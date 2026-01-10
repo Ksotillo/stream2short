@@ -1,11 +1,13 @@
-import Redis from 'ioredis';
+import IORedis from 'ioredis';
 import { config } from './config.js';
 
-let redis: Redis | null = null;
+type RedisClient = InstanceType<typeof IORedis>;
 
-export function getRedis(): Redis {
+let redis: RedisClient | null = null;
+
+export function getRedis(): RedisClient {
   if (!redis) {
-    redis = new Redis(config.redisUrl, {
+    redis = new IORedis(config.redisUrl, {
       maxRetriesPerRequest: 3,
       retryStrategy(times: number) {
         const delay = Math.min(times * 50, 2000);
