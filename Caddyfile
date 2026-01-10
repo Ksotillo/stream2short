@@ -1,0 +1,4 @@
+shelllumber.eastus.cloudapp.azure.com {
+    reverse_proxy api:3000
+}
+

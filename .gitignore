@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Credentials (keep the folder, ignore the actual secrets)
+credentials/*.json
+!credentials/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temp files
+/tmp/
+*.tmp
+
+# Whisper models (downloaded at runtime)
+*.pt
+*.bin
+
+# Test coverage
+coverage/
+.coverage
+htmlcov/
+
+# Docker
+.docker/
+

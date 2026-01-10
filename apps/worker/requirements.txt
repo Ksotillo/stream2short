@@ -1,0 +1,25 @@
+# Stream2Short Worker Dependencies
+
+# Redis client
+redis>=5.0.0
+
+# Supabase client
+supabase>=2.0.0
+
+# HTTP client
+httpx>=0.25.0
+
+# Whisper for transcription
+faster-whisper>=0.10.0
+
+# Google Drive API
+google-api-python-client>=2.111.0
+google-auth>=2.25.0
+google-auth-oauthlib>=1.2.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Utilities
+pydantic>=2.5.0
+

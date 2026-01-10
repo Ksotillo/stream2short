@@ -1,0 +1,30 @@
+{
+  "name": "stream2short",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Turn Twitch clips into social-ready vertical videos with automatic subtitles",
+  "scripts": {
+    "dev:api": "cd apps/api && npm run dev",
+    "dev:worker": "cd apps/worker && python main.py",
+    "build:api": "cd apps/api && npm run build",
+    "docker:up": "docker compose up --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
+  },
+  "keywords": [
+    "twitch",
+    "clips",
+    "shorts",
+    "tiktok",
+    "vertical-video",
+    "subtitles",
+    "whisper"
+  ],
+  "author": "",
+  "license": "MIT",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}
+
