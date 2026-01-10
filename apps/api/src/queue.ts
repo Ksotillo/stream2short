@@ -7,13 +7,13 @@ export function getRedis(): Redis {
   if (!redis) {
     redis = new Redis(config.redisUrl, {
       maxRetriesPerRequest: 3,
-      retryStrategy(times) {
+      retryStrategy(times: number) {
         const delay = Math.min(times * 50, 2000);
         return delay;
       },
     });
     
-    redis.on('error', (err) => {
+    redis.on('error', (err: Error) => {
       console.error('Redis connection error:', err);
     });
     
@@ -27,15 +27,15 @@ export function getRedis(): Redis {
 
 // Push a job ID to the queue
 export async function enqueueJob(jobId: string): Promise<void> {
-  const redis = getRedis();
-  await redis.lpush(config.queueName, jobId);
+  const redisClient = getRedis();
+  await redisClient.lpush(config.queueName, jobId);
   console.log(`📤 Enqueued job ${jobId}`);
 }
 
 // Get queue length (for monitoring)
 export async function getQueueLength(): Promise<number> {
-  const redis = getRedis();
-  return redis.llen(config.queueName);
+  const redisClient = getRedis();
+  return redisClient.llen(config.queueName);
 }
 
 // Graceful shutdown
@@ -45,4 +45,3 @@ export async function closeRedis(): Promise<void> {
     redis = null;
   }
 }
-
