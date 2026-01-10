@@ -161,7 +161,7 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
         </html>
       `);
     } catch (err) {
-      fastify.log.error('OAuth callback error:', err);
+      fastify.log.error({ err }, 'OAuth callback error');
       
       return reply.type('text/html').send(`
         <!DOCTYPE html>

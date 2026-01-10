@@ -1,6 +1,7 @@
 {
   "name": "@stream2short/api",
   "version": "1.0.0",
+  "type": "module",
   "description": "Fastify API for Twitch Clips MVP",
   "main": "dist/index.js",
   "scripts": {

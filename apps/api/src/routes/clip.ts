@@ -59,7 +59,7 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
       
       return reply.send(`Queued ✅ job=${job.id.substring(0, 8)}. It will appear in the review queue soon.`);
     } catch (err) {
-      fastify.log.error('Failed to queue clip job:', err);
+      fastify.log.error({ err }, 'Failed to queue clip job');
       return reply.send('Failed to queue clip. Try again later.');
     }
   });
@@ -109,7 +109,7 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
         message: 'Clip job queued successfully',
       });
     } catch (err) {
-      fastify.log.error('Failed to queue clip job:', err);
+      fastify.log.error({ err }, 'Failed to queue clip job');
       return reply.status(500).send({ error: 'Failed to queue clip job' });
     }
   });
