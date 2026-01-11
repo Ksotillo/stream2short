@@ -1,13 +1,11 @@
-version: '3.8'
-
 services:
-  # Caddy - Reverse proxy with automatic HTTPS
+  # Caddy - Reverse proxy with automatic HTTPS (on different ports)
   caddy:
     image: caddy:2-alpine
     container_name: stream2short-caddy
     ports:
-      - "80:80"
-      - "443:443"
+      - "3080:80"
+      - "3443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
