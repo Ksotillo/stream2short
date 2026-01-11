@@ -88,12 +88,13 @@ def process_job(job_id: str) -> None:
         update_job_status(job_id, "downloading")
         print("📥 Stage 3: Downloading clip...")
         
-        thumbnail_url = clip_info.get("thumbnail_url", "")
-        print(f"🔗 Thumbnail URL: {thumbnail_url}")
+        # Get the clip page URL (e.g., https://www.twitch.tv/channel/clip/ClipSlug)
+        clip_page_url = clip_info.get("url", "")
+        print(f"🔗 Clip URL: {clip_page_url}")
         
         raw_video_path = str(temp_dir / "raw.mp4")
-        # download_clip will try multiple URL patterns derived from thumbnail
-        download_clip(thumbnail_url, raw_video_path)
+        # Use yt-dlp to download the clip reliably
+        download_clip(clip_page_url, raw_video_path)
         
         update_job(job_id, raw_video_path=raw_video_path)
         print(f"✅ Downloaded to: {raw_video_path}")

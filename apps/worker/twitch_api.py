@@ -229,71 +229,91 @@ def get_clip_download_url(thumbnail_url: str) -> str:
     return urls[0] if urls else thumbnail_url.replace(".jpg", ".mp4")
 
 
-def download_clip_from_urls(urls: list[str], output_path: str) -> None:
+def download_clip_with_ytdlp(clip_url: str, output_path: str) -> None:
     """
-    Try downloading a clip from multiple URLs until one works.
+    Download a Twitch clip using yt-dlp.
     
     Args:
-        urls: List of possible clip download URLs
-        output_path: Local file path to save to
-        
-    Raises:
-        TwitchAPIError: If all download attempts fail
-    """
-    errors = []
-    
-    with httpx.Client(timeout=60.0) as client:
-        for url in urls:
-            print(f"📥 Trying: {url}")
-            
-            try:
-                response = client.get(url, follow_redirects=True)
-                
-                if not response.is_success:
-                    errors.append(f"{url}: HTTP {response.status_code}")
-                    continue
-                
-                # Verify we got a video file (check Content-Type or size)
-                content_type = response.headers.get("content-type", "")
-                content_length = len(response.content)
-                
-                if "video" not in content_type and content_length < 100000:
-                    # Likely got an image or error page, not a video
-                    errors.append(f"{url}: Not a video (type={content_type}, size={content_length})")
-                    continue
-                
-                # Success! Save the file
-                with open(output_path, "wb") as f:
-                    f.write(response.content)
-                
-                print(f"✅ Downloaded clip ({content_length} bytes) to {output_path}")
-                return
-                
-            except httpx.HTTPError as e:
-                errors.append(f"{url}: {e}")
-                continue
-    
-    # All URLs failed
-    error_summary = "\n".join(errors)
-    raise TwitchAPIError(f"Failed to download clip from any URL:\n{error_summary}")
-
-
-def download_clip(url: str, output_path: str) -> None:
-    """
-    Download a clip to a local file.
-    
-    Args:
-        url: Clip download URL (or thumbnail URL)
+        clip_url: Twitch clip page URL (e.g., https://www.twitch.tv/channel/clip/ClipSlug)
         output_path: Local file path to save to
         
     Raises:
         TwitchAPIError: If download fails
     """
-    # Get all possible download URLs
-    urls = get_clip_download_urls(url)
+    import subprocess
+    import shutil
     
-    if not urls:
-        urls = [url]
+    print(f"📥 Downloading clip with yt-dlp: {clip_url}")
     
-    download_clip_from_urls(urls, output_path)
+    # Check if yt-dlp is available
+    if not shutil.which("yt-dlp"):
+        raise TwitchAPIError("yt-dlp not found. Please install it.")
+    
+    try:
+        # Run yt-dlp to download the clip
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "-f", "best[ext=mp4]/best",  # Prefer mp4 format
+                "-o", output_path,
+                "--no-playlist",
+                "--quiet",
+                "--no-warnings",
+                clip_url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,  # 2 minute timeout
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            raise TwitchAPIError(f"yt-dlp failed: {error_msg}")
+        
+        # Verify file exists and has content
+        import os
+        if not os.path.exists(output_path):
+            raise TwitchAPIError(f"Download completed but file not found: {output_path}")
+        
+        file_size = os.path.getsize(output_path)
+        if file_size < 10000:  # Less than 10KB is suspicious
+            raise TwitchAPIError(f"Downloaded file too small ({file_size} bytes)")
+        
+        print(f"✅ Downloaded clip ({file_size} bytes) to {output_path}")
+        
+    except subprocess.TimeoutExpired:
+        raise TwitchAPIError("yt-dlp download timed out after 120 seconds")
+    except FileNotFoundError:
+        raise TwitchAPIError("yt-dlp not found. Please install it.")
+
+
+def download_clip(clip_url_or_thumbnail: str, output_path: str, clip_page_url: str = None) -> None:
+    """
+    Download a clip to a local file.
+    
+    Uses yt-dlp for reliable downloads from Twitch.
+    
+    Args:
+        clip_url_or_thumbnail: Either the clip page URL or thumbnail URL
+        output_path: Local file path to save to
+        clip_page_url: Optional direct clip page URL
+        
+    Raises:
+        TwitchAPIError: If download fails
+    """
+    # If we have a clip page URL, use it directly
+    if clip_page_url:
+        download_clip_with_ytdlp(clip_page_url, output_path)
+        return
+    
+    # If this looks like a Twitch clip page URL, use it
+    if "twitch.tv" in clip_url_or_thumbnail and "clip" in clip_url_or_thumbnail:
+        download_clip_with_ytdlp(clip_url_or_thumbnail, output_path)
+        return
+    
+    # Otherwise, we can't download from just a thumbnail URL anymore
+    raise TwitchAPIError(
+        "Cannot download clip: need a Twitch clip page URL. "
+        f"Got: {clip_url_or_thumbnail}"
+    )
 
