@@ -10,6 +10,22 @@ class VideoProcessingError(Exception):
     pass
 
 
+def escape_ffmpeg_path(path: str) -> str:
+    """
+    Escape a file path for use in FFmpeg's subtitle filter.
+    
+    FFmpeg's filtergraph has multiple levels of escaping:
+    1. Backslashes need to be escaped
+    2. Single quotes need to be escaped  
+    3. Colons need to be escaped (they're option separators)
+    """
+    # Escape backslashes first, then other special chars
+    escaped = path.replace("\\", "\\\\")
+    escaped = escaped.replace(":", "\\:")
+    escaped = escaped.replace("'", "'\\''")  # End quote, escaped quote, start quote
+    return escaped
+
+
 def render_vertical_video(
     input_path: str,
     output_path: str,
@@ -37,6 +53,16 @@ def render_vertical_video(
     """
     print(f"🎬 Rendering vertical video: {input_path} -> {output_path}")
     
+    # Check if subtitle file exists and has content
+    use_subtitles = False
+    if subtitle_path and os.path.exists(subtitle_path):
+        file_size = os.path.getsize(subtitle_path)
+        print(f"📝 Subtitle file size: {file_size} bytes")
+        if file_size > 10:  # More than 10 bytes means it has actual content
+            use_subtitles = True
+        else:
+            print("⚠️ Subtitle file is empty or too small, skipping subtitles")
+    
     # Build filter chain
     filters = []
     
@@ -45,20 +71,19 @@ def render_vertical_video(
     filters.append(f"scale={width}:{height}:force_original_aspect_ratio=increase")
     filters.append(f"crop={width}:{height}")
     
-    # Add subtitles if provided
-    if subtitle_path and os.path.exists(subtitle_path):
-        # Escape path for FFmpeg filter
-        escaped_path = subtitle_path.replace(":", "\\:").replace("'", "\\'")
+    # Add subtitles if available and valid
+    if use_subtitles:
+        # For FFmpeg subtitles filter, we need to escape special characters
+        # Using the filename option with a simpler approach
+        escaped_path = escape_ffmpeg_path(subtitle_path)
         
         if subtitle_path.endswith(".ass"):
-            # ASS subtitles with custom styling
             filters.append(f"ass='{escaped_path}'")
         else:
-            # SRT subtitles with default styling
-            # Force styling for better readability on vertical video
+            # SRT subtitles - use simpler styling to avoid issues
             filters.append(
-                f"subtitles='{escaped_path}':force_style="
-                "'FontName=Arial Black,FontSize=24,PrimaryColour=&H00FFFFFF,"
+                f"subtitles=filename='{escaped_path}'"
+                ":force_style='FontSize=20,PrimaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,"
                 "Alignment=2,MarginV=80'"
             )
@@ -93,6 +118,17 @@ def render_vertical_video(
         return output_path
         
     except subprocess.CalledProcessError as e:
+        # If subtitles failed, try without them
+        if use_subtitles and "Unable to open" in e.stderr:
+            print("⚠️ Subtitle rendering failed, trying without subtitles...")
+            return render_vertical_video(
+                input_path=input_path,
+                output_path=output_path,
+                subtitle_path=None,  # Disable subtitles
+                width=width,
+                height=height,
+            )
+        
         error_msg = f"FFmpeg failed: {e.stderr}"
         print(f"❌ {error_msg}")
         raise VideoProcessingError(error_msg)

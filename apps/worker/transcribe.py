@@ -52,13 +52,21 @@ def transcribe_video(video_path: str, output_srt_path: str) -> str:
     print(f"📝 Detected language: {info.language} (probability: {info.language_probability:.2f})")
     
     # Convert to SRT format
-    srt_content = segments_to_srt(list(segments))
+    segments_list = list(segments)
+    print(f"📝 Found {len(segments_list)} speech segments")
+    
+    srt_content = segments_to_srt(segments_list)
     
     # Write SRT file
     with open(output_srt_path, "w", encoding="utf-8") as f:
         f.write(srt_content)
     
-    print(f"✅ Subtitles saved to {output_srt_path}")
+    # Verify file was written
+    file_size = os.path.getsize(output_srt_path)
+    print(f"✅ Subtitles saved to {output_srt_path} ({file_size} bytes)")
+    
+    if file_size == 0:
+        print("⚠️ Warning: No speech detected in video, subtitle file is empty")
     
     return output_srt_path
 
