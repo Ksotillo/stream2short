@@ -68,16 +68,20 @@ def find_or_create_folder(name: str, parent_id: Optional[str] = None) -> str:
     if parent_id is None:
         parent_id = config.GOOGLE_DRIVE_FOLDER_ID
     
+    if not parent_id:
+        raise ValueError("GOOGLE_DRIVE_FOLDER_ID must be set - service accounts cannot upload to their own Drive")
+    
     # Search for existing folder
     query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    if parent_id:
-        query += f" and '{parent_id}' in parents"
+    query += f" and '{parent_id}' in parents"
     
     results = service.files().list(
         q=query,
         spaces='drive',
         fields='files(id, name)',
-        pageSize=1
+        pageSize=1,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
     ).execute()
     
     files = results.get('files', [])
@@ -85,18 +89,17 @@ def find_or_create_folder(name: str, parent_id: Optional[str] = None) -> str:
     if files:
         return files[0]['id']
     
-    # Create new folder
+    # Create new folder inside the parent
     folder_metadata = {
         'name': name,
-        'mimeType': 'application/vnd.google-apps.folder'
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_id]
     }
-    
-    if parent_id:
-        folder_metadata['parents'] = [parent_id]
     
     folder = service.files().create(
         body=folder_metadata,
-        fields='id'
+        fields='id',
+        supportsAllDrives=True
     ).execute()
     
     print(f"📁 Created folder: {name}")
@@ -154,7 +157,8 @@ def upload_file(
     file = service.files().create(
         body=file_metadata,
         media_body=media,
-        fields='id, name, webViewLink, webContentLink'
+        fields='id, name, webViewLink, webContentLink',
+        supportsAllDrives=True
     ).execute()
     
     print(f"✅ Uploaded: {file['name']} (ID: {file['id']})")
@@ -166,7 +170,8 @@ def upload_file(
             body={
                 'type': 'anyone',
                 'role': 'reader'
-            }
+            },
+            supportsAllDrives=True
         ).execute()
         print("🔗 File shared with link access")
     except Exception as e:
