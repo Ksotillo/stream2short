@@ -24,10 +24,17 @@ class Config:
     TWITCH_CLIENT_ID: str = os.getenv("TWITCH_CLIENT_ID", "")
     TWITCH_CLIENT_SECRET: str = os.getenv("TWITCH_CLIENT_SECRET", "")
     
-    # Google Drive Storage
+    # Google Drive Storage (Shared Drive)
     GOOGLE_SERVICE_ACCOUNT_FILE: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "")
     GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    GOOGLE_DRIVE_FOLDER_ID: str = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")  # Root folder ID
+    
+    # Shared Drive settings (required for service accounts)
+    GDRIVE_SHARED_DRIVE_ID: str = os.getenv("GDRIVE_SHARED_DRIVE_ID", "")
+    GDRIVE_PARENT_FOLDER_ID: str = os.getenv("GDRIVE_PARENT_FOLDER_ID", "")  # Optional specific folder
+    GDRIVE_PARENT_FOLDER_NAME: str = os.getenv("GDRIVE_PARENT_FOLDER_NAME", "Stream2Short Uploads")
+    
+    # Legacy (deprecated, use GDRIVE_SHARED_DRIVE_ID instead)
+    GOOGLE_DRIVE_FOLDER_ID: str = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
     
     # Worker settings
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")

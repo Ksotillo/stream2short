@@ -16,7 +16,7 @@ from twitch_api import (
 )
 from transcribe import transcribe_video
 from video import render_vertical_video, VideoProcessingError
-from storage import upload_file
+from storage import upload_file, SharedDriveError
 
 
 class PipelineError(Exception):
@@ -164,6 +164,11 @@ def process_job(job_id: str) -> None:
         
     except VideoProcessingError as e:
         error_msg = f"Video processing error: {e}"
+        print(f"❌ {error_msg}")
+        mark_job_failed(job_id, error_msg)
+    
+    except SharedDriveError as e:
+        error_msg = f"Google Drive error: {e}"
         print(f"❌ {error_msg}")
         mark_job_failed(job_id, error_msg)
         
