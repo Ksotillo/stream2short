@@ -1,4 +1,15 @@
-shelllumber.eastus.cloudapp.azure.com {
+{
+    auto_https off
+    admin off
+}
+
+:443 {
+    tls internal {
+        on_demand
+    }
     reverse_proxy api:3000
 }
 
+:80 {
+    reverse_proxy api:3000
+}
