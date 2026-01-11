@@ -74,18 +74,35 @@ def render_vertical_video(
     # Add subtitles if available and valid
     if use_subtitles:
         # For FFmpeg subtitles filter, we need to escape special characters
-        # Using the filename option with a simpler approach
         escaped_path = escape_ffmpeg_path(subtitle_path)
         
         if subtitle_path.endswith(".ass"):
             filters.append(f"ass='{escaped_path}'")
         else:
-            # SRT subtitles - use simpler styling to avoid issues
+            # Modern social media style subtitles (TikTok/Reels inspired)
+            # - Bold, large font
+            # - Centered at bottom with good margin
+            # - White text with strong black outline
+            # - Single line, few words at a time
             filters.append(
                 f"subtitles=filename='{escaped_path}'"
-                ":force_style='FontSize=20,PrimaryColour=&H00FFFFFF,"
-                "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,"
-                "Alignment=2,MarginV=80'"
+                ":force_style='"
+                "FontName=Liberation Sans,"  # Clean, bold font (installed in container)
+                "FontSize=52,"               # Large for mobile viewing
+                "PrimaryColour=&H00FFFFFF,"  # White text
+                "SecondaryColour=&H00FFFFFF,"
+                "OutlineColour=&H00000000,"  # Black outline
+                "BackColour=&H80000000,"     # Semi-transparent black shadow
+                "Bold=1,"                    # Bold
+                "Italic=0,"
+                "BorderStyle=1,"             # Outline + shadow
+                "Outline=4,"                 # Thick outline for readability
+                "Shadow=2,"                  # Drop shadow
+                "Alignment=2,"               # Bottom center
+                "MarginL=60,"                # Left margin
+                "MarginR=60,"                # Right margin  
+                "MarginV=150"                # Bottom margin (away from edge)
+                "'"
             )
     
     filter_complex = ",".join(filters)

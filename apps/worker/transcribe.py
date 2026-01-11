@@ -71,28 +71,72 @@ def transcribe_video(video_path: str, output_srt_path: str) -> str:
     return output_srt_path
 
 
-def segments_to_srt(segments: list) -> str:
+def segments_to_srt(segments: list, words_per_subtitle: int = 3) -> str:
     """
-    Convert faster-whisper segments to SRT format.
+    Convert faster-whisper segments to SRT format with short phrases.
+    
+    Creates social media style subtitles with only a few words at a time
+    for better readability on vertical video.
     
     Args:
         segments: List of transcription segments
+        words_per_subtitle: Max words per subtitle line (default 3 for social media)
         
     Returns:
         SRT formatted string
     """
     srt_lines = []
+    subtitle_index = 1
     
-    for i, segment in enumerate(segments, start=1):
-        start_time = format_srt_time(segment.start)
-        end_time = format_srt_time(segment.end)
-        text = segment.text.strip()
-        
-        if text:
-            srt_lines.append(f"{i}")
-            srt_lines.append(f"{start_time} --> {end_time}")
-            srt_lines.append(text)
-            srt_lines.append("")  # Empty line between entries
+    for segment in segments:
+        # Use word-level timestamps if available
+        if hasattr(segment, 'words') and segment.words:
+            words = list(segment.words)
+            
+            # Group words into chunks
+            for i in range(0, len(words), words_per_subtitle):
+                chunk = words[i:i + words_per_subtitle]
+                
+                if not chunk:
+                    continue
+                
+                start_time = format_srt_time(chunk[0].start)
+                end_time = format_srt_time(chunk[-1].end)
+                text = " ".join(w.word.strip() for w in chunk).strip()
+                
+                if text:
+                    srt_lines.append(f"{subtitle_index}")
+                    srt_lines.append(f"{start_time} --> {end_time}")
+                    srt_lines.append(text.upper())  # Uppercase for social media style
+                    srt_lines.append("")
+                    subtitle_index += 1
+        else:
+            # Fallback: split segment text into chunks
+            text = segment.text.strip()
+            words = text.split()
+            
+            if not words:
+                continue
+            
+            # Calculate time per word
+            duration = segment.end - segment.start
+            time_per_word = duration / len(words) if words else duration
+            
+            for i in range(0, len(words), words_per_subtitle):
+                chunk_words = words[i:i + words_per_subtitle]
+                chunk_start = segment.start + (i * time_per_word)
+                chunk_end = segment.start + ((i + len(chunk_words)) * time_per_word)
+                
+                start_time = format_srt_time(chunk_start)
+                end_time = format_srt_time(min(chunk_end, segment.end))
+                chunk_text = " ".join(chunk_words).upper()
+                
+                if chunk_text:
+                    srt_lines.append(f"{subtitle_index}")
+                    srt_lines.append(f"{start_time} --> {end_time}")
+                    srt_lines.append(chunk_text)
+                    srt_lines.append("")
+                    subtitle_index += 1
     
     return "\n".join(srt_lines)
 

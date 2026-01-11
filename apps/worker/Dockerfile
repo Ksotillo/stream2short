@@ -1,11 +1,16 @@
 # Stream2Short Worker Dockerfile
 FROM python:3.11-slim
 
-# Install system dependencies
+# Install system dependencies and fonts for subtitles
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    # Fonts for social media style subtitles
+    fonts-liberation \
+    fonts-dejavu-core \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/* \
+    && fc-cache -f -v
 
 # Set working directory
 WORKDIR /app

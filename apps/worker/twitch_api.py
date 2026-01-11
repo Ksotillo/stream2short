@@ -250,15 +250,16 @@ def download_clip_with_ytdlp(clip_url: str, output_path: str) -> None:
         raise TwitchAPIError("yt-dlp not found. Please install it.")
     
     try:
-        # Run yt-dlp to download the clip
+        # Run yt-dlp to download the clip at best quality
         result = subprocess.run(
             [
                 "yt-dlp",
-                "-f", "best[ext=mp4]/best",  # Prefer mp4 format
+                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",  # Best quality
                 "-o", output_path,
                 "--no-playlist",
                 "--quiet",
                 "--no-warnings",
+                "--merge-output-format", "mp4",
                 clip_url,
             ],
             capture_output=True,
