@@ -254,17 +254,15 @@ def download_clip_with_ytdlp(clip_url: str, output_path: str) -> None:
         result = subprocess.run(
             [
                 "yt-dlp",
-                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",  # Best quality
+                "-f", "best",  # Best single format (Twitch clips are usually single file)
                 "-o", output_path,
                 "--no-playlist",
-                "--quiet",
                 "--no-warnings",
-                "--merge-output-format", "mp4",
                 clip_url,
             ],
             capture_output=True,
             text=True,
-            timeout=120,  # 2 minute timeout
+            timeout=180,  # 3 minute timeout
         )
         
         if result.returncode != 0:

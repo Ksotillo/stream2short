@@ -80,44 +80,43 @@ def render_vertical_video(
             filters.append(f"ass='{escaped_path}'")
         else:
             # Modern social media style subtitles (TikTok/Reels inspired)
-            # - Bold, large font
+            # - Bold font, readable size
             # - Centered at bottom with good margin
-            # - White text with strong black outline
-            # - Single line, few words at a time
+            # - White text with black outline
             filters.append(
                 f"subtitles=filename='{escaped_path}'"
                 ":force_style='"
-                "FontName=Liberation Sans,"  # Clean, bold font (installed in container)
-                "FontSize=52,"               # Large for mobile viewing
+                "FontName=Liberation Sans,"  # Clean font (installed in container)
+                "FontSize=24,"               # Readable size for 1080x1920
                 "PrimaryColour=&H00FFFFFF,"  # White text
-                "SecondaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,"  # Black outline
-                "BackColour=&H80000000,"     # Semi-transparent black shadow
+                "BackColour=&H40000000,"     # Semi-transparent shadow
                 "Bold=1,"                    # Bold
-                "Italic=0,"
                 "BorderStyle=1,"             # Outline + shadow
-                "Outline=4,"                 # Thick outline for readability
-                "Shadow=2,"                  # Drop shadow
+                "Outline=2,"                 # Clean outline
+                "Shadow=1,"                  # Subtle shadow
                 "Alignment=2,"               # Bottom center
-                "MarginL=60,"                # Left margin
-                "MarginR=60,"                # Right margin  
-                "MarginV=150"                # Bottom margin (away from edge)
+                "MarginL=20,"                # Left margin
+                "MarginR=20,"                # Right margin  
+                "MarginV=60"                 # Bottom margin
                 "'"
             )
     
     filter_complex = ",".join(filters)
     
-    # Build FFmpeg command
+    # Build FFmpeg command with high quality settings
     cmd = [
         "ffmpeg",
         "-y",  # Overwrite output
         "-i", input_path,
         "-vf", filter_complex,
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "23",
+        "-preset", "slow",      # Better quality encoding
+        "-crf", "18",           # High quality (lower = better, 18 is visually lossless)
+        "-profile:v", "high",   # High profile for better compression
+        "-level", "4.1",        # Compatibility level
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "192k",         # Higher audio bitrate
         "-movflags", "+faststart",
         output_path,
     ]
