@@ -9,8 +9,8 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from config import config
 
-# Google Drive API scopes
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
+# Google Drive API scopes - full drive access needed for shared folders
+SCOPES = ['https://www.googleapis.com/auth/drive']
 
 _drive_service = None
 
@@ -51,25 +51,18 @@ def get_drive_service():
     return _drive_service
 
 
-def find_or_create_folder(name: str, parent_id: Optional[str] = None) -> str:
+def find_folder(name: str, parent_id: str) -> Optional[str]:
     """
-    Find a folder by name or create it if it doesn't exist.
+    Find a folder by name inside a parent folder.
     
     Args:
-        name: Folder name
-        parent_id: Parent folder ID (None for root or shared folder)
+        name: Folder name to search for
+        parent_id: Parent folder ID to search in
         
     Returns:
-        Folder ID
+        Folder ID if found, None otherwise
     """
     service = get_drive_service()
-    
-    # Use the configured root folder if no parent specified
-    if parent_id is None:
-        parent_id = config.GOOGLE_DRIVE_FOLDER_ID
-    
-    if not parent_id:
-        raise ValueError("GOOGLE_DRIVE_FOLDER_ID must be set - service accounts cannot upload to their own Drive")
     
     # Search for existing folder
     query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -87,24 +80,10 @@ def find_or_create_folder(name: str, parent_id: Optional[str] = None) -> str:
     files = results.get('files', [])
     
     if files:
+        print(f"📁 Found existing folder: {name}")
         return files[0]['id']
     
-    # Create new folder inside the parent
-    folder_metadata = {
-        'name': name,
-        'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [parent_id]
-    }
-    
-    folder = service.files().create(
-        body=folder_metadata,
-        fields='id',
-        supportsAllDrives=True
-    ).execute()
-    
-    print(f"📁 Created folder: {name}")
-    
-    return folder['id']
+    return None
 
 
 def upload_file(
@@ -114,9 +93,10 @@ def upload_file(
     filename: str = "final.mp4",
 ) -> dict:
     """
-    Upload a file to Google Drive with organized folder structure.
+    Upload a file to Google Drive.
     
-    Structure: Root / {streamer_name} / {date} / {filename}
+    Looks for an existing folder for the streamer. If found, uploads there.
+    If not found, uploads to the root shared folder.
     
     Args:
         local_path: Path to local file
@@ -129,22 +109,31 @@ def upload_file(
     """
     service = get_drive_service()
     
-    # Get today's date for folder organization
-    date_folder = datetime.now().strftime('%Y-%m-%d')
+    # Get the shared folder ID (root)
+    root_folder_id = config.GOOGLE_DRIVE_FOLDER_ID
+    if not root_folder_id:
+        raise ValueError("GOOGLE_DRIVE_FOLDER_ID must be set")
     
-    print(f"📤 Uploading to Google Drive: {streamer_name}/{date_folder}/{filename}")
+    # Look for existing streamer folder (created manually by user)
+    streamer_folder_id = find_folder(streamer_name, root_folder_id)
     
-    # Create folder structure: Root -> Streamer -> Date
-    streamer_folder_id = find_or_create_folder(streamer_name)
-    date_folder_id = find_or_create_folder(date_folder, streamer_folder_id)
+    # Use streamer folder if exists, otherwise use root
+    target_folder_id = streamer_folder_id or root_folder_id
     
-    # Prepare file metadata
-    # Use job_id in filename to ensure uniqueness
-    final_filename = f"clip_{job_id[:8]}_{filename}"
+    # Get today's date for filename
+    date_str = datetime.now().strftime('%Y-%m-%d_%H%M%S')
+    
+    # Use descriptive filename: StreamerName_Date_JobID.mp4
+    final_filename = f"{streamer_name}_{date_str}_{job_id[:8]}.mp4"
+    
+    if streamer_folder_id:
+        print(f"📤 Uploading to Google Drive: {streamer_name}/{final_filename}")
+    else:
+        print(f"📤 Uploading to Google Drive (root): {final_filename}")
     
     file_metadata = {
         'name': final_filename,
-        'parents': [date_folder_id]
+        'parents': [target_folder_id]
     }
     
     # Upload file
@@ -177,12 +166,18 @@ def upload_file(
     except Exception as e:
         print(f"⚠️ Could not set sharing permissions: {e}")
     
+    # Build path string for logging
+    if streamer_folder_id:
+        path = f"{streamer_name}/{final_filename}"
+    else:
+        path = final_filename
+    
     return {
         'id': file['id'],
         'name': file['name'],
         'webViewLink': file.get('webViewLink', ''),
         'webContentLink': file.get('webContentLink', ''),
-        'path': f"{streamer_name}/{date_folder}/{final_filename}"
+        'path': path
     }
 
 
