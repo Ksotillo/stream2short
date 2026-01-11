@@ -168,27 +168,114 @@ def wait_for_clip(clip_id: str, access_token: str) -> dict:
     raise TwitchAPIError(f"Clip {clip_id} not available after {config.CLIP_POLL_MAX_ATTEMPTS} attempts")
 
 
-def get_clip_download_url(thumbnail_url: str) -> str:
+def get_clip_download_urls(thumbnail_url: str) -> list[str]:
     """
-    Derive clip download URL from thumbnail URL.
+    Get possible download URLs from thumbnail URL.
     
-    Twitch doesn't provide a direct download URL, but we can derive it from the thumbnail.
-    Thumbnail: https://clips-media-assets2.twitch.tv/AT-cm%7C{id}-preview-480x272.jpg
-    Video: https://clips-media-assets2.twitch.tv/AT-cm%7C{id}.mp4
+    Twitch has multiple thumbnail/video URL formats that change over time.
+    This function returns multiple possible URLs to try.
     
     Args:
         thumbnail_url: Clip thumbnail URL
         
     Returns:
-        MP4 download URL
+        List of possible MP4 download URLs to try
     """
     import re
     
-    # Remove preview suffix and change to .mp4
-    download_url = re.sub(r"-preview-\d+x\d+\.jpg$", ".mp4", thumbnail_url)
-    download_url = re.sub(r"-preview\.jpg$", ".mp4", download_url)
+    urls = []
     
-    return download_url
+    # New Twitch format (static-cdn.jtvnw.net)
+    # Thumbnail: https://static-cdn.jtvnw.net/twitch-clips-thumbnails-prod/{slug}/{uuid}/preview-480x272.jpg
+    new_format_match = re.search(
+        r"twitch-clips-thumbnails-prod/([^/]+)/([^/]+)/preview",
+        thumbnail_url
+    )
+    
+    if new_format_match:
+        slug = new_format_match.group(1)
+        uuid = new_format_match.group(2)
+        
+        # Try various CDN patterns
+        urls.extend([
+            f"https://production.assets.clips.twitchcdn.net/{uuid}-offset-0.mp4",
+            f"https://production.assets.clips.twitchcdn.net/{uuid}.mp4",
+            f"https://clips-media-assets2.twitch.tv/{uuid}.mp4",
+            f"https://clips-media-assets2.twitch.tv/{uuid}-offset-0.mp4",
+            f"https://production.assets.clips.twitchcdn.net/v2/media/{uuid}/vod/1080.mp4",
+            f"https://production.assets.clips.twitchcdn.net/v2/media/{uuid}/vod/720.mp4",
+            f"https://production.assets.clips.twitchcdn.net/v2/media/{uuid}/vod/480.mp4",
+            f"https://production.assets.clips.twitchcdn.net/v2/media/{uuid}/vod/360.mp4",
+        ])
+    
+    # Old format - try removing preview suffix
+    old_format_url = re.sub(r"-preview-\d+x\d+\.jpg$", ".mp4", thumbnail_url)
+    if old_format_url != thumbnail_url:
+        urls.append(old_format_url)
+    
+    old_format_url2 = re.sub(r"-preview\.jpg$", ".mp4", thumbnail_url)
+    if old_format_url2 != thumbnail_url:
+        urls.append(old_format_url2)
+    
+    return urls
+
+
+def get_clip_download_url(thumbnail_url: str) -> str:
+    """
+    Legacy function - returns first URL candidate.
+    Use get_clip_download_urls for multiple options.
+    """
+    urls = get_clip_download_urls(thumbnail_url)
+    return urls[0] if urls else thumbnail_url.replace(".jpg", ".mp4")
+
+
+def download_clip_from_urls(urls: list[str], output_path: str) -> None:
+    """
+    Try downloading a clip from multiple URLs until one works.
+    
+    Args:
+        urls: List of possible clip download URLs
+        output_path: Local file path to save to
+        
+    Raises:
+        TwitchAPIError: If all download attempts fail
+    """
+    errors = []
+    
+    with httpx.Client(timeout=60.0) as client:
+        for url in urls:
+            print(f"📥 Trying: {url}")
+            
+            try:
+                response = client.get(url, follow_redirects=True)
+                
+                if not response.is_success:
+                    errors.append(f"{url}: HTTP {response.status_code}")
+                    continue
+                
+                # Verify we got a video file (check Content-Type or size)
+                content_type = response.headers.get("content-type", "")
+                content_length = len(response.content)
+                
+                if "video" not in content_type and content_length < 100000:
+                    # Likely got an image or error page, not a video
+                    errors.append(f"{url}: Not a video (type={content_type}, size={content_length})")
+                    continue
+                
+                # Success! Save the file
+                with open(output_path, "wb") as f:
+                    f.write(response.content)
+                
+                print(f"✅ Downloaded clip ({content_length} bytes) to {output_path}")
+                return
+                
+            except httpx.HTTPError as e:
+                errors.append(f"{url}: {e}")
+                continue
+    
+    # All URLs failed
+    error_summary = "\n".join(errors)
+    raise TwitchAPIError(f"Failed to download clip from any URL:\n{error_summary}")
 
 
 def download_clip(url: str, output_path: str) -> None:
@@ -196,22 +283,17 @@ def download_clip(url: str, output_path: str) -> None:
     Download a clip to a local file.
     
     Args:
-        url: Clip download URL
+        url: Clip download URL (or thumbnail URL)
         output_path: Local file path to save to
         
     Raises:
         TwitchAPIError: If download fails
     """
-    print(f"📥 Downloading clip from {url}")
+    # Get all possible download URLs
+    urls = get_clip_download_urls(url)
     
-    with httpx.Client(timeout=60.0) as client:
-        response = client.get(url, follow_redirects=True)
-        
-        if not response.is_success:
-            raise TwitchAPIError(f"Failed to download clip: {response.status_code}")
-        
-        with open(output_path, "wb") as f:
-            f.write(response.content)
+    if not urls:
+        urls = [url]
     
-    print(f"✅ Downloaded clip to {output_path}")
+    download_clip_from_urls(urls, output_path)
 

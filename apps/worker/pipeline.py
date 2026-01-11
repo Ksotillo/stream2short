@@ -11,7 +11,6 @@ from twitch_api import (
     get_valid_access_token,
     create_clip,
     wait_for_clip,
-    get_clip_download_url,
     download_clip,
     TwitchAPIError,
 )
@@ -90,10 +89,11 @@ def process_job(job_id: str) -> None:
         print("📥 Stage 3: Downloading clip...")
         
         thumbnail_url = clip_info.get("thumbnail_url", "")
-        download_url = get_clip_download_url(thumbnail_url)
+        print(f"🔗 Thumbnail URL: {thumbnail_url}")
         
         raw_video_path = str(temp_dir / "raw.mp4")
-        download_clip(download_url, raw_video_path)
+        # download_clip will try multiple URL patterns derived from thumbnail
+        download_clip(thumbnail_url, raw_video_path)
         
         update_job(job_id, raw_video_path=raw_video_path)
         print(f"✅ Downloaded to: {raw_video_path}")
