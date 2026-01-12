@@ -1,7 +1,8 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { config } from '../config.js';
-import { getChannelByLogin, getChannelByBroadcasterId, createJob } from '../db.js';
+import { getChannelByLogin, getChannelByBroadcasterId, createJob, updateJob } from '../db.js';
 import { enqueueJob } from '../queue.js';
+import { getValidAccessToken, createClip } from '../twitch.js';
 
 export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
   // StreamElements trigger endpoint (GET-only)
@@ -44,23 +45,47 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
     }
     
     try {
-      // Create job record
+      // Get valid access token for the channel
+      const accessToken = await getValidAccessToken(channelRecord.id);
+      
+      // Create clip on Twitch immediately
+      fastify.log.info(`Creating clip for channel ${channelRecord.twitch_login}...`);
+      const clipData = await createClip(channelRecord.twitch_broadcaster_id, accessToken);
+      
+      // Build the clip URL (edit_url redirects to clip page)
+      // Format: https://clips.twitch.tv/{channel}/clip/{clip_id}
+      const clipUrl = `https://clips.twitch.tv/${channelRecord.twitch_login}/clip/${clipData.id}`;
+      
+      // Create job record with clip already created
       const job = await createJob({
         channel_id: channelRecord.id,
         requested_by: user || null,
         source: 'streamelements',
-        status: 'queued',
+        status: 'waiting_clip',  // Skip to waiting stage
+        twitch_clip_id: clipData.id,
       });
       
-      // Push to Redis queue
+      // Push to Redis queue for background processing
       await enqueueJob(job.id);
       
-      fastify.log.info(`Clip job queued: ${job.id} for channel ${channelRecord.twitch_login} by ${user}`);
+      fastify.log.info(`Clip created: ${clipData.id} for channel ${channelRecord.twitch_login} by ${user}`);
       
-      return reply.send(`Queued ✅ job=${job.id.substring(0, 8)}. It will appear in the review queue soon.`);
-    } catch (err) {
-      fastify.log.error({ err }, 'Failed to queue clip job');
-      return reply.send('Failed to queue clip. Try again later.');
+      // Return the clip URL immediately!
+      return reply.send(`Clip created! 🎬 ${clipUrl}`);
+    } catch (err: any) {
+      // Handle specific Twitch errors
+      const errorMsg = err?.message || String(err);
+      
+      if (errorMsg.includes('Channel offline')) {
+        return reply.send('❌ Channel must be LIVE to create clips!');
+      }
+      
+      if (errorMsg.includes('Token refresh failed') || errorMsg.includes('re-authenticate')) {
+        return reply.send('❌ Auth expired. Streamer needs to reconnect at /auth/twitch/start');
+      }
+      
+      fastify.log.error({ err }, 'Failed to create clip');
+      return reply.send('❌ Failed to create clip. Try again later.');
     }
   });
   

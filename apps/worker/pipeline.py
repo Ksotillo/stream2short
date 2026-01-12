@@ -65,15 +65,22 @@ def process_job(job_id: str) -> None:
         # Get valid access token
         access_token = get_valid_access_token(job["channel_id"])
         
-        # Stage 1: Create clip
-        update_job_status(job_id, "creating_clip")
-        print("📹 Stage 1: Creating clip...")
+        # Check if clip was already created by the API
+        clip_id = job.get("twitch_clip_id")
         
-        clip_data = create_clip(broadcaster_id, access_token)
-        clip_id = clip_data["id"]
-        
-        update_job(job_id, twitch_clip_id=clip_id)
-        print(f"✅ Clip created: {clip_id}")
+        if clip_id:
+            # Clip already created by API, skip to Stage 2
+            print(f"📹 Clip already created by API: {clip_id}")
+        else:
+            # Stage 1: Create clip (fallback for direct API calls)
+            update_job_status(job_id, "creating_clip")
+            print("📹 Stage 1: Creating clip...")
+            
+            clip_data = create_clip(broadcaster_id, access_token)
+            clip_id = clip_data["id"]
+            
+            update_job(job_id, twitch_clip_id=clip_id)
+            print(f"✅ Clip created: {clip_id}")
         
         # Stage 2: Wait for clip to be available
         update_job_status(job_id, "waiting_clip")
