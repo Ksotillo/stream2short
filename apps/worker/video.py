@@ -79,28 +79,26 @@ def render_vertical_video(
         if subtitle_path.endswith(".ass"):
             filters.append(f"ass='{escaped_path}'")
         else:
-            # Modern social media style subtitles (TikTok/Reels style)
-            # Based on creator community research:
-            # - Montserrat SemiBold (most recommended font)
-            # - "Middle-low" positioning (above UI overlays)
-            # - White text with black outline
-            # - MarginV ~380 keeps text in safe zone above TikTok/Reels UI
+            # Modern social media style subtitles
+            # - Montserrat SemiBold (recommended font from creator research)
+            # - Bottom center positioning with safe margins
+            # - White text with black outline for readability
             filters.append(
                 f"subtitles=filename='{escaped_path}'"
                 ":force_style='"
-                "FontName=Montserrat SemiBold,"  # TikTok/Reels recommended font
-                "FontSize=22,"               # Clean readable size (not too big)
+                "FontName=Montserrat SemiBold,"  # Clean modern font
+                "FontSize=18,"               # Readable size
                 "PrimaryColour=&H00FFFFFF,"  # White text
                 "OutlineColour=&H00000000,"  # Black outline
                 "BackColour=&H80000000,"     # Semi-transparent shadow
                 "Bold=1,"                    # Bold weight
                 "BorderStyle=1,"             # Outline + shadow style
-                "Outline=4,"                 # Thick outline for readability
+                "Outline=2,"                 # Clean outline
                 "Shadow=1,"                  # Subtle drop shadow
                 "Alignment=2,"               # Bottom center
-                "MarginL=80,"                # Left margin (safe zone)
-                "MarginR=80,"                # Right margin (safe zone)
-                "MarginV=350"                # Middle-low position (above UI)
+                "MarginL=20,"                # Left margin
+                "MarginR=20,"                # Right margin
+                "MarginV=50"                 # Bottom margin
                 "'"
             )
     
