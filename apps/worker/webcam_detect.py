@@ -76,12 +76,15 @@ def detect_faces_in_region(
     width: int,
     height: int,
     face_cascade: cv2.CascadeClassifier,
-) -> bool:
+    padding_ratio: float = 0.5,  # How much padding around face (0.5 = 50% extra on each side)
+) -> Optional[WebcamRegion]:
     """
-    Detect if there are faces in a specific region of the frame.
+    Detect faces in a specific region of the frame.
     
-    Returns True if face found, False otherwise.
+    Returns WebcamRegion tightly cropped around the face with padding.
     """
+    frame_height, frame_width = frame.shape[:2]
+    
     # Crop the region
     region = frame[y_start:y_start+height, x_start:x_start+width]
     
@@ -98,66 +101,59 @@ def detect_faces_in_region(
     )
     
     if len(faces) > 0:
-        print(f"  ✅ Face detected in {region_name}: {len(faces)} face(s)")
-        return True
-    
-    return False
-
-
-def get_corner_webcam_region(
-    frame_width: int,
-    frame_height: int,
-    corner: str,
-    webcam_width_ratio: float = 0.28,   # Webcam is ~28% of stream width
-    webcam_height_ratio: float = 0.38,  # Webcam is ~38% of stream height
-) -> WebcamRegion:
-    """
-    Get a webcam region anchored to a specific corner.
-    
-    Args:
-        frame_width: Width of the video frame
-        frame_height: Height of the video frame
-        corner: Which corner ('top-left', 'top-right', 'bottom-left', 'bottom-right')
-        webcam_width_ratio: How much of frame width the webcam takes (default 28%)
-        webcam_height_ratio: How much of frame height the webcam takes (default 38%)
+        # Found at least one face - get the largest one
+        largest_face = max(faces, key=lambda f: f[2] * f[3])
+        fx, fy, fw, fh = largest_face
         
-    Returns:
-        WebcamRegion anchored to the specified corner
-    """
-    webcam_w = int(frame_width * webcam_width_ratio)
-    webcam_h = int(frame_height * webcam_height_ratio)
+        # Calculate tight crop around face with padding
+        # The face coordinates are relative to the region, convert to frame coordinates
+        face_center_x = x_start + fx + fw // 2
+        face_center_y = y_start + fy + fh // 2
+        
+        # Calculate crop size with padding (make it square-ish for better framing)
+        face_size = max(fw, fh)
+        crop_size = int(face_size * (1 + padding_ratio * 2))  # Face + padding on both sides
+        
+        # Make the crop wider than tall for a nice webcam frame (16:9 aspect)
+        crop_width = int(crop_size * 1.5)
+        crop_height = crop_size
+        
+        # Calculate crop coordinates centered on face
+        crop_x = face_center_x - crop_width // 2
+        crop_y = face_center_y - crop_height // 2
+        
+        # Clamp to frame boundaries
+        crop_x = max(0, min(crop_x, frame_width - crop_width))
+        crop_y = max(0, min(crop_y, frame_height - crop_height))
+        crop_width = min(crop_width, frame_width - crop_x)
+        crop_height = min(crop_height, frame_height - crop_y)
+        
+        print(f"  ✅ Face detected in {region_name}: face={fw}x{fh}, crop={crop_width}x{crop_height}")
+        
+        return WebcamRegion(
+            x=crop_x,
+            y=crop_y,
+            width=crop_width,
+            height=crop_height,
+            position=region_name
+        )
     
-    if corner == 'top-left':
-        return WebcamRegion(x=0, y=0, width=webcam_w, height=webcam_h, position=corner)
-    elif corner == 'top-right':
-        return WebcamRegion(x=frame_width - webcam_w, y=0, width=webcam_w, height=webcam_h, position=corner)
-    elif corner == 'bottom-left':
-        return WebcamRegion(x=0, y=frame_height - webcam_h, width=webcam_w, height=webcam_h, position=corner)
-    elif corner == 'bottom-right':
-        return WebcamRegion(x=frame_width - webcam_w, y=frame_height - webcam_h, width=webcam_w, height=webcam_h, position=corner)
-    else:
-        raise ValueError(f"Unknown corner: {corner}")
+    return None
 
 
 def detect_webcam_region(
     video_path: str,
     sample_times: list[float] = [3.0, 10.0, 15.0],
-    webcam_width_ratio: float = 0.28,   # Webcam typically ~28% of stream width
-    webcam_height_ratio: float = 0.38,  # Webcam typically ~38% of stream height
 ) -> Optional[WebcamRegion]:
     """
     Detect the webcam/facecam region in a video.
     
-    Strategy:
-    1. Sample multiple frames and look for faces in corner regions
-    2. Once we know WHICH corner has a face, return a fixed webcam crop from that corner
-    3. This ensures we capture the FULL webcam overlay, not just the face
+    Samples multiple frames and looks for faces in the corner regions.
+    Returns the region where a face is most consistently detected.
     
     Args:
         video_path: Path to the video file
         sample_times: List of times (in seconds) to sample frames from
-        webcam_width_ratio: Expected webcam width as ratio of frame (default 28%)
-        webcam_height_ratio: Expected webcam height as ratio of frame (default 38%)
         
     Returns:
         WebcamRegion if webcam detected, None otherwise
@@ -165,6 +161,7 @@ def detect_webcam_region(
     print(f"🔍 Detecting webcam region in: {video_path}")
     
     # Load OpenCV's pre-trained face detector
+    # Try multiple paths for the cascade file
     cascade_paths = [
         cv2.data.haarcascades + 'haarcascade_frontalface_default.xml',
         '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
@@ -181,16 +178,15 @@ def detect_webcam_region(
         print("⚠️ Could not load face cascade classifier")
         return None
     
-    # Track detections per corner
-    corner_detections: dict[str, int] = {
+    # Track detections per region
+    region_detections: dict[str, int] = {
         'top-left': 0,
         'top-right': 0,
         'bottom-left': 0,
         'bottom-right': 0,
     }
     
-    frame_width = 0
-    frame_height = 0
+    detected_regions: dict[str, WebcamRegion] = {}
     
     for sample_time in sample_times:
         frame = extract_frame(video_path, sample_time)
@@ -199,56 +195,49 @@ def detect_webcam_region(
         
         frame_height, frame_width = frame.shape[:2]
         
-        # Search area is slightly larger than webcam to ensure we find faces
-        search_width = int(frame_width * 0.40)
-        search_height = int(frame_height * 0.45)
+        # Define corner regions (approximately 30% of each dimension)
+        region_width = int(frame_width * 0.35)
+        region_height = int(frame_height * 0.40)
         
         print(f"  📸 Sampling frame at {sample_time}s ({frame_width}x{frame_height})")
         
-        # Check each corner region for faces
+        # Check each corner region
         corners = {
             'top-left': (0, 0),
-            'top-right': (frame_width - search_width, 0),
-            'bottom-left': (0, frame_height - search_height),
-            'bottom-right': (frame_width - search_width, frame_height - search_height),
+            'top-right': (frame_width - region_width, 0),
+            'bottom-left': (0, frame_height - region_height),
+            'bottom-right': (frame_width - region_width, frame_height - region_height),
         }
         
-        for corner_name, (x_start, y_start) in corners.items():
-            has_face = detect_faces_in_region(
+        for region_name, (x_start, y_start) in corners.items():
+            result = detect_faces_in_region(
                 frame=frame,
-                region_name=corner_name,
+                region_name=region_name,
                 x_start=x_start,
                 y_start=y_start,
-                width=search_width,
-                height=search_height,
+                width=region_width,
+                height=region_height,
                 face_cascade=face_cascade,
             )
             
-            if has_face:
-                corner_detections[corner_name] += 1
+            if result:
+                region_detections[region_name] += 1
+                detected_regions[region_name] = result
     
-    # Find corner with most consistent face detections
-    if not any(corner_detections.values()):
+    # Find region with most consistent detections
+    if not any(region_detections.values()):
         print("❌ No webcam/face detected in any corner")
         return None
     
-    best_corner = max(corner_detections, key=corner_detections.get)
-    detection_count = corner_detections[best_corner]
+    best_region = max(region_detections, key=region_detections.get)
+    detection_count = region_detections[best_region]
     
     if detection_count == 0:
         print("❌ No consistent face detections")
         return None
     
-    # Now return a fixed webcam region anchored to that corner
-    result = get_corner_webcam_region(
-        frame_width=frame_width,
-        frame_height=frame_height,
-        corner=best_corner,
-        webcam_width_ratio=webcam_width_ratio,
-        webcam_height_ratio=webcam_height_ratio,
-    )
-    
-    print(f"✅ Webcam detected in {best_corner}: {result}")
+    result = detected_regions[best_region]
+    print(f"✅ Webcam detected: {result}")
     return result
 
 
