@@ -128,12 +128,27 @@ def process_job(job_id: str) -> None:
         # Use display_name or twitch_login for folder name
         streamer_name = channel.get("display_name") or channel.get("twitch_login") or broadcaster_id
         
+        # Read transcript for descriptive filename
+        transcript_text = ""
+        try:
+            if os.path.exists(srt_path):
+                with open(srt_path, "r", encoding="utf-8") as f:
+                    # Extract just the text lines (skip numbers and timestamps)
+                    lines = f.readlines()
+                    text_lines = [l.strip() for l in lines if l.strip() and 
+                                  not l.strip().isdigit() and 
+                                  "-->" not in l]
+                    transcript_text = " ".join(text_lines)
+        except Exception as e:
+            print(f"⚠️ Could not read transcript: {e}")
+        
         # Check if Google Drive is configured
         if config.GOOGLE_SERVICE_ACCOUNT_FILE or config.GOOGLE_SERVICE_ACCOUNT_JSON:
             upload_result = upload_file(
                 local_path=final_video_path,
                 streamer_name=streamer_name,
                 job_id=job_id,
+                transcript_text=transcript_text,
             )
             final_url = upload_result.get("webViewLink") or upload_result.get("webContentLink", "")
             drive_file_id = upload_result.get("id", "")

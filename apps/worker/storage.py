@@ -2,9 +2,12 @@
 
 Service accounts cannot upload to personal Google Drive (no storage quota).
 This module uploads to a Shared Drive where the service account is a member.
+
+Folder structure: {Shared Drive}/{Parent Folder}/{Streamer}/{Date}/{clip_name}.mp4
 """
 
 import os
+import re
 import json
 from datetime import datetime
 from typing import Optional
@@ -23,6 +26,61 @@ _drive_service = None
 class SharedDriveError(Exception):
     """Shared Drive operation error with helpful messages."""
     pass
+
+
+def generate_clip_name_from_transcript(transcript_text: str, max_words: int = 5) -> str:
+    """
+    Generate a descriptive clip name from transcription text.
+    
+    Args:
+        transcript_text: The transcribed text from the clip
+        max_words: Maximum words to use in the name
+        
+    Returns:
+        A clean, filesystem-safe name derived from the transcript
+    """
+    if not transcript_text or not transcript_text.strip():
+        return "clip"
+    
+    # Clean the text
+    text = transcript_text.strip()
+    
+    # Remove special characters, keep only alphanumeric and spaces
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    # Get first N words
+    words = text.split()[:max_words]
+    
+    if not words:
+        return "clip"
+    
+    # Join with underscores and lowercase
+    name = "_".join(words).lower()
+    
+    # Limit length
+    if len(name) > 50:
+        name = name[:50]
+    
+    # Remove trailing underscores
+    name = name.rstrip('_')
+    
+    return name if name else "clip"
+
+
+def sanitize_folder_name(name: str) -> str:
+    """
+    Sanitize a string to be safe for folder names.
+    
+    Args:
+        name: Raw name
+        
+    Returns:
+        Filesystem-safe name
+    """
+    # Remove or replace invalid characters
+    safe_name = re.sub(r'[<>:"/\\|?*]', '', name)
+    safe_name = safe_name.strip()
+    return safe_name if safe_name else "unnamed"
 
 
 def get_drive_service():
@@ -191,6 +249,57 @@ def create_folder_in_shared_drive(
         raise SharedDriveError(f"Failed to create folder: {e}")
 
 
+def find_or_create_folder(
+    shared_drive_id: str,
+    folder_name: str,
+    parent_id: Optional[str] = None
+) -> str:
+    """
+    Find or create a single folder in the Shared Drive.
+    
+    Args:
+        shared_drive_id: The Shared Drive ID
+        folder_name: Name of the folder
+        parent_id: Parent folder ID (or shared drive ID for root)
+        
+    Returns:
+        Folder ID
+    """
+    # Search for existing
+    folder_id = find_folder_in_shared_drive(shared_drive_id, folder_name, parent_id)
+    
+    if folder_id:
+        return folder_id
+    
+    # Create new folder
+    return create_folder_in_shared_drive(shared_drive_id, folder_name, parent_id)
+
+
+def ensure_folder_path(
+    shared_drive_id: str,
+    folder_path: list[str],
+    root_folder_id: Optional[str] = None
+) -> str:
+    """
+    Ensure a nested folder path exists, creating folders as needed.
+    
+    Args:
+        shared_drive_id: The Shared Drive ID
+        folder_path: List of folder names from root to leaf, e.g. ["Streamer", "2026-01-11"]
+        root_folder_id: Starting folder ID (or None for shared drive root)
+        
+    Returns:
+        ID of the deepest (leaf) folder
+    """
+    current_parent = root_folder_id or shared_drive_id
+    
+    for folder_name in folder_path:
+        safe_name = sanitize_folder_name(folder_name)
+        current_parent = find_or_create_folder(shared_drive_id, safe_name, current_parent)
+    
+    return current_parent
+
+
 def ensure_shared_drive_folder(
     shared_drive_id: str,
     folder_name: str,
@@ -241,16 +350,20 @@ def upload_file(
     local_path: str,
     streamer_name: str,
     job_id: str,
+    transcript_text: str = "",
     filename: str = "final.mp4",
 ) -> dict:
     """
-    Upload a file to the Shared Drive.
+    Upload a file to the Shared Drive with organized folder structure.
+    
+    Folder structure: {Parent Folder}/{Streamer Name}/{Date}/{descriptive_name}.mp4
     
     Args:
         local_path: Path to local file
         streamer_name: Streamer's Twitch login/display name
-        job_id: Job UUID (used in filename)
-        filename: Output filename
+        job_id: Job UUID (used in filename as fallback)
+        transcript_text: Transcription text for generating descriptive name
+        filename: Output filename (unused, kept for compatibility)
         
     Returns:
         Dict with 'id', 'name', 'webViewLink', 'webContentLink', 'path'
@@ -268,18 +381,35 @@ def upload_file(
             "Service accounts require a Shared Drive to upload files."
         )
     
-    # Ensure destination folder exists
-    destination_folder_id = ensure_shared_drive_folder(
+    # Verify access to Shared Drive
+    verify_shared_drive_access(shared_drive_id)
+    
+    # Build folder path: Parent -> Streamer -> Date
+    date_folder = datetime.now().strftime('%Y-%m-%d')
+    folder_path = [
+        config.GDRIVE_PARENT_FOLDER_NAME,  # e.g., "Stream2Short Uploads"
+        sanitize_folder_name(streamer_name),  # e.g., "SrGriff"
+        date_folder,  # e.g., "2026-01-11"
+    ]
+    
+    # Get or create starting folder if specified
+    root_folder_id = config.GDRIVE_PARENT_FOLDER_ID if config.GDRIVE_PARENT_FOLDER_ID else None
+    
+    # Ensure the full folder path exists
+    print(f"📁 Creating folder structure: {'/'.join(folder_path)}")
+    destination_folder_id = ensure_folder_path(
         shared_drive_id=shared_drive_id,
-        folder_name=config.GDRIVE_PARENT_FOLDER_NAME,
-        parent_folder_id=config.GDRIVE_PARENT_FOLDER_ID or None
+        folder_path=folder_path,
+        root_folder_id=root_folder_id
     )
     
-    # Build descriptive filename
-    date_str = datetime.now().strftime('%Y-%m-%d_%H%M%S')
-    final_filename = f"{streamer_name}_{date_str}_{job_id[:8]}.mp4"
+    # Generate descriptive filename from transcript
+    clip_name = generate_clip_name_from_transcript(transcript_text)
+    time_str = datetime.now().strftime('%H%M%S')
+    final_filename = f"{clip_name}_{time_str}_{job_id[:6]}.mp4"
     
-    print(f"📤 Uploading to Shared Drive: {final_filename}")
+    full_path = f"{'/'.join(folder_path)}/{final_filename}"
+    print(f"📤 Uploading: {full_path}")
     
     # Prepare file metadata
     file_metadata = {
@@ -312,7 +442,7 @@ def upload_file(
             'name': file['name'],
             'webViewLink': file.get('webViewLink', ''),
             'webContentLink': file.get('webContentLink', ''),
-            'path': f"{config.GDRIVE_PARENT_FOLDER_NAME}/{final_filename}"
+            'path': full_path
         }
         
     except HttpError as e:

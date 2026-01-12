@@ -67,8 +67,8 @@ def render_vertical_video(
     filters = []
     
     # Scale to fill height, then crop to target dimensions
-    # This ensures the video fills the vertical frame without letterboxing
-    filters.append(f"scale={width}:{height}:force_original_aspect_ratio=increase")
+    # Use lanczos for sharper upscaling
+    filters.append(f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos")
     filters.append(f"crop={width}:{height}")
     
     # Add subtitles if available and valid
@@ -104,19 +104,20 @@ def render_vertical_video(
     
     filter_complex = ",".join(filters)
     
-    # Build FFmpeg command with high quality settings
+    # Build FFmpeg command with maximum quality settings
     cmd = [
         "ffmpeg",
         "-y",  # Overwrite output
         "-i", input_path,
         "-vf", filter_complex,
         "-c:v", "libx264",
-        "-preset", "slow",      # Better quality encoding
-        "-crf", "18",           # High quality (lower = better, 18 is visually lossless)
+        "-preset", "veryslow",  # Maximum quality encoding
+        "-crf", "16",           # Very high quality
         "-profile:v", "high",   # High profile for better compression
-        "-level", "4.1",        # Compatibility level
+        "-level", "4.2",        # Modern compatibility level
+        "-pix_fmt", "yuv420p",  # Maximum compatibility
         "-c:a", "aac",
-        "-b:a", "192k",         # Higher audio bitrate
+        "-b:a", "256k",         # High quality audio
         "-movflags", "+faststart",
         output_path,
     ]
