@@ -1,12 +1,18 @@
 # Stream2Short Worker Dockerfile
 FROM python:3.11-slim
 
-# Install system dependencies and fonts for subtitles
+# Install system dependencies, OpenCV libs, and fonts for subtitles
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
     wget \
     unzip \
+    # OpenCV dependencies for face detection
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgl1-mesa-glx \
     # Fonts for social media style subtitles
     fonts-liberation \
     fonts-dejavu-core \

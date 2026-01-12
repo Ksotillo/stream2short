@@ -2,7 +2,11 @@
 
 import subprocess
 import os
+import json
 from pathlib import Path
+from typing import Optional
+
+from webcam_detect import detect_webcam_region, WebcamRegion, get_video_dimensions
 
 
 class VideoProcessingError(Exception):
@@ -192,7 +196,6 @@ def get_video_info(video_path: str) -> dict:
         video_path,
     ]
     
-    import json
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     data = json.loads(result.stdout)
     
@@ -209,4 +212,229 @@ def get_video_info(video_path: str) -> dict:
         "codec": video_stream.get("codec_name", ""),
         "fps": eval(video_stream.get("r_frame_rate", "0/1")) if "/" in video_stream.get("r_frame_rate", "0") else 0,
     }
+
+
+def render_split_layout_video(
+    input_path: str,
+    output_path: str,
+    webcam_region: WebcamRegion,
+    subtitle_path: str | None = None,
+    width: int = 1080,
+    height: int = 1920,
+    webcam_height_ratio: float = 0.30,  # Webcam takes 30% of height
+) -> str:
+    """
+    Render a split-layout vertical video with webcam on top and main content below.
+    
+    Layout:
+    ┌──────────────────┐
+    │    WEBCAM        │  30% height
+    │   (face crop)    │
+    ├──────────────────┤
+    │                  │
+    │  MAIN CONTENT    │  70% height
+    │   (gameplay)     │
+    │                  │
+    └──────────────────┘
+    
+    Args:
+        input_path: Path to input video
+        output_path: Path to output video
+        webcam_region: Detected webcam region
+        subtitle_path: Optional path to subtitle file
+        width: Output width (default 1080)
+        height: Output height (default 1920)
+        webcam_height_ratio: Ratio of height for webcam (default 0.30)
+        
+    Returns:
+        Path to output video
+        
+    Raises:
+        VideoProcessingError: If FFmpeg fails
+    """
+    print(f"🎬 Rendering split-layout video: {input_path} -> {output_path}")
+    print(f"   Webcam region: {webcam_region}")
+    
+    # Calculate layout dimensions
+    webcam_h = int(height * webcam_height_ratio)
+    content_h = height - webcam_h
+    
+    print(f"   Layout: webcam={webcam_h}px, content={content_h}px")
+    
+    # Get source video dimensions
+    src_width, src_height = get_video_dimensions(input_path)
+    print(f"   Source video: {src_width}x{src_height}")
+    
+    # Check if subtitle file exists and has content
+    use_subtitles = False
+    if subtitle_path and os.path.exists(subtitle_path):
+        file_size = os.path.getsize(subtitle_path)
+        if file_size > 10:
+            use_subtitles = True
+    
+    # Build complex filter graph
+    # 
+    # Input [0:v] splits into:
+    #   1. Webcam crop -> scale to full width, webcam_h height
+    #   2. Main content -> scale to full width, content_h height (center crop)
+    # Then stack vertically
+    
+    # Webcam: crop the detected region, scale to fill width
+    webcam_filter = (
+        f"[0:v]crop={webcam_region.width}:{webcam_region.height}:{webcam_region.x}:{webcam_region.y},"
+        f"scale={width}:{webcam_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={width}:{webcam_h}[webcam]"
+    )
+    
+    # Main content: exclude the webcam corner, scale and center crop
+    # We scale the full video to fit the content area, maintaining aspect ratio
+    content_filter = (
+        f"[0:v]scale={width}:{content_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={width}:{content_h}[content]"
+    )
+    
+    # Stack vertically: webcam on top, content below
+    stack_filter = "[webcam][content]vstack=inputs=2[stacked]"
+    
+    # Combine all filters
+    filter_parts = [webcam_filter, content_filter, stack_filter]
+    
+    # Add subtitles if available (apply to final stacked output)
+    if use_subtitles:
+        escaped_path = escape_ffmpeg_path(subtitle_path)
+        # Position subtitles in the content area (below webcam)
+        # MarginV should position it within the content section
+        subtitle_margin_v = int(content_h * 0.05)  # 5% from bottom of content area
+        
+        subtitle_filter = (
+            f"[stacked]subtitles=filename='{escaped_path}'"
+            ":force_style='"
+            "FontName=Montserrat SemiBold,"
+            "FontSize=18,"
+            "PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,"
+            "BackColour=&H80000000,"
+            "Bold=1,"
+            "BorderStyle=1,"
+            "Outline=2,"
+            "Shadow=1,"
+            "Alignment=2,"
+            "MarginL=20,"
+            "MarginR=20,"
+            f"MarginV={subtitle_margin_v}"
+            "'[final]"
+        )
+        filter_parts.append(subtitle_filter)
+        output_label = "[final]"
+    else:
+        output_label = "[stacked]"
+    
+    filter_complex = ";".join(filter_parts)
+    
+    # Build FFmpeg command
+    cmd = [
+        "ffmpeg",
+        "-y",  # Overwrite output
+        "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", output_label,
+        "-map", "0:a",  # Keep original audio
+        "-c:v", "libx264",
+        "-preset", "veryslow",
+        "-crf", "16",
+        "-profile:v", "high",
+        "-level", "4.2",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "256k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    
+    print(f"🔧 Running FFmpeg with split layout...")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        print("✅ Split-layout video rendering complete")
+        return output_path
+        
+    except subprocess.CalledProcessError as e:
+        # If subtitles failed, try without them
+        if use_subtitles and ("Unable to open" in e.stderr or "Error" in e.stderr):
+            print("⚠️ Subtitle rendering failed, trying without subtitles...")
+            return render_split_layout_video(
+                input_path=input_path,
+                output_path=output_path,
+                webcam_region=webcam_region,
+                subtitle_path=None,
+                width=width,
+                height=height,
+                webcam_height_ratio=webcam_height_ratio,
+            )
+        
+        error_msg = f"FFmpeg failed: {e.stderr}"
+        print(f"❌ {error_msg}")
+        raise VideoProcessingError(error_msg)
+
+
+def render_video_auto(
+    input_path: str,
+    output_path: str,
+    subtitle_path: str | None = None,
+    width: int = 1080,
+    height: int = 1920,
+    enable_webcam_detection: bool = True,
+) -> str:
+    """
+    Automatically render the best layout based on webcam detection.
+    
+    If a webcam/face is detected in a corner, uses split layout.
+    Otherwise, falls back to simple center crop.
+    
+    Args:
+        input_path: Path to input video
+        output_path: Path to output video
+        subtitle_path: Optional path to subtitle file
+        width: Output width (default 1080)
+        height: Output height (default 1920)
+        enable_webcam_detection: Whether to try detecting webcam (default True)
+        
+    Returns:
+        Path to output video
+    """
+    webcam_region = None
+    
+    if enable_webcam_detection:
+        try:
+            webcam_region = detect_webcam_region(input_path)
+        except Exception as e:
+            print(f"⚠️ Webcam detection failed: {e}")
+            webcam_region = None
+    
+    if webcam_region:
+        # Use split layout with webcam on top
+        print("🎥 Using split layout (webcam + content)")
+        return render_split_layout_video(
+            input_path=input_path,
+            output_path=output_path,
+            webcam_region=webcam_region,
+            subtitle_path=subtitle_path,
+            width=width,
+            height=height,
+        )
+    else:
+        # Fall back to simple center crop
+        print("📹 Using simple center crop (no webcam detected)")
+        return render_vertical_video(
+            input_path=input_path,
+            output_path=output_path,
+            subtitle_path=subtitle_path,
+            width=width,
+            height=height,
+        )
 

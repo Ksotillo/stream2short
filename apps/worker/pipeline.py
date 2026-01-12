@@ -15,7 +15,7 @@ from twitch_api import (
     TwitchAPIError,
 )
 from transcribe import transcribe_video
-from video import render_vertical_video, VideoProcessingError
+from video import render_vertical_video, render_video_auto, VideoProcessingError
 from storage import upload_file, SharedDriveError
 
 
@@ -114,15 +114,16 @@ def process_job(job_id: str) -> None:
         transcribe_video(raw_video_path, srt_path)
         print(f"✅ Transcription saved to: {srt_path}")
         
-        # Stage 5: Render vertical video with subtitles
+        # Stage 5: Render vertical video with subtitles (auto-detect webcam)
         update_job_status(job_id, "rendering")
         print("🎬 Stage 5: Rendering vertical video...")
         
         final_video_path = str(temp_dir / "final.mp4")
-        render_vertical_video(
+        render_video_auto(
             input_path=raw_video_path,
             output_path=final_video_path,
             subtitle_path=srt_path,
+            enable_webcam_detection=True,  # Auto-detect and split layout
         )
         
         update_job(job_id, final_video_path=final_video_path)

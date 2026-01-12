@@ -26,3 +26,7 @@ pydantic>=2.5.0
 # Video downloading (Twitch clips)
 yt-dlp>=2024.1.0
 
+# Face/webcam detection
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+
