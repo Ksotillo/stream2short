@@ -79,26 +79,28 @@ def render_vertical_video(
         if subtitle_path.endswith(".ass"):
             filters.append(f"ass='{escaped_path}'")
         else:
-            # Modern social media style subtitles (TikTok/Reels inspired)
-            # - Bold font, readable size
-            # - Centered at bottom with good margin
+            # Modern social media style subtitles (TikTok/Reels style)
+            # Based on creator community research:
+            # - Montserrat SemiBold (most recommended font)
+            # - "Middle-low" positioning (above UI overlays)
             # - White text with black outline
+            # - MarginV ~380 keeps text in safe zone above TikTok/Reels UI
             filters.append(
                 f"subtitles=filename='{escaped_path}'"
                 ":force_style='"
-                "FontName=Liberation Sans,"  # Clean font (installed in container)
-                "FontSize=24,"               # Readable size for 1080x1920
+                "FontName=Montserrat SemiBold,"  # TikTok/Reels recommended font
+                "FontSize=22,"               # Clean readable size (not too big)
                 "PrimaryColour=&H00FFFFFF,"  # White text
                 "OutlineColour=&H00000000,"  # Black outline
-                "BackColour=&H40000000,"     # Semi-transparent shadow
-                "Bold=1,"                    # Bold
-                "BorderStyle=1,"             # Outline + shadow
-                "Outline=2,"                 # Clean outline
-                "Shadow=1,"                  # Subtle shadow
+                "BackColour=&H80000000,"     # Semi-transparent shadow
+                "Bold=1,"                    # Bold weight
+                "BorderStyle=1,"             # Outline + shadow style
+                "Outline=4,"                 # Thick outline for readability
+                "Shadow=1,"                  # Subtle drop shadow
                 "Alignment=2,"               # Bottom center
-                "MarginL=20,"                # Left margin
-                "MarginR=20,"                # Right margin  
-                "MarginV=60"                 # Bottom margin
+                "MarginL=80,"                # Left margin (safe zone)
+                "MarginR=80,"                # Right margin (safe zone)
+                "MarginV=350"                # Middle-low position (above UI)
                 "'"
             )
     
