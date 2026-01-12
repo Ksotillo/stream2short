@@ -76,12 +76,15 @@ def detect_faces_in_region(
     width: int,
     height: int,
     face_cascade: cv2.CascadeClassifier,
+    padding_ratio: float = 0.5,  # How much padding around face (0.5 = 50% extra on each side)
 ) -> Optional[WebcamRegion]:
     """
     Detect faces in a specific region of the frame.
     
-    Returns WebcamRegion if face found, None otherwise.
+    Returns WebcamRegion tightly cropped around the face with padding.
     """
+    frame_height, frame_width = frame.shape[:2]
+    
     # Crop the region
     region = frame[y_start:y_start+height, x_start:x_start+width]
     
@@ -98,13 +101,40 @@ def detect_faces_in_region(
     )
     
     if len(faces) > 0:
-        # Found at least one face - return the entire region as webcam area
-        print(f"  ✅ Face detected in {region_name}: {len(faces)} face(s)")
+        # Found at least one face - get the largest one
+        largest_face = max(faces, key=lambda f: f[2] * f[3])
+        fx, fy, fw, fh = largest_face
+        
+        # Calculate tight crop around face with padding
+        # The face coordinates are relative to the region, convert to frame coordinates
+        face_center_x = x_start + fx + fw // 2
+        face_center_y = y_start + fy + fh // 2
+        
+        # Calculate crop size with padding (make it square-ish for better framing)
+        face_size = max(fw, fh)
+        crop_size = int(face_size * (1 + padding_ratio * 2))  # Face + padding on both sides
+        
+        # Make the crop wider than tall for a nice webcam frame (16:9 aspect)
+        crop_width = int(crop_size * 1.5)
+        crop_height = crop_size
+        
+        # Calculate crop coordinates centered on face
+        crop_x = face_center_x - crop_width // 2
+        crop_y = face_center_y - crop_height // 2
+        
+        # Clamp to frame boundaries
+        crop_x = max(0, min(crop_x, frame_width - crop_width))
+        crop_y = max(0, min(crop_y, frame_height - crop_height))
+        crop_width = min(crop_width, frame_width - crop_x)
+        crop_height = min(crop_height, frame_height - crop_y)
+        
+        print(f"  ✅ Face detected in {region_name}: face={fw}x{fh}, crop={crop_width}x{crop_height}")
+        
         return WebcamRegion(
-            x=x_start,
-            y=y_start,
-            width=width,
-            height=height,
+            x=crop_x,
+            y=crop_y,
+            width=crop_width,
+            height=crop_height,
             position=region_name
         )
     
