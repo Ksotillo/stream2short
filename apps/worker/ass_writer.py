@@ -32,12 +32,12 @@ def generate_ass_header(
     play_res_x: int = 1080,
     play_res_y: int = 1920,
     font_name: str = "Montserrat SemiBold",
-    font_size: int = 18,
-    margin_v: int = 50,
-    margin_l: int = 20,
-    margin_r: int = 20,
-    outline: int = 2,
-    shadow: int = 1,
+    font_size: int = 52,  # Scaled for 1920 height (was 18, too small)
+    margin_v: int = 120,  # Safe margin from bottom
+    margin_l: int = 40,
+    margin_r: int = 40,
+    outline: int = 3,
+    shadow: int = 2,
 ) -> str:
     """
     Generate ASS file header with script info and styles.
@@ -123,10 +123,10 @@ def segments_to_ass(
     play_res_x: int = 1080,
     play_res_y: int = 1920,
     font_name: str = "Montserrat SemiBold",
-    font_size: int = 18,
-    margin_v: int = 50,
-    margin_l: int = 20,
-    margin_r: int = 20,
+    font_size: int = 52,  # Scaled for 1920 height
+    margin_v: int = 120,  # Safe margin from bottom
+    margin_l: int = 40,
+    margin_r: int = 40,
 ) -> str:
     """
     Convert transcript segments to ASS subtitle file.
