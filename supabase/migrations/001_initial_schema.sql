@@ -5,13 +5,19 @@
 -- CHANNELS TABLE
 -- Stores one record per streamer (tenant)
 -- ============================================================================
+-- 
+-- Settings JSON schema:
+-- {
+--   "enable_diarization": boolean  -- Override global ENABLE_DIARIZATION for this channel
+-- }
+--
 CREATE TABLE IF NOT EXISTS channels (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     twitch_broadcaster_id TEXT UNIQUE NOT NULL,
     twitch_login TEXT,
     display_name TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    settings JSONB DEFAULT '{}'::jsonb
+    settings JSONB DEFAULT '{}'::jsonb  -- Per-channel settings (see schema above)
 );
 
 -- Index for looking up by login name (used by StreamElements)

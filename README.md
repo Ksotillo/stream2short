@@ -320,7 +320,19 @@ queued → creating_clip → waiting_clip → downloading → transcribing → r
 3. Create a read token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
 4. Set `HF_TOKEN` and `ENABLE_DIARIZATION=true`
 
-**Per-channel toggle:** Add `"enable_diarization": true` to a channel's `settings` JSON in Supabase to enable for specific streamers only.
+**Per-channel toggle:** Update a channel's `settings` JSON in Supabase to override the global setting:
+
+```sql
+-- Enable diarization for a specific channel
+UPDATE channels 
+SET settings = jsonb_set(settings, '{enable_diarization}', 'true')
+WHERE twitch_login = 'streamer_name';
+
+-- Disable diarization for a specific channel (even if globally enabled)
+UPDATE channels 
+SET settings = jsonb_set(settings, '{enable_diarization}', 'false')
+WHERE twitch_login = 'streamer_name';
+```
 
 ## License
 
