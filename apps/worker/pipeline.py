@@ -165,24 +165,37 @@ def process_job(job_id: str) -> None:
         )
         print(f"✅ Subtitles saved to: {subtitle_path}")
         
-        # Stage 5: Render vertical video with subtitles (auto-detect webcam)
+        # Stage 5: Render vertical videos (TWO versions: with and without subtitles)
         update_job_status(job_id, "rendering")
-        print("🎬 Stage 5: Rendering vertical video...")
+        print("🎬 Stage 5: Rendering vertical videos (2 versions)...")
         
-        final_video_path = str(temp_dir / "final.mp4")
+        # Version 1: WITHOUT subtitles (raw vertical crop)
+        video_no_subs_path = str(temp_dir / "final_no_subs.mp4")
+        print("🎬 Rendering version WITHOUT subtitles...")
         render_video_auto(
             input_path=raw_video_path,
-            output_path=final_video_path,
-            subtitle_path=subtitle_path,
-            enable_webcam_detection=True,  # Auto-detect and split layout
+            output_path=video_no_subs_path,
+            subtitle_path=None,  # No subtitles
+            enable_webcam_detection=True,
         )
+        print(f"✅ Rendered (no subs): {video_no_subs_path}")
         
-        update_job(job_id, final_video_path=final_video_path)
-        print(f"✅ Rendered to: {final_video_path}")
+        # Version 2: WITH subtitles
+        video_with_subs_path = str(temp_dir / "final_with_subs.mp4")
+        print("🎬 Rendering version WITH subtitles...")
+        render_video_auto(
+            input_path=raw_video_path,
+            output_path=video_with_subs_path,
+            subtitle_path=subtitle_path,
+            enable_webcam_detection=True,
+        )
+        print(f"✅ Rendered (with subs): {video_with_subs_path}")
         
-        # Stage 6: Upload to Google Drive
+        update_job(job_id, final_video_path=video_with_subs_path)
+        
+        # Stage 6: Upload BOTH versions to Google Drive
         update_job_status(job_id, "uploading")
-        print("📤 Stage 6: Uploading to Google Drive...")
+        print("📤 Stage 6: Uploading to Google Drive (2 versions)...")
         
         # Use display_name or twitch_login for folder name
         streamer_name = channel.get("display_name") or channel.get("twitch_login") or broadcaster_id
@@ -190,23 +203,44 @@ def process_job(job_id: str) -> None:
         # Use transcript text from transcription stage
         transcript_text = transcript_text_raw
         
+        # Get clip timestamp from clip_info
+        clip_timestamp = clip_info.get("created_at", "")
+        
         # Check if Google Drive is configured
         if config.GOOGLE_SERVICE_ACCOUNT_FILE or config.GOOGLE_SERVICE_ACCOUNT_JSON:
-            upload_result = upload_file(
-                local_path=final_video_path,
+            # Upload version WITHOUT subtitles
+            print("📤 Uploading WITHOUT_SUBTITLES version...")
+            upload_result_no_subs = upload_file(
+                local_path=video_no_subs_path,
                 streamer_name=streamer_name,
                 job_id=job_id,
                 transcript_text=transcript_text,
+                clip_timestamp=clip_timestamp,
+                version_suffix="WITHOUT_SUBTITLES",
             )
-            final_url = upload_result.get("webViewLink") or upload_result.get("webContentLink", "")
-            drive_file_id = upload_result.get("id", "")
-            drive_path = upload_result.get("path", "")
+            print(f"📁 Saved: {upload_result_no_subs.get('path', '')}")
             
-            print(f"📁 Saved to: {drive_path}")
+            # Upload version WITH subtitles
+            print("📤 Uploading WITH_SUBTITLES version...")
+            upload_result_with_subs = upload_file(
+                local_path=video_with_subs_path,
+                streamer_name=streamer_name,
+                job_id=job_id,
+                transcript_text=transcript_text,
+                clip_timestamp=clip_timestamp,
+                version_suffix="WITH_SUBTITLES",
+            )
+            print(f"📁 Saved: {upload_result_with_subs.get('path', '')}")
+            
+            # Use the WITH_SUBTITLES version as the primary URL
+            final_url = upload_result_with_subs.get("webViewLink") or upload_result_with_subs.get("webContentLink", "")
+            drive_path = upload_result_with_subs.get("path", "")
+            
+            print(f"📁 Both versions saved to: {'/'.join(drive_path.split('/')[:-1])}/")
         else:
             # No Google Drive configured, keep local path
-            print("⚠️ Google Drive not configured, keeping local file")
-            final_url = final_video_path
+            print("⚠️ Google Drive not configured, keeping local files")
+            final_url = video_with_subs_path
         
         # Mark job as ready
         update_job(

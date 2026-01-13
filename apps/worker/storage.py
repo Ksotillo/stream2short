@@ -67,6 +67,25 @@ def generate_clip_name_from_transcript(transcript_text: str, max_words: int = 5)
     return name if name else "clip"
 
 
+def format_clip_timestamp(created_at: str) -> str:
+    """
+    Format Twitch clip created_at timestamp for filename.
+    
+    Args:
+        created_at: ISO timestamp from Twitch API (e.g., "2026-01-13T15:30:45Z")
+        
+    Returns:
+        Formatted timestamp string (e.g., "153045" for HH:MM:SS)
+    """
+    try:
+        # Parse ISO format from Twitch
+        dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+        return dt.strftime('%H%M%S')
+    except (ValueError, AttributeError):
+        # Fallback to current time if parsing fails
+        return datetime.now().strftime('%H%M%S')
+
+
 def sanitize_folder_name(name: str) -> str:
     """
     Sanitize a string to be safe for folder names.
@@ -351,18 +370,23 @@ def upload_file(
     streamer_name: str,
     job_id: str,
     transcript_text: str = "",
+    clip_timestamp: str = "",
+    version_suffix: str = "WITH_SUBTITLES",
     filename: str = "final.mp4",
 ) -> dict:
     """
     Upload a file to the Shared Drive with organized folder structure.
     
     Folder structure: {Parent Folder}/{Streamer Name}/{Date}/{descriptive_name}.mp4
+    Filename format: {transcript_words}_{CLIP_TIMESTAMP}_{VERSION_SUFFIX}.mp4
     
     Args:
         local_path: Path to local file
         streamer_name: Streamer's Twitch login/display name
         job_id: Job UUID (used in filename as fallback)
         transcript_text: Transcription text for generating descriptive name
+        clip_timestamp: Twitch clip created_at timestamp (ISO format)
+        version_suffix: "WITH_SUBTITLES" or "WITHOUT_SUBTITLES"
         filename: Output filename (unused, kept for compatibility)
         
     Returns:
@@ -404,9 +428,10 @@ def upload_file(
     )
     
     # Generate descriptive filename from transcript
+    # Format: {transcript_words}_{CLIP_TIMESTAMP}_{VERSION}.mp4
     clip_name = generate_clip_name_from_transcript(transcript_text)
-    time_str = datetime.now().strftime('%H%M%S')
-    final_filename = f"{clip_name}_{time_str}_{job_id[:6]}.mp4"
+    time_str = format_clip_timestamp(clip_timestamp) if clip_timestamp else datetime.now().strftime('%H%M%S')
+    final_filename = f"{clip_name}_{time_str}_{version_suffix}.mp4"
     
     full_path = f"{'/'.join(folder_path)}/{final_filename}"
     print(f"📤 Uploading: {full_path}")
