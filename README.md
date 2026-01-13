@@ -9,6 +9,8 @@ A **!clip** command in your Twitch chat creates a vertical 9:16 video with burne
 - 🎬 **Automatic clip creation** via StreamElements `!clip` command
 - 📱 **Vertical video rendering** (1080x1920) optimized for social platforms
 - 📝 **AI-powered subtitles** using Whisper for accurate transcription
+- 🎤 **Speaker diarization** - color subtitles by speaker (white/yellow)
+- 📷 **Webcam detection** - auto-detects face and creates split layout
 - 👥 **Multi-streamer support** - works for multiple connected streamers
 - 📦 **Google Drive storage** - organized by streamer and date
 - 🔄 **Job queue** - handles multiple clip requests efficiently
@@ -300,6 +302,25 @@ queued → creating_clip → waiting_clip → downloading → transcribing → r
 | `MAX_ATTEMPTS` | No | Max job retry attempts (default: 2) |
 
 *One of `GOOGLE_SERVICE_ACCOUNT_FILE` or `GOOGLE_SERVICE_ACCOUNT_JSON` is required for uploads.
+
+### Speaker Diarization (Optional)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `HF_TOKEN` | If diarization | Hugging Face read token |
+| `ENABLE_DIARIZATION` | No | Enable speaker diarization (default: false) |
+| `DIARIZATION_MODEL` | No | pyannote model (default: pyannote/speaker-diarization-3.1) |
+| `PRIMARY_SPEAKER_STRATEGY` | No | "most_time" or "first" (default: most_time) |
+
+**Diarization Setup:**
+1. Create a Hugging Face account at [huggingface.co](https://huggingface.co)
+2. Accept model conditions for:
+   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+3. Create a read token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+4. Set `HF_TOKEN` and `ENABLE_DIARIZATION=true`
+
+**Per-channel toggle:** Add `"enable_diarization": true` to a channel's `settings` JSON in Supabase to enable for specific streamers only.
 
 ## License
 

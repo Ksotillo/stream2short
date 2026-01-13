@@ -3,7 +3,7 @@
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from config import config
 from db import get_job, get_channel, update_job, update_job_status, mark_job_failed
@@ -14,9 +14,16 @@ from twitch_api import (
     download_clip,
     TwitchAPIError,
 )
-from transcribe import transcribe_video
+from transcribe import transcribe_video, transcribe_video_with_segments
 from video import render_vertical_video, render_video_auto, VideoProcessingError
 from storage import upload_file, SharedDriveError
+from diarization import (
+    diarize_video,
+    assign_speakers_to_segments,
+    merge_adjacent_segments,
+    DiarizationResult,
+)
+from ass_writer import segments_to_ass_with_diarization
 
 
 class PipelineError(Exception):
@@ -106,13 +113,57 @@ def process_job(job_id: str) -> None:
         update_job(job_id, raw_video_path=raw_video_path)
         print(f"✅ Downloaded to: {raw_video_path}")
         
-        # Stage 4: Transcribe
+        # Stage 4: Transcribe + Diarization
         update_job_status(job_id, "transcribing")
         print("🎙️ Stage 4: Transcribing audio...")
         
-        srt_path = str(temp_dir / "captions.srt")
-        transcribe_video(raw_video_path, srt_path)
-        print(f"✅ Transcription saved to: {srt_path}")
+        # Get channel settings for per-channel diarization toggle
+        channel_settings = channel.get("settings", {}) or {}
+        
+        # Get transcript segments
+        segments, transcript_text_raw = transcribe_video_with_segments(raw_video_path)
+        print(f"✅ Transcription complete: {len(segments)} segments")
+        
+        # Stage 4b: Speaker diarization (if enabled)
+        diarization_result: Optional[DiarizationResult] = None
+        has_diarization = False
+        
+        try:
+            diarization_result = diarize_video(
+                video_path=raw_video_path,
+                temp_dir=str(temp_dir),
+                channel_settings=channel_settings,
+            )
+            
+            if diarization_result:
+                has_diarization = True
+                print(f"🎤 Diarization complete: {len(diarization_result.speakers)} speakers detected")
+                
+                # Assign speakers to transcript segments
+                segments = assign_speakers_to_segments(
+                    segments=segments,
+                    turns=diarization_result.turns,
+                    primary_speaker=diarization_result.primary_speaker,
+                )
+                
+                # Merge adjacent segments with same speaker
+                segments = merge_adjacent_segments(segments, max_gap=0.25)
+                
+                # Count speaker distribution
+                primary_count = sum(1 for s in segments if s.get('is_primary', True))
+                other_count = len(segments) - primary_count
+                print(f"📊 Speaker distribution: {primary_count} primary (white), {other_count} other (yellow)")
+        except Exception as e:
+            print(f"⚠️ Diarization skipped: {e}")
+        
+        # Generate ASS subtitles with speaker coloring
+        subtitle_path = str(temp_dir / "captions.ass")
+        segments_to_ass_with_diarization(
+            segments=segments,
+            output_path=subtitle_path,
+            has_diarization=has_diarization,
+        )
+        print(f"✅ Subtitles saved to: {subtitle_path}")
         
         # Stage 5: Render vertical video with subtitles (auto-detect webcam)
         update_job_status(job_id, "rendering")
@@ -122,7 +173,7 @@ def process_job(job_id: str) -> None:
         render_video_auto(
             input_path=raw_video_path,
             output_path=final_video_path,
-            subtitle_path=srt_path,
+            subtitle_path=subtitle_path,
             enable_webcam_detection=True,  # Auto-detect and split layout
         )
         
@@ -136,19 +187,8 @@ def process_job(job_id: str) -> None:
         # Use display_name or twitch_login for folder name
         streamer_name = channel.get("display_name") or channel.get("twitch_login") or broadcaster_id
         
-        # Read transcript for descriptive filename
-        transcript_text = ""
-        try:
-            if os.path.exists(srt_path):
-                with open(srt_path, "r", encoding="utf-8") as f:
-                    # Extract just the text lines (skip numbers and timestamps)
-                    lines = f.readlines()
-                    text_lines = [l.strip() for l in lines if l.strip() and 
-                                  not l.strip().isdigit() and 
-                                  "-->" not in l]
-                    transcript_text = " ".join(text_lines)
-        except Exception as e:
-            print(f"⚠️ Could not read transcript: {e}")
+        # Use transcript text from transcription stage
+        transcript_text = transcript_text_raw
         
         # Check if Google Drive is configured
         if config.GOOGLE_SERVICE_ACCOUNT_FILE or config.GOOGLE_SERVICE_ACCOUNT_JSON:

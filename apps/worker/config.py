@@ -45,6 +45,13 @@ class Config:
     CLIP_POLL_INTERVAL: float = 1.0  # seconds
     CLIP_POLL_MAX_ATTEMPTS: int = 15
     
+    # Speaker Diarization (pyannote.audio)
+    HF_TOKEN: str = os.getenv("HF_TOKEN", "")  # Hugging Face token for gated models
+    ENABLE_DIARIZATION: bool = os.getenv("ENABLE_DIARIZATION", "false").lower() == "true"
+    DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
+    DIARIZATION_SEGMENTATION: str = os.getenv("DIARIZATION_SEGMENTATION", "pyannote/segmentation-3.0")
+    PRIMARY_SPEAKER_STRATEGY: str = os.getenv("PRIMARY_SPEAKER_STRATEGY", "most_time")  # "most_time" or "first"
+    
     @classmethod
     def validate(cls) -> list[str]:
         """Validate required configuration. Returns list of missing vars."""

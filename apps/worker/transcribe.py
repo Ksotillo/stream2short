@@ -71,6 +71,87 @@ def transcribe_video(video_path: str, output_srt_path: str) -> str:
     return output_srt_path
 
 
+def transcribe_video_with_segments(
+    video_path: str,
+    words_per_subtitle: int = 3
+) -> tuple[list[dict], str]:
+    """
+    Transcribe video and return segment data for diarization processing.
+    
+    Args:
+        video_path: Path to input video file
+        words_per_subtitle: Max words per subtitle chunk
+        
+    Returns:
+        Tuple of (segments list, transcript text)
+        Each segment has: start, end, text keys
+    """
+    model = get_model()
+    
+    print(f"🎙️ Transcribing: {video_path}")
+    
+    # Transcribe with word-level timestamps
+    segments, info = model.transcribe(
+        video_path,
+        beam_size=5,
+        word_timestamps=True,
+        vad_filter=True,
+    )
+    
+    print(f"📝 Detected language: {info.language} (probability: {info.language_probability:.2f})")
+    
+    segments_list = list(segments)
+    print(f"📝 Found {len(segments_list)} speech segments")
+    
+    # Convert to dict format with word-level chunking
+    result_segments = []
+    full_text_parts = []
+    
+    for segment in segments_list:
+        if hasattr(segment, 'words') and segment.words:
+            words = list(segment.words)
+            
+            for i in range(0, len(words), words_per_subtitle):
+                chunk = words[i:i + words_per_subtitle]
+                if not chunk:
+                    continue
+                
+                text = " ".join(w.word.strip() for w in chunk).strip()
+                if text:
+                    result_segments.append({
+                        'start': chunk[0].start,
+                        'end': chunk[-1].end,
+                        'text': text,
+                    })
+                    full_text_parts.append(text)
+        else:
+            # Fallback for segments without word timestamps
+            text = segment.text.strip()
+            if text:
+                words = text.split()
+                duration = segment.end - segment.start
+                time_per_word = duration / len(words) if words else duration
+                
+                for i in range(0, len(words), words_per_subtitle):
+                    chunk_words = words[i:i + words_per_subtitle]
+                    chunk_start = segment.start + (i * time_per_word)
+                    chunk_end = min(segment.start + ((i + len(chunk_words)) * time_per_word), segment.end)
+                    chunk_text = " ".join(chunk_words)
+                    
+                    if chunk_text:
+                        result_segments.append({
+                            'start': chunk_start,
+                            'end': chunk_end,
+                            'text': chunk_text,
+                        })
+                        full_text_parts.append(chunk_text)
+    
+    full_text = " ".join(full_text_parts)
+    print(f"📝 Created {len(result_segments)} subtitle segments")
+    
+    return result_segments, full_text
+
+
 def segments_to_srt(segments: list, words_per_subtitle: int = 3) -> str:
     """
     Convert faster-whisper segments to SRT format with short phrases.

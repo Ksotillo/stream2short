@@ -71,9 +71,15 @@ services:
       - WHISPER_MODEL=${WHISPER_MODEL:-small}
       - MAX_ATTEMPTS=${MAX_ATTEMPTS:-2}
       - CLEANUP_TEMP=${CLEANUP_TEMP:-false}
+      # Speaker diarization (optional - requires HF token and model access)
+      - HF_TOKEN=${HF_TOKEN}
+      - ENABLE_DIARIZATION=${ENABLE_DIARIZATION:-false}
+      - DIARIZATION_MODEL=${DIARIZATION_MODEL:-pyannote/speaker-diarization-3.1}
+      - PRIMARY_SPEAKER_STRATEGY=${PRIMARY_SPEAKER_STRATEGY:-most_time}
     volumes:
       - worker_temp:/tmp/stream2short
       - ./credentials:/app/credentials:ro
+      - huggingface_cache:/root/.cache/huggingface
     depends_on:
       redis:
         condition: service_healthy
@@ -84,3 +90,4 @@ volumes:
   worker_temp:
   caddy_data:
   caddy_config:
+  huggingface_cache:  # Cache for HuggingFace models (diarization)
