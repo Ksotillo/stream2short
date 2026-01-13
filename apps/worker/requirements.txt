@@ -31,7 +31,9 @@ opencv-python-headless>=4.9.0
 numpy>=1.26.0
 
 # Speaker diarization (optional - requires HF_TOKEN and model access)
+# Using CPU-only PyTorch to avoid downloading 3GB+ of NVIDIA CUDA libraries
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchaudio
 pyannote.audio>=3.1.0
-torch>=2.0.0
-torchaudio>=2.0.0
 
