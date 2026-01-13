@@ -74,7 +74,8 @@ const start = async () => {
 ║  • GET  /auth/twitch/start   - Start OAuth flow           ║
 ║  • GET  /auth/twitch/callback - OAuth callback            ║
 ║  • GET  /se/clip             - StreamElements trigger     ║
-║  • POST /api/clip            - Direct clip trigger        ║
+║  • POST /api/clip            - Create NEW clip (LIVE)     ║
+║  • POST /api/process-clip    - Process EXISTING clip 🆕   ║
 ║  • GET  /jobs                - List jobs for channel      ║
 ║  • GET  /jobs/:id            - Get job details            ║
 ║  • GET  /jobs/:id/signed-url - Get video download URL     ║

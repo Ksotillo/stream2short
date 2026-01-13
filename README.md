@@ -173,11 +173,43 @@ cloudflared tunnel --url http://localhost:3000
 | `/health` | GET | Health check |
 | `/auth/twitch/start` | GET | Start OAuth flow |
 | `/auth/twitch/callback` | GET | OAuth callback |
-| `/se/clip` | GET | StreamElements trigger |
-| `/api/clip` | POST | Direct clip trigger |
+| `/se/clip` | GET | StreamElements trigger (requires LIVE) |
+| `/api/clip` | POST | Create NEW clip (requires LIVE) |
+| `/api/process-clip` | POST | Process EXISTING clip (no need to be LIVE!) |
 | `/jobs` | GET | List jobs for a channel |
 | `/jobs/:id` | GET | Get job details |
 | `/jobs/:id/signed-url` | GET | Get video download URL |
+
+### Process Existing Clips (No Need to Be Live!)
+
+Use this endpoint to process any existing Twitch clip without being live:
+
+```bash
+# Using a clip URL
+curl -X POST http://localhost:3000/api/process-clip \
+  -H "Content-Type: application/json" \
+  -d '{"clip_url": "https://clips.twitch.tv/YourClipSlug"}'
+
+# Or using just the clip ID
+curl -X POST http://localhost:3000/api/process-clip \
+  -H "Content-Type: application/json" \
+  -d '{"clip_id": "YourClipSlug"}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "job_id": "uuid",
+  "clip_id": "YourClipSlug",
+  "clip_url": "https://www.twitch.tv/channel/clip/YourClipSlug",
+  "clip_title": "Amazing Play!",
+  "broadcaster": "streamer_name",
+  "message": "Processing clip \"Amazing Play!\" - no need to be live!"
+}
+```
+
+> **Note:** The clip's broadcaster must have connected their Twitch account via `/auth/twitch/start` for their clips to be processed.
 
 ### Query Jobs
 
