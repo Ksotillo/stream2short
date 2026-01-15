@@ -119,12 +119,13 @@ def run_diarization(audio_path: str) -> list[SpeakerTurn]:
         )
     
     # PyTorch 2.6+ changed default weights_only=True for security
-    # We need to allowlist the TorchVersion class used by pyannote models
-    try:
-        torch.serialization.add_safe_globals([torch.torch_version.TorchVersion])
-    except (AttributeError, TypeError):
-        # Older PyTorch versions don't have this issue
-        pass
+    # Pyannote models require many custom classes, so we use weights_only=False
+    # This is safe since we're loading from trusted Hugging Face models
+    original_load = torch.load
+    def patched_load(*args, **kwargs):
+        kwargs.setdefault('weights_only', False)
+        return original_load(*args, **kwargs)
+    torch.load = patched_load
     
     print(f"🎤 Loading diarization model: {config.DIARIZATION_MODEL}")
     
@@ -143,6 +144,9 @@ def run_diarization(audio_path: str) -> list[SpeakerTurn]:
                 f"Error: {e}"
             )
         raise DiarizationError(f"Failed to load diarization model: {e}")
+    finally:
+        # Restore original torch.load
+        torch.load = original_load
     
     print(f"🎤 Running diarization on: {audio_path}")
     
