@@ -32,8 +32,9 @@ numpy>=1.26.0
 
 # Speaker diarization (optional - requires HF_TOKEN and model access)
 # Using CPU-only PyTorch to avoid downloading 3GB+ of NVIDIA CUDA libraries
+# Pinned to <2.6 due to weights_only=True breaking change in PyTorch 2.6
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchaudio
+torch>=2.0.0,<2.6.0
+torchaudio>=2.0.0,<2.6.0
 pyannote.audio>=3.1.0
 
