@@ -20,7 +20,6 @@ from storage import upload_file, SharedDriveError
 from diarization import (
     diarize_video,
     assign_speakers_to_segments,
-    merge_adjacent_segments,
     DiarizationResult,
 )
 from ass_writer import segments_to_ass_with_diarization
@@ -146,13 +145,14 @@ def process_job(job_id: str) -> None:
                     primary_speaker=diarization_result.primary_speaker,
                 )
                 
-                # Merge adjacent segments with same speaker
-                segments = merge_adjacent_segments(segments, max_gap=0.25)
+                # NOTE: We no longer merge segments - keep short 2-3 word chunks for TikTok style
+                # merge_adjacent_segments was causing subtitles to become long sentences again
                 
                 # Count speaker distribution
                 primary_count = sum(1 for s in segments if s.get('is_primary', True))
                 other_count = len(segments) - primary_count
-                print(f"📊 Speaker distribution: {primary_count} primary (white), {other_count} other (yellow)")
+                speakers_found = list(set(s.get('speaker', 'UNKNOWN') for s in segments))
+                print(f"📊 Speaker distribution: {primary_count} primary, {other_count} other ({len(speakers_found)} speakers)")
         except Exception as e:
             print(f"⚠️ Diarization skipped: {e}")
         

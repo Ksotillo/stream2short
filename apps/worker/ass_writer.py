@@ -1,16 +1,20 @@
 """ASS subtitle writer with speaker-based styling for Stream2Short Worker.
 
 Generates .ass (Advanced SubStation Alpha) subtitle files with different
-styles for primary and secondary speakers.
+styles for each speaker.
 
 Features:
-- Large, TikTok/Reels style text (70pt+)
+- Large, TikTok/Reels style text (75pt)
 - Zoom-in animation effect on text appearance
-- Speaker coloring (white for primary, yellow for others)
+- Multi-color speaker support (primary=white, others=varied colors)
 
-Colors:
-- Primary speaker (white): &H00FFFFFF
-- Other speakers (yellow): &H0000FFFF (BGR format)
+Color palette (ASS BGR format):
+- Primary speaker: White (&H00FFFFFF)
+- Speaker 2: Cyan (&H00FFFF00) - cool/masculine
+- Speaker 3: Pink (&H00FF77FF) - warm/feminine  
+- Speaker 4: Yellow (&H0000FFFF)
+- Speaker 5: Lime (&H0000FF00)
+- Speaker 6: Orange (&H000099FF)
 """
 
 from typing import Optional
@@ -20,6 +24,18 @@ from typing import Optional
 ZOOM_ANIMATION_DURATION_MS = 100  # Duration of zoom-in effect in milliseconds (fast & snappy)
 ZOOM_START_SCALE = 70  # Start at 70% scale
 ZOOM_END_SCALE = 100   # End at 100% scale
+
+# Speaker color palette (ASS format: &H00BBGGRR)
+SPEAKER_COLORS = {
+    "primary": "&H00FFFFFF",    # White - main speaker
+    "speaker_1": "&H00FFFF00",  # Cyan - secondary speaker
+    "speaker_2": "&H00FF77FF",  # Pink - feminine accent
+    "speaker_3": "&H0000FFFF",  # Yellow
+    "speaker_4": "&H0000FF00",  # Lime green
+    "speaker_5": "&H000099FF",  # Orange
+    "speaker_6": "&H00FF0000",  # Blue
+    "speaker_7": "&H00FF00FF",  # Magenta
+}
 
 
 def format_ass_time(seconds: float) -> str:
@@ -51,11 +67,11 @@ def generate_ass_header(
     shadow: int = 0,      # No shadow, just outline
 ) -> str:
     """
-    Generate ASS file header with script info and styles.
+    Generate ASS file header with script info and styles for multiple speakers.
     
     Styles:
     - Primary: White text for main speaker
-    - Other: Yellow text for secondary speakers
+    - Speaker1-7: Various colors for other speakers
     
     Args:
         play_res_x: Video width
@@ -71,12 +87,19 @@ def generate_ass_header(
     Returns:
         ASS header string
     """
-    # ASS color format is &HAABBGGRR (Alpha, Blue, Green, Red)
-    # For subtitle text, we typically use &H00BBGGRR (no alpha)
-    white = "&H00FFFFFF"      # Pure white
-    yellow = "&H0000FFFF"     # Yellow (BGR: 00, FF, FF = Blue=0, Green=255, Red=255)
-    black = "&H00000000"      # Black for outline
-    shadow_color = "&H00000000"  # Black for shadow (not used when shadow=0)
+    black = "&H00000000"  # Black for outline
+    
+    # Build styles for all speakers
+    styles = []
+    for style_name, color in SPEAKER_COLORS.items():
+        # Convert style name to ASS style name (Primary, Speaker1, etc.)
+        ass_style_name = style_name.replace("_", "").title()
+        style_line = (
+            f"Style: {ass_style_name},{font_name},{font_size},{color},{color},"
+            f"{black},{black},1,0,0,0,100,100,0,0,1,{outline},{shadow},2,"
+            f"{margin_l},{margin_r},{margin_v},1"
+        )
+        styles.append(style_line)
     
     header = f"""[Script Info]
 Title: Stream2Short Subtitles
@@ -88,8 +111,7 @@ YCbCr Matrix: TV.709
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Primary,{font_name},{font_size},{white},{white},{black},{shadow_color},1,0,0,0,100,100,0,0,1,{outline},{shadow},2,{margin_l},{margin_r},{margin_v},1
-Style: Other,{font_name},{font_size},{yellow},{yellow},{black},{shadow_color},1,0,0,0,100,100,0,0,1,{outline},{shadow},2,{margin_l},{margin_r},{margin_v},1
+{chr(10).join(styles)}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -97,11 +119,37 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header
 
 
+def get_speaker_style(speaker: str, is_primary: bool, speaker_index: int = 0) -> str:
+    """
+    Get the ASS style name for a speaker.
+    
+    Args:
+        speaker: Speaker ID from diarization
+        is_primary: True if this is the primary (most speaking) speaker
+        speaker_index: Index of non-primary speakers (0-based)
+        
+    Returns:
+        ASS style name
+    """
+    if is_primary:
+        return "Primary"
+    
+    # Map speaker index to style name
+    style_keys = [k for k in SPEAKER_COLORS.keys() if k != "primary"]
+    if speaker_index < len(style_keys):
+        return style_keys[speaker_index].replace("_", "").title()
+    
+    # Fallback to cycling through colors
+    return style_keys[speaker_index % len(style_keys)].replace("_", "").title()
+
+
 def generate_ass_dialogue(
     start: float,
     end: float,
     text: str,
     is_primary: bool = True,
+    speaker: str = "",
+    speaker_index: int = 0,
     layer: int = 0,
     enable_zoom_animation: bool = True,
 ) -> str:
@@ -112,14 +160,16 @@ def generate_ass_dialogue(
         start: Start time in seconds
         end: End time in seconds
         text: Subtitle text
-        is_primary: True for primary speaker (white), False for other (yellow)
+        is_primary: True for primary speaker (white)
+        speaker: Speaker ID from diarization
+        speaker_index: Index of this speaker (for color assignment)
         layer: Layer number (default 0)
         enable_zoom_animation: Add zoom-in effect on text appearance
         
     Returns:
         ASS dialogue line
     """
-    style = "Primary" if is_primary else "Other"
+    style = get_speaker_style(speaker, is_primary, speaker_index)
     start_str = format_ass_time(start)
     end_str = format_ass_time(end)
     
@@ -157,13 +207,14 @@ def segments_to_ass(
     enable_zoom_animation: bool = True,
 ) -> str:
     """
-    Convert transcript segments to ASS subtitle file.
+    Convert transcript segments to ASS subtitle file with multi-color speakers.
     
     Segments should have:
     - start: float (seconds)
     - end: float (seconds)  
     - text: str
     - is_primary: bool (optional, default True)
+    - speaker: str (optional, speaker ID)
     
     Args:
         segments: List of segment dictionaries
@@ -191,12 +242,24 @@ def segments_to_ass(
         margin_r=margin_r,
     )
     
+    # Build speaker index map (non-primary speakers get colors in order of appearance)
+    speaker_indices = {}
+    next_index = 0
+    for seg in segments:
+        speaker = seg.get('speaker', '')
+        is_primary = seg.get('is_primary', True)
+        if speaker and not is_primary and speaker not in speaker_indices:
+            speaker_indices[speaker] = next_index
+            next_index += 1
+    
     # Generate dialogue lines
     for seg in segments:
         start = seg.get('start', 0)
         end = seg.get('end', 0)
         text = seg.get('text', '').strip()
         is_primary = seg.get('is_primary', True)
+        speaker = seg.get('speaker', '')
+        speaker_index = speaker_indices.get(speaker, 0)
         
         if text:  # Skip empty segments
             dialogue = generate_ass_dialogue(
@@ -204,6 +267,8 @@ def segments_to_ass(
                 end=end,
                 text=text.upper(),  # ALL CAPS for social media style
                 is_primary=is_primary,
+                speaker=speaker,
+                speaker_index=speaker_index,
                 enable_zoom_animation=enable_zoom_animation,
             )
             ass_content += dialogue + "\n"
@@ -212,7 +277,11 @@ def segments_to_ass(
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(ass_content)
     
-    print(f"📝 Generated ASS subtitles: {output_path} (zoom_animation={enable_zoom_animation})")
+    # Log speaker color assignments
+    if speaker_indices:
+        print(f"📝 Speaker colors: Primary=white, Others={list(speaker_indices.keys())}")
+    
+    print(f"📝 Generated ASS subtitles: {output_path} ({len(segments)} segments)")
     return output_path
 
 
