@@ -121,10 +121,10 @@ def run_diarization(audio_path: str) -> list[SpeakerTurn]:
     print(f"🎤 Loading diarization model: {config.DIARIZATION_MODEL}")
     
     try:
-        # pyannote.audio 4.x API: use token= parameter explicitly
+        # pyannote.audio 3.x + huggingface-hub <1.0: use use_auth_token=
         pipeline = Pipeline.from_pretrained(
             config.DIARIZATION_MODEL,
-            token=config.HF_TOKEN,
+            use_auth_token=config.HF_TOKEN,
         )
         print("🎤 Model loaded successfully")
             

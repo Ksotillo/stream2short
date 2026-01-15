@@ -32,10 +32,10 @@ numpy>=1.26.0
 
 # Speaker diarization (optional - requires HF_TOKEN and model access)
 # Using CPU-only PyTorch to avoid large NVIDIA CUDA downloads
-# Version compatibility: pyannote.audio 4.x + huggingface-hub 1.x + torch 2.5.1
+# Version compatibility: pyannote.audio 3.x + huggingface-hub <1.0 (uses use_auth_token)
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.5.1
 torchaudio==2.5.1
-huggingface-hub>=1.0.0
-pyannote.audio>=4.0.0
+huggingface-hub<1.0.0
+pyannote.audio>=3.1.0,<4.0.0
 
