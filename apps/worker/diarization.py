@@ -120,23 +120,42 @@ def run_diarization(audio_path: str) -> list[SpeakerTurn]:
     
     print(f"🎤 Loading diarization model: {config.DIARIZATION_MODEL}")
     
+    # Set HF_TOKEN environment variable - huggingface_hub auto-detects it
+    import os
+    os.environ["HF_TOKEN"] = config.HF_TOKEN
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = config.HF_TOKEN  # Alternative env var
+    
     try:
-        # Try newer API first (token=), fall back to older API (use_auth_token=)
+        # Try different API versions for compatibility
+        pipeline = None
+        last_error = None
+        
+        # Method 1: Newest API (token=)
         try:
-            pipeline = Pipeline.from_pretrained(
-                config.DIARIZATION_MODEL,
-                token=config.HF_TOKEN
-            )
-        except TypeError as te:
-            if "unexpected keyword argument" in str(te) and "token" in str(te):
-                # Older pyannote version uses use_auth_token
-                print("🎤 Using legacy API (use_auth_token)")
-                pipeline = Pipeline.from_pretrained(
-                    config.DIARIZATION_MODEL,
-                    use_auth_token=config.HF_TOKEN
-                )
-            else:
-                raise
+            pipeline = Pipeline.from_pretrained(config.DIARIZATION_MODEL, token=config.HF_TOKEN)
+            print("🎤 Loaded with token= API")
+        except TypeError as e:
+            last_error = e
+        
+        # Method 2: Legacy API (use_auth_token=)
+        if pipeline is None:
+            try:
+                pipeline = Pipeline.from_pretrained(config.DIARIZATION_MODEL, use_auth_token=config.HF_TOKEN)
+                print("🎤 Loaded with use_auth_token= API")
+            except TypeError as e:
+                last_error = e
+        
+        # Method 3: No explicit auth (relies on HF_TOKEN env var)
+        if pipeline is None:
+            try:
+                pipeline = Pipeline.from_pretrained(config.DIARIZATION_MODEL)
+                print("🎤 Loaded using HF_TOKEN environment variable")
+            except Exception as e:
+                last_error = e
+        
+        if pipeline is None:
+            raise DiarizationError(f"All loading methods failed: {last_error}")
+            
     except Exception as e:
         error_msg = str(e)
         if "gated" in error_msg.lower() or "401" in error_msg or "403" in error_msg:
