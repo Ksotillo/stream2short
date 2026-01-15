@@ -120,16 +120,12 @@ def run_diarization(audio_path: str) -> list[SpeakerTurn]:
     
     print(f"🎤 Loading diarization model: {config.DIARIZATION_MODEL}")
     
-    # Set HF_TOKEN environment variable - huggingface_hub auto-detects it
-    import os
-    os.environ["HF_TOKEN"] = config.HF_TOKEN
-    os.environ["HUGGING_FACE_HUB_TOKEN"] = config.HF_TOKEN
-    os.environ["HUGGINGFACE_HUB_TOKEN"] = config.HF_TOKEN
-    
     try:
-        # Just use env var - no explicit auth parameter
-        # huggingface_hub will auto-detect HF_TOKEN from environment
-        pipeline = Pipeline.from_pretrained(config.DIARIZATION_MODEL)
+        # pyannote.audio 4.x API: use token= parameter explicitly
+        pipeline = Pipeline.from_pretrained(
+            config.DIARIZATION_MODEL,
+            token=config.HF_TOKEN,
+        )
         print("🎤 Model loaded successfully")
             
     except Exception as e:
