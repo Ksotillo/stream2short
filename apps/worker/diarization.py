@@ -106,9 +106,10 @@ def run_diarization(audio_path: str) -> list[SpeakerTurn]:
         DiarizationError: If diarization fails
     """
     try:
+        import torch
         from pyannote.audio import Pipeline
-    except ImportError:
-        raise DiarizationError("pyannote.audio not installed")
+    except ImportError as e:
+        raise DiarizationError(f"pyannote.audio not installed: {e}")
     
     if not config.HF_TOKEN:
         raise DiarizationError(
@@ -117,12 +118,20 @@ def run_diarization(audio_path: str) -> list[SpeakerTurn]:
             "pyannote/segmentation-3.0 and pyannote/speaker-diarization-3.1"
         )
     
+    # PyTorch 2.6+ changed default weights_only=True for security
+    # We need to allowlist the TorchVersion class used by pyannote models
+    try:
+        torch.serialization.add_safe_globals([torch.torch_version.TorchVersion])
+    except (AttributeError, TypeError):
+        # Older PyTorch versions don't have this issue
+        pass
+    
     print(f"🎤 Loading diarization model: {config.DIARIZATION_MODEL}")
     
     try:
         pipeline = Pipeline.from_pretrained(
             config.DIARIZATION_MODEL,
-            token=config.HF_TOKEN  # 'token' replaces deprecated 'use_auth_token'
+            token=config.HF_TOKEN
         )
     except Exception as e:
         error_msg = str(e)
