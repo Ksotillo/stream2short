@@ -3,12 +3,23 @@
 Generates .ass (Advanced SubStation Alpha) subtitle files with different
 styles for primary and secondary speakers.
 
+Features:
+- Large, TikTok/Reels style text (70pt+)
+- Zoom-in animation effect on text appearance
+- Speaker coloring (white for primary, yellow for others)
+
 Colors:
 - Primary speaker (white): &H00FFFFFF
 - Other speakers (yellow): &H0000FFFF (BGR format)
 """
 
 from typing import Optional
+
+
+# Animation settings
+ZOOM_ANIMATION_DURATION_MS = 150  # Duration of zoom-in effect in milliseconds
+ZOOM_START_SCALE = 70  # Start at 70% scale
+ZOOM_END_SCALE = 100   # End at 100% scale
 
 
 def format_ass_time(seconds: float) -> str:
@@ -31,13 +42,13 @@ def format_ass_time(seconds: float) -> str:
 def generate_ass_header(
     play_res_x: int = 1080,
     play_res_y: int = 1920,
-    font_name: str = "Montserrat SemiBold",
-    font_size: int = 52,  # Scaled for 1920 height (was 18, too small)
-    margin_v: int = 120,  # Safe margin from bottom
-    margin_l: int = 40,
-    margin_r: int = 40,
-    outline: int = 3,
-    shadow: int = 2,
+    font_name: str = "Montserrat ExtraBold",
+    font_size: int = 75,  # Large TikTok/Reels style (bigger = more impact)
+    margin_v: int = 180,  # Safe margin from bottom
+    margin_l: int = 50,
+    margin_r: int = 50,
+    outline: int = 4,     # Thick outline for readability
+    shadow: int = 0,      # No shadow, just outline
 ) -> str:
     """
     Generate ASS file header with script info and styles.
@@ -65,7 +76,7 @@ def generate_ass_header(
     white = "&H00FFFFFF"      # Pure white
     yellow = "&H0000FFFF"     # Yellow (BGR: 00, FF, FF = Blue=0, Green=255, Red=255)
     black = "&H00000000"      # Black for outline
-    shadow_color = "&H80000000"  # Semi-transparent black for shadow
+    shadow_color = "&H00000000"  # Black for shadow (not used when shadow=0)
     
     header = f"""[Script Info]
 Title: Stream2Short Subtitles
@@ -92,9 +103,10 @@ def generate_ass_dialogue(
     text: str,
     is_primary: bool = True,
     layer: int = 0,
+    enable_zoom_animation: bool = True,
 ) -> str:
     """
-    Generate a single ASS dialogue line.
+    Generate a single ASS dialogue line with optional zoom-in animation.
     
     Args:
         start: Start time in seconds
@@ -102,6 +114,7 @@ def generate_ass_dialogue(
         text: Subtitle text
         is_primary: True for primary speaker (white), False for other (yellow)
         layer: Layer number (default 0)
+        enable_zoom_animation: Add zoom-in effect on text appearance
         
     Returns:
         ASS dialogue line
@@ -114,7 +127,21 @@ def generate_ass_dialogue(
     # Newlines use \N, literal backslash uses \\
     text_escaped = text.replace("\\", "\\\\").replace("\n", "\\N")
     
-    return f"Dialogue: {layer},{start_str},{end_str},{style},,0,0,0,,{text_escaped}"
+    # Add zoom-in animation effect
+    # \fscx = font scale X, \fscy = font scale Y
+    # \t(t1,t2,effect) = animate from t1 to t2 milliseconds
+    if enable_zoom_animation:
+        # Start smaller and zoom to full size over ZOOM_ANIMATION_DURATION_MS
+        animation_tag = (
+            f"{{\\fscx{ZOOM_START_SCALE}\\fscy{ZOOM_START_SCALE}"
+            f"\\t(0,{ZOOM_ANIMATION_DURATION_MS},"
+            f"\\fscx{ZOOM_END_SCALE}\\fscy{ZOOM_END_SCALE})}}"
+        )
+        text_with_effect = animation_tag + text_escaped
+    else:
+        text_with_effect = text_escaped
+    
+    return f"Dialogue: {layer},{start_str},{end_str},{style},,0,0,0,,{text_with_effect}"
 
 
 def segments_to_ass(
@@ -122,11 +149,12 @@ def segments_to_ass(
     output_path: str,
     play_res_x: int = 1080,
     play_res_y: int = 1920,
-    font_name: str = "Montserrat SemiBold",
-    font_size: int = 52,  # Scaled for 1920 height
-    margin_v: int = 120,  # Safe margin from bottom
-    margin_l: int = 40,
-    margin_r: int = 40,
+    font_name: str = "Montserrat ExtraBold",
+    font_size: int = 75,  # Large TikTok/Reels style
+    margin_v: int = 180,  # Safe margin from bottom
+    margin_l: int = 50,
+    margin_r: int = 50,
+    enable_zoom_animation: bool = True,
 ) -> str:
     """
     Convert transcript segments to ASS subtitle file.
@@ -147,6 +175,7 @@ def segments_to_ass(
         margin_v: Vertical margin
         margin_l: Left margin
         margin_r: Right margin
+        enable_zoom_animation: Enable zoom-in effect on subtitles
         
     Returns:
         Path to output file
@@ -175,6 +204,7 @@ def segments_to_ass(
                 end=end,
                 text=text.upper(),  # ALL CAPS for social media style
                 is_primary=is_primary,
+                enable_zoom_animation=enable_zoom_animation,
             )
             ass_content += dialogue + "\n"
     
@@ -182,7 +212,7 @@ def segments_to_ass(
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(ass_content)
     
-    print(f"📝 Generated ASS subtitles: {output_path}")
+    print(f"📝 Generated ASS subtitles: {output_path} (zoom_animation={enable_zoom_animation})")
     return output_path
 
 

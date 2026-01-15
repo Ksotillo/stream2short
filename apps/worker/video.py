@@ -81,28 +81,28 @@ def render_vertical_video(
         escaped_path = escape_ffmpeg_path(subtitle_path)
         
         if subtitle_path.endswith(".ass"):
+            # ASS filter respects embedded styling (large text, zoom animation)
             filters.append(f"ass='{escaped_path}'")
         else:
-            # Modern social media style subtitles
-            # - Montserrat SemiBold (recommended font from creator research)
+            # SRT fallback - Large TikTok/Reels style subtitles
+            # - Montserrat ExtraBold for maximum impact
             # - Bottom center positioning with safe margins
-            # - White text with black outline for readability
+            # - White text with thick black outline for readability
             filters.append(
                 f"subtitles=filename='{escaped_path}'"
                 ":force_style='"
-                "FontName=Montserrat SemiBold,"  # Clean modern font
-                "FontSize=18,"               # Readable size
+                "FontName=Montserrat ExtraBold,"  # Bold modern font
+                "FontSize=75,"               # Large, TikTok style
                 "PrimaryColour=&H00FFFFFF,"  # White text
                 "OutlineColour=&H00000000,"  # Black outline
-                "BackColour=&H80000000,"     # Semi-transparent shadow
                 "Bold=1,"                    # Bold weight
-                "BorderStyle=1,"             # Outline + shadow style
-                "Outline=2,"                 # Clean outline
-                "Shadow=1,"                  # Subtle drop shadow
+                "BorderStyle=1,"             # Outline style
+                "Outline=4,"                 # Thick outline for readability
+                "Shadow=0,"                  # No shadow
                 "Alignment=2,"               # Bottom center
-                "MarginL=20,"                # Left margin
-                "MarginR=20,"                # Right margin
-                "MarginV=50"                 # Bottom margin
+                "MarginL=50,"                # Left margin
+                "MarginR=50,"                # Right margin
+                "MarginV=180"                # Bottom margin
                 "'"
             )
     
@@ -302,28 +302,32 @@ def render_split_layout_video(
     # Add subtitles if available (apply to final stacked output)
     if use_subtitles:
         escaped_path = escape_ffmpeg_path(subtitle_path)
-        # Position subtitles in the content area (below webcam)
-        # MarginV should position it within the content section
-        subtitle_margin_v = int(content_h * 0.05)  # 5% from bottom of content area
         
-        subtitle_filter = (
-            f"[stacked]subtitles=filename='{escaped_path}'"
-            ":force_style='"
-            "FontName=Montserrat SemiBold,"
-            "FontSize=18,"
-            "PrimaryColour=&H00FFFFFF,"
-            "OutlineColour=&H00000000,"
-            "BackColour=&H80000000,"
-            "Bold=1,"
-            "BorderStyle=1,"
-            "Outline=2,"
-            "Shadow=1,"
-            "Alignment=2,"
-            "MarginL=20,"
-            "MarginR=20,"
-            f"MarginV={subtitle_margin_v}"
-            "'[final]"
-        )
+        # Use ASS filter for .ass files (respects embedded styling)
+        # Use subtitles filter with force_style for SRT files
+        if subtitle_path.endswith(".ass"):
+            # ASS filter uses the styling embedded in the ASS file
+            subtitle_filter = f"[stacked]ass='{escaped_path}'[final]"
+        else:
+            # SRT fallback with inline styling
+            subtitle_margin_v = int(content_h * 0.05)  # 5% from bottom
+            subtitle_filter = (
+                f"[stacked]subtitles=filename='{escaped_path}'"
+                ":force_style='"
+                "FontName=Montserrat ExtraBold,"
+                "FontSize=75,"
+                "PrimaryColour=&H00FFFFFF,"
+                "OutlineColour=&H00000000,"
+                "Bold=1,"
+                "BorderStyle=1,"
+                "Outline=4,"
+                "Shadow=0,"
+                "Alignment=2,"
+                "MarginL=50,"
+                "MarginR=50,"
+                f"MarginV={subtitle_margin_v}"
+                "'[final]"
+            )
         filter_parts.append(subtitle_filter)
         output_label = "[final]"
     else:
