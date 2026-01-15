@@ -126,6 +126,7 @@ def process_job(job_id: str) -> None:
         # Stage 4b: Speaker diarization (if enabled)
         diarization_result: Optional[DiarizationResult] = None
         has_diarization = False
+        speaker_info = {}  # Dict of speaker_id -> SpeakerInfo for gender-based colors
         
         try:
             diarization_result = diarize_video(
@@ -137,6 +138,13 @@ def process_job(job_id: str) -> None:
             if diarization_result:
                 has_diarization = True
                 print(f"🎤 Diarization complete: {len(diarization_result.speakers)} speakers detected")
+                
+                # Get speaker info (gender, pitch, etc.) for color assignment
+                speaker_info = diarization_result.speaker_info
+                
+                # Log gender detection results
+                for spk_id, info in speaker_info.items():
+                    print(f"   🎤 {spk_id}: {info.gender} (avg pitch: {info.avg_pitch:.0f}Hz)")
                 
                 # Assign speakers to transcript segments
                 segments = assign_speakers_to_segments(
@@ -156,12 +164,13 @@ def process_job(job_id: str) -> None:
         except Exception as e:
             print(f"⚠️ Diarization skipped: {e}")
         
-        # Generate ASS subtitles with speaker coloring
+        # Generate ASS subtitles with speaker coloring (gender-based colors)
         subtitle_path = str(temp_dir / "captions.ass")
         segments_to_ass_with_diarization(
             segments=segments,
             output_path=subtitle_path,
             has_diarization=has_diarization,
+            speaker_info=speaker_info,  # Pass speaker info for gender-based colors
         )
         print(f"✅ Subtitles saved to: {subtitle_path}")
         

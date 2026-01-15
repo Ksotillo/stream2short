@@ -3,6 +3,11 @@
 This module provides speaker diarization to identify who is speaking when,
 allowing subtitles to be colored by speaker.
 
+Features:
+- Speaker diarization (who speaks when)
+- Speaker merging (same voice = same color even with gaps)
+- Gender detection via pitch analysis (feminine/masculine colors)
+
 Requirements:
 - HF_TOKEN environment variable with a Hugging Face read token
 - User must accept model conditions for:
@@ -12,10 +17,17 @@ Requirements:
 
 import subprocess
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+import numpy as np
 
 from config import config
+
+
+# Gender detection thresholds (Hz)
+# Female voices typically have higher fundamental frequency
+FEMALE_PITCH_THRESHOLD = 165  # Hz - above this is likely female
+MALE_PITCH_THRESHOLD = 165    # Hz - below this is likely male
 
 
 @dataclass
@@ -26,12 +38,22 @@ class SpeakerTurn:
     speaker: str
 
 
+@dataclass
+class SpeakerInfo:
+    """Information about a detected speaker."""
+    id: str
+    gender: str = "unknown"  # "masculine", "feminine", or "unknown"
+    avg_pitch: float = 0.0   # Average fundamental frequency in Hz
+    total_duration: float = 0.0
+
+
 @dataclass 
 class DiarizationResult:
     """Result of speaker diarization."""
     turns: list[SpeakerTurn]
     primary_speaker: str
     speakers: list[str]
+    speaker_info: dict[str, SpeakerInfo] = field(default_factory=dict)
 
 
 class DiarizationError(Exception):
@@ -274,6 +296,236 @@ def merge_adjacent_segments(
     return merged
 
 
+def analyze_speaker_pitch(
+    audio_path: str,
+    turns: list[SpeakerTurn],
+    speaker_id: str
+) -> tuple[float, str]:
+    """
+    Analyze pitch (F0) for a speaker to estimate gender.
+    
+    Args:
+        audio_path: Path to audio file
+        turns: All speaker turns
+        speaker_id: ID of speaker to analyze
+        
+    Returns:
+        Tuple of (average_pitch_hz, gender_estimate)
+    """
+    try:
+        import librosa
+    except ImportError:
+        print("⚠️ librosa not installed, skipping pitch analysis")
+        return 0.0, "unknown"
+    
+    try:
+        # Load audio
+        y, sr = librosa.load(audio_path, sr=16000)
+        
+        # Collect pitch values from all segments of this speaker
+        all_pitches = []
+        
+        for turn in turns:
+            if turn.speaker != speaker_id:
+                continue
+            
+            # Extract segment audio
+            start_sample = int(turn.start * sr)
+            end_sample = int(turn.end * sr)
+            segment = y[start_sample:end_sample]
+            
+            if len(segment) < sr * 0.1:  # Skip segments < 0.1s
+                continue
+            
+            # Extract fundamental frequency using pyin
+            f0, voiced_flag, voiced_probs = librosa.pyin(
+                segment,
+                fmin=50,   # Min frequency (Hz)
+                fmax=400,  # Max frequency (Hz)
+                sr=sr
+            )
+            
+            # Get valid (non-NaN) pitch values
+            valid_f0 = f0[~np.isnan(f0)]
+            if len(valid_f0) > 0:
+                all_pitches.extend(valid_f0.tolist())
+        
+        if not all_pitches:
+            return 0.0, "unknown"
+        
+        # Use median for robustness against outliers
+        avg_pitch = float(np.median(all_pitches))
+        
+        # Classify gender based on pitch
+        if avg_pitch > FEMALE_PITCH_THRESHOLD:
+            gender = "feminine"
+        else:
+            gender = "masculine"
+        
+        return avg_pitch, gender
+        
+    except Exception as e:
+        print(f"⚠️ Pitch analysis failed for {speaker_id}: {e}")
+        return 0.0, "unknown"
+
+
+def merge_similar_speakers(
+    turns: list[SpeakerTurn],
+    audio_path: str,
+    similarity_threshold: float = 0.75
+) -> tuple[list[SpeakerTurn], dict[str, str]]:
+    """
+    Merge speakers that have similar voice embeddings.
+    
+    This fixes the issue where the same person speaking at different times
+    gets assigned different speaker IDs.
+    
+    Args:
+        turns: List of speaker turns
+        audio_path: Path to audio file
+        similarity_threshold: Cosine similarity threshold for merging (0-1)
+        
+    Returns:
+        Tuple of (updated_turns, speaker_mapping)
+        speaker_mapping maps old speaker IDs to new (merged) IDs
+    """
+    try:
+        from pyannote.audio import Model, Inference
+        import torch
+    except ImportError:
+        print("⚠️ Cannot load embedding model, skipping speaker merging")
+        return turns, {}
+    
+    speakers = list(set(t.speaker for t in turns))
+    
+    if len(speakers) <= 1:
+        return turns, {}
+    
+    try:
+        print("🔗 Loading speaker embedding model...")
+        embedding_model = Model.from_pretrained(
+            "pyannote/embedding",
+            use_auth_token=config.HF_TOKEN
+        )
+        inference = Inference(embedding_model, window="whole")
+        
+        # Load audio
+        import librosa
+        y, sr = librosa.load(audio_path, sr=16000)
+        
+        # Get embeddings for each speaker
+        speaker_embeddings = {}
+        
+        for speaker in speakers:
+            # Concatenate all segments for this speaker
+            speaker_audio = []
+            for turn in turns:
+                if turn.speaker == speaker:
+                    start_sample = int(turn.start * sr)
+                    end_sample = int(turn.end * sr)
+                    speaker_audio.extend(y[start_sample:end_sample].tolist())
+            
+            if len(speaker_audio) < sr * 0.5:  # Need at least 0.5s
+                continue
+            
+            # Get embedding
+            speaker_audio_np = np.array(speaker_audio, dtype=np.float32)
+            # Save to temp file for inference
+            temp_audio_path = audio_path.replace(".wav", f"_{speaker}.wav")
+            import soundfile as sf
+            sf.write(temp_audio_path, speaker_audio_np, sr)
+            
+            try:
+                embedding = inference(temp_audio_path)
+                speaker_embeddings[speaker] = embedding
+            finally:
+                if os.path.exists(temp_audio_path):
+                    os.remove(temp_audio_path)
+        
+        if len(speaker_embeddings) < 2:
+            return turns, {}
+        
+        # Compare embeddings and find similar speakers
+        speaker_mapping = {s: s for s in speakers}  # Default: map to self
+        processed = set()
+        
+        speaker_list = list(speaker_embeddings.keys())
+        for i, speaker_a in enumerate(speaker_list):
+            if speaker_a in processed:
+                continue
+            
+            for speaker_b in speaker_list[i+1:]:
+                if speaker_b in processed:
+                    continue
+                
+                # Calculate cosine similarity
+                emb_a = speaker_embeddings[speaker_a]
+                emb_b = speaker_embeddings[speaker_b]
+                
+                similarity = float(np.dot(emb_a, emb_b) / (np.linalg.norm(emb_a) * np.linalg.norm(emb_b)))
+                
+                if similarity > similarity_threshold:
+                    print(f"🔗 Merging {speaker_b} → {speaker_a} (similarity: {similarity:.2f})")
+                    speaker_mapping[speaker_b] = speaker_a
+                    processed.add(speaker_b)
+        
+        # Apply mapping to turns
+        updated_turns = []
+        for turn in turns:
+            new_speaker = speaker_mapping.get(turn.speaker, turn.speaker)
+            updated_turns.append(SpeakerTurn(
+                start=turn.start,
+                end=turn.end,
+                speaker=new_speaker
+            ))
+        
+        return updated_turns, speaker_mapping
+        
+    except Exception as e:
+        print(f"⚠️ Speaker merging failed: {e}")
+        return turns, {}
+
+
+def analyze_all_speakers(
+    audio_path: str,
+    turns: list[SpeakerTurn]
+) -> dict[str, SpeakerInfo]:
+    """
+    Analyze all speakers to get gender and other info.
+    
+    Args:
+        audio_path: Path to audio file
+        turns: List of speaker turns
+        
+    Returns:
+        Dict mapping speaker ID to SpeakerInfo
+    """
+    speakers = list(set(t.speaker for t in turns))
+    speaker_info = {}
+    
+    for speaker in speakers:
+        # Calculate total duration
+        total_duration = sum(
+            t.end - t.start
+            for t in turns
+            if t.speaker == speaker
+        )
+        
+        # Analyze pitch for gender
+        avg_pitch, gender = analyze_speaker_pitch(audio_path, turns, speaker)
+        
+        speaker_info[speaker] = SpeakerInfo(
+            id=speaker,
+            gender=gender,
+            avg_pitch=avg_pitch,
+            total_duration=total_duration
+        )
+        
+        print(f"🎤 {speaker}: {gender} (pitch={avg_pitch:.0f}Hz, duration={total_duration:.1f}s)")
+    
+    return speaker_info
+
+
 def diarize_video(
     video_path: str,
     temp_dir: str,
@@ -281,6 +533,11 @@ def diarize_video(
 ) -> Optional[DiarizationResult]:
     """
     Full diarization pipeline for a video.
+    
+    Includes:
+    - Speaker diarization (who speaks when)
+    - Speaker merging (same voice across gaps = same ID)
+    - Gender detection via pitch analysis
     
     Args:
         video_path: Path to video file
@@ -318,14 +575,35 @@ def diarize_video(
             print("⚠️ No speaker turns detected")
             return None
         
-        # Determine primary speaker
-        primary = determine_primary_speaker(turns, config.PRIMARY_SPEAKER_STRATEGY)
+        initial_speakers = list(set(t.speaker for t in turns))
+        print(f"🎤 Initial speakers detected: {len(initial_speakers)}")
+        
+        # Merge similar speakers (same voice across gaps)
+        if len(initial_speakers) > 1:
+            print("🔗 Checking for duplicate speakers (same voice, different IDs)...")
+            turns, speaker_mapping = merge_similar_speakers(turns, audio_path)
+            
+            if speaker_mapping:
+                merged_count = len([k for k, v in speaker_mapping.items() if k != v])
+                if merged_count > 0:
+                    print(f"🔗 Merged {merged_count} duplicate speaker(s)")
+        
+        # Get updated speaker list after merging
         speakers = list(set(t.speaker for t in turns))
+        print(f"🎤 Final speakers: {len(speakers)}")
+        
+        # Determine primary speaker (who talks most)
+        primary = determine_primary_speaker(turns, config.PRIMARY_SPEAKER_STRATEGY)
+        
+        # Analyze each speaker (gender detection via pitch)
+        print("🎤 Analyzing speaker voices...")
+        speaker_info = analyze_all_speakers(audio_path, turns)
         
         return DiarizationResult(
             turns=turns,
             primary_speaker=primary,
-            speakers=speakers
+            speakers=speakers,
+            speaker_info=speaker_info
         )
         
     except DiarizationError as e:
