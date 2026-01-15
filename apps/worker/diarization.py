@@ -121,10 +121,22 @@ def run_diarization(audio_path: str) -> list[SpeakerTurn]:
     print(f"🎤 Loading diarization model: {config.DIARIZATION_MODEL}")
     
     try:
-        pipeline = Pipeline.from_pretrained(
-            config.DIARIZATION_MODEL,
-            token=config.HF_TOKEN
-        )
+        # Try newer API first (token=), fall back to older API (use_auth_token=)
+        try:
+            pipeline = Pipeline.from_pretrained(
+                config.DIARIZATION_MODEL,
+                token=config.HF_TOKEN
+            )
+        except TypeError as te:
+            if "unexpected keyword argument" in str(te) and "token" in str(te):
+                # Older pyannote version uses use_auth_token
+                print("🎤 Using legacy API (use_auth_token)")
+                pipeline = Pipeline.from_pretrained(
+                    config.DIARIZATION_MODEL,
+                    use_auth_token=config.HF_TOKEN
+                )
+            else:
+                raise
     except Exception as e:
         error_msg = str(e)
         if "gated" in error_msg.lower() or "401" in error_msg or "403" in error_msg:
