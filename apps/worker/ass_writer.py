@@ -17,7 +17,7 @@ from typing import Optional
 
 
 # Animation settings
-ZOOM_ANIMATION_DURATION_MS = 150  # Duration of zoom-in effect in milliseconds
+ZOOM_ANIMATION_DURATION_MS = 100  # Duration of zoom-in effect in milliseconds (fast & snappy)
 ZOOM_START_SCALE = 70  # Start at 70% scale
 ZOOM_END_SCALE = 100   # End at 100% scale
 
@@ -43,11 +43,11 @@ def generate_ass_header(
     play_res_x: int = 1080,
     play_res_y: int = 1920,
     font_name: str = "Montserrat ExtraBold",
-    font_size: int = 60,  # Bold but not overwhelming
-    margin_v: int = 160,  # Safe margin from bottom
+    font_size: int = 75,  # Large TikTok/Reels style
+    margin_v: int = 280,  # Higher up from bottom
     margin_l: int = 50,
     margin_r: int = 50,
-    outline: int = 3,     # Clean outline for readability
+    outline: int = 4,     # Thick outline for readability
     shadow: int = 0,      # No shadow, just outline
 ) -> str:
     """
@@ -150,8 +150,8 @@ def segments_to_ass(
     play_res_x: int = 1080,
     play_res_y: int = 1920,
     font_name: str = "Montserrat ExtraBold",
-    font_size: int = 60,  # Bold but not overwhelming
-    margin_v: int = 160,  # Safe margin from bottom
+    font_size: int = 75,  # Large TikTok/Reels style
+    margin_v: int = 280,  # Higher up from bottom
     margin_l: int = 50,
     margin_r: int = 50,
     enable_zoom_animation: bool = True,

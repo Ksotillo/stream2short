@@ -84,25 +84,25 @@ def render_vertical_video(
             # ASS filter respects embedded styling (large text, zoom animation)
             filters.append(f"ass='{escaped_path}'")
         else:
-            # SRT fallback - Bold but readable subtitles
+            # SRT fallback - Large TikTok/Reels style subtitles
             # - Montserrat ExtraBold for impact
-            # - Bottom center positioning with safe margins
-            # - White text with black outline for readability
+            # - Higher positioning (not too close to bottom)
+            # - White text with thick black outline for readability
             filters.append(
                 f"subtitles=filename='{escaped_path}'"
                 ":force_style='"
                 "FontName=Montserrat ExtraBold,"  # Bold modern font
-                "FontSize=60,"               # Bold but not overwhelming
+                "FontSize=75,"               # Large TikTok style
                 "PrimaryColour=&H00FFFFFF,"  # White text
                 "OutlineColour=&H00000000,"  # Black outline
                 "Bold=1,"                    # Bold weight
                 "BorderStyle=1,"             # Outline style
-                "Outline=3,"                 # Clean outline
+                "Outline=4,"                 # Thick outline
                 "Shadow=0,"                  # No shadow
                 "Alignment=2,"               # Bottom center
                 "MarginL=50,"                # Left margin
                 "MarginR=50,"                # Right margin
-                "MarginV=160"                # Bottom margin
+                "MarginV=280"                # Higher up from bottom
                 "'"
             )
     
@@ -310,17 +310,17 @@ def render_split_layout_video(
             subtitle_filter = f"[stacked]ass='{escaped_path}'[final]"
         else:
             # SRT fallback with inline styling
-            subtitle_margin_v = int(content_h * 0.08)  # 8% from bottom
+            subtitle_margin_v = int(content_h * 0.15)  # 15% from bottom (higher up)
             subtitle_filter = (
                 f"[stacked]subtitles=filename='{escaped_path}'"
                 ":force_style='"
                 "FontName=Montserrat ExtraBold,"
-                "FontSize=60,"
+                "FontSize=75,"
                 "PrimaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,"
                 "Bold=1,"
                 "BorderStyle=1,"
-                "Outline=3,"
+                "Outline=4,"
                 "Shadow=0,"
                 "Alignment=2,"
                 "MarginL=50,"
