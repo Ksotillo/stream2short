@@ -122,7 +122,7 @@ def run_diarization(audio_path: str) -> list[SpeakerTurn]:
     try:
         pipeline = Pipeline.from_pretrained(
             config.DIARIZATION_MODEL,
-            use_auth_token=config.HF_TOKEN
+            token=config.HF_TOKEN  # 'token' replaces deprecated 'use_auth_token'
         )
     except Exception as e:
         error_msg = str(e)
