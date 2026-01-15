@@ -1,6 +1,13 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { config } from '../config.js';
-import { getChannelByLogin, getChannelByBroadcasterId, createJob, updateJob } from '../db.js';
+import { 
+  getChannelByLogin, 
+  getChannelByBroadcasterId, 
+  createJob, 
+  updateJob,
+  checkCooldowns,
+  getJobByClipId,
+} from '../db.js';
 import { enqueueJob } from '../queue.js';
 import { getValidAccessToken, createClip, getClip } from '../twitch.js';
 
@@ -73,6 +80,35 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
     }
     
     try {
+      // ====================================================================
+      // ANTI-SPAM CHECKS (before creating clip)
+      // ====================================================================
+      const cooldownResult = await checkCooldowns(
+        channelRecord.id,
+        user || null,
+        null, // No clip ID yet - we're creating a new one
+        {
+          channelCooldownSeconds: config.cooldown.channelCooldownSeconds,
+          userCooldownSeconds: config.cooldown.userCooldownSeconds,
+          blockOnActiveJob: config.cooldown.blockOnActiveJob,
+          blockDuplicateClips: false, // Not applicable for new clips
+        }
+      );
+      
+      if (!cooldownResult.allowed) {
+        fastify.log.info(`Clip request blocked: ${cooldownResult.reason} (channel: ${channelRecord.twitch_login}, user: ${user})`);
+        
+        if (cooldownResult.waitSeconds) {
+          return reply.send(`⏳ Please wait ${cooldownResult.waitSeconds}s before creating another clip.`);
+        }
+        
+        if (cooldownResult.reason?.includes('already being processed')) {
+          return reply.send(`⏳ A clip is already being processed. Please wait.`);
+        }
+        
+        return reply.send(`⏳ ${cooldownResult.reason}`);
+      }
+      
       // Get valid access token for the channel
       const accessToken = await getValidAccessToken(channelRecord.id);
       
@@ -148,6 +184,27 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
     }
     
     try {
+      // Anti-spam checks
+      const cooldownResult = await checkCooldowns(
+        channelRecord.id,
+        requested_by || null,
+        null,
+        {
+          channelCooldownSeconds: config.cooldown.channelCooldownSeconds,
+          userCooldownSeconds: config.cooldown.userCooldownSeconds,
+          blockOnActiveJob: config.cooldown.blockOnActiveJob,
+          blockDuplicateClips: false,
+        }
+      );
+      
+      if (!cooldownResult.allowed) {
+        return reply.status(429).send({
+          error: 'Rate limited',
+          reason: cooldownResult.reason,
+          wait_seconds: cooldownResult.waitSeconds,
+        });
+      }
+      
       const job = await createJob({
         channel_id: channelRecord.id,
         requested_by: requested_by || null,
@@ -274,6 +331,38 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
           error: `Channel "${clipInfo.broadcaster_name}" is not connected. The streamer needs to authenticate first at /auth/twitch/start`,
           broadcaster_id: clipInfo.broadcaster_id,
           broadcaster_name: clipInfo.broadcaster_name,
+        });
+      }
+      
+      // ====================================================================
+      // ANTI-SPAM CHECKS (including duplicate clip check)
+      // ====================================================================
+      const cooldownResult = await checkCooldowns(
+        channelRecord.id,
+        requested_by || 'api-process-clip',
+        clipInfo.id, // Check for duplicate clip ID
+        {
+          channelCooldownSeconds: 0, // No channel cooldown for process-clip
+          userCooldownSeconds: 0,    // No user cooldown for process-clip
+          blockOnActiveJob: config.cooldown.blockOnActiveJob,
+          blockDuplicateClips: config.cooldown.blockDuplicateClips,
+        }
+      );
+      
+      if (!cooldownResult.allowed) {
+        // For duplicate clips, return the existing job info
+        if (cooldownResult.existingJob && cooldownResult.reason?.includes('already been processed')) {
+          return reply.status(409).send({
+            error: cooldownResult.reason,
+            existing_job_id: cooldownResult.existingJob.id,
+            existing_job_status: cooldownResult.existingJob.status,
+            clip_id: clipInfo.id,
+          });
+        }
+        
+        return reply.status(429).send({
+          error: 'Rate limited',
+          reason: cooldownResult.reason,
         });
       }
       

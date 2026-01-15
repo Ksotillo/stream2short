@@ -158,3 +158,172 @@ export async function updateJob(jobId: string, updates: Partial<ClipJob>): Promi
   if (error) throw new Error(`Failed to update job: ${error.message}`);
 }
 
+// ============================================================================
+// Anti-Spam / Cooldown Functions
+// ============================================================================
+
+/**
+ * Check if there's a recent job for this channel (within cooldown period).
+ * Used for per-channel cooldown.
+ */
+export async function getRecentJobForChannel(
+  channelId: string,
+  withinSeconds: number
+): Promise<ClipJob | null> {
+  const cutoff = new Date(Date.now() - withinSeconds * 1000).toISOString();
+  
+  const { data, error } = await supabase
+    .from('clip_jobs')
+    .select('*')
+    .eq('channel_id', channelId)
+    .gte('created_at', cutoff)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  
+  if (error) return null;
+  return data as ClipJob | null;
+}
+
+/**
+ * Check if there's a recent job by this user for this channel (within cooldown period).
+ * Used for per-user cooldown.
+ */
+export async function getRecentJobByUser(
+  channelId: string,
+  requestedBy: string,
+  withinSeconds: number
+): Promise<ClipJob | null> {
+  const cutoff = new Date(Date.now() - withinSeconds * 1000).toISOString();
+  
+  const { data, error } = await supabase
+    .from('clip_jobs')
+    .select('*')
+    .eq('channel_id', channelId)
+    .eq('requested_by', requestedBy)
+    .gte('created_at', cutoff)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  
+  if (error) return null;
+  return data as ClipJob | null;
+}
+
+/**
+ * Check if there's an active (queued or processing) job for this channel.
+ * Active statuses are anything not 'ready' or 'failed'.
+ */
+export async function getActiveJobForChannel(channelId: string): Promise<ClipJob | null> {
+  const { data, error } = await supabase
+    .from('clip_jobs')
+    .select('*')
+    .eq('channel_id', channelId)
+    .not('status', 'in', '("ready","failed")')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  
+  if (error) return null;
+  return data as ClipJob | null;
+}
+
+/**
+ * Check if we already have a job for this Twitch clip ID.
+ * Used to prevent duplicate processing of the same clip.
+ */
+export async function getJobByClipId(twitchClipId: string): Promise<ClipJob | null> {
+  const { data, error } = await supabase
+    .from('clip_jobs')
+    .select('*')
+    .eq('twitch_clip_id', twitchClipId)
+    .limit(1)
+    .maybeSingle();
+  
+  if (error) return null;
+  return data as ClipJob | null;
+}
+
+/**
+ * Result of anti-spam checks.
+ */
+export interface CooldownCheckResult {
+  allowed: boolean;
+  reason?: string;
+  waitSeconds?: number;
+  existingJob?: ClipJob;
+}
+
+/**
+ * Comprehensive anti-spam check for clip creation.
+ * Checks: channel cooldown, user cooldown, active job, duplicate clip.
+ */
+export async function checkCooldowns(
+  channelId: string,
+  requestedBy: string | null,
+  twitchClipId: string | null,
+  options: {
+    channelCooldownSeconds: number;
+    userCooldownSeconds: number;
+    blockOnActiveJob: boolean;
+    blockDuplicateClips: boolean;
+  }
+): Promise<CooldownCheckResult> {
+  // 1. Check for duplicate clip ID
+  if (options.blockDuplicateClips && twitchClipId) {
+    const existingJob = await getJobByClipId(twitchClipId);
+    if (existingJob) {
+      return {
+        allowed: false,
+        reason: 'This clip has already been processed',
+        existingJob,
+      };
+    }
+  }
+  
+  // 2. Check for active job on this channel
+  if (options.blockOnActiveJob) {
+    const activeJob = await getActiveJobForChannel(channelId);
+    if (activeJob) {
+      return {
+        allowed: false,
+        reason: 'A clip is already being processed for this channel',
+        existingJob: activeJob,
+      };
+    }
+  }
+  
+  // 3. Check channel cooldown
+  if (options.channelCooldownSeconds > 0) {
+    const recentJob = await getRecentJobForChannel(channelId, options.channelCooldownSeconds);
+    if (recentJob) {
+      const jobAge = (Date.now() - new Date(recentJob.created_at).getTime()) / 1000;
+      const waitSeconds = Math.ceil(options.channelCooldownSeconds - jobAge);
+      return {
+        allowed: false,
+        reason: `Channel cooldown active`,
+        waitSeconds,
+        existingJob: recentJob,
+      };
+    }
+  }
+  
+  // 4. Check per-user cooldown
+  if (options.userCooldownSeconds > 0 && requestedBy) {
+    const recentUserJob = await getRecentJobByUser(channelId, requestedBy, options.userCooldownSeconds);
+    if (recentUserJob) {
+      const jobAge = (Date.now() - new Date(recentUserJob.created_at).getTime()) / 1000;
+      const waitSeconds = Math.ceil(options.userCooldownSeconds - jobAge);
+      return {
+        allowed: false,
+        reason: `User cooldown active`,
+        waitSeconds,
+        existingJob: recentUserJob,
+      };
+    }
+  }
+  
+  // All checks passed
+  return { allowed: true };
+}
+

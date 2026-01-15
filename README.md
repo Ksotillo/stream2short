@@ -335,6 +335,36 @@ queued → creating_clip → waiting_clip → downloading → transcribing → r
 
 *One of `GOOGLE_SERVICE_ACCOUNT_FILE` or `GOOGLE_SERVICE_ACCOUNT_JSON` is required for uploads.
 
+### Anti-Spam / Cooldown Settings
+
+Prevents chat spam and duplicate processing:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHANNEL_COOLDOWN_SECONDS` | 30 | Minimum seconds between clips for the same channel |
+| `USER_COOLDOWN_SECONDS` | 60 | Minimum seconds between clips for the same user |
+| `BLOCK_ON_ACTIVE_JOB` | true | Block new clips if one is already processing |
+| `BLOCK_DUPLICATE_CLIPS` | true | Prevent re-processing the same Twitch clip |
+
+**How it works:**
+
+1. **Per-channel cooldown (30s default):** If anyone created a clip for this channel in the last 30 seconds, new requests are rejected. This prevents multiple users from spamming `!clip` at the same time.
+
+2. **Per-user cooldown (60s default):** The same user can't trigger clips more than once per minute. Prevents individual spam.
+
+3. **Active job blocking:** If a clip is currently being processed for the channel, new requests are rejected. Only one clip at a time per channel.
+
+4. **Duplicate clip prevention:** Once a Twitch clip ID has been processed, it won't be processed again. The `/api/process-clip` endpoint returns the existing job info if you try to re-process.
+
+**Example responses when rate-limited:**
+
+```
+⏳ Please wait 15s before creating another clip.
+⏳ A clip is already being processed. Please wait.
+```
+
+**Database migration:** Run `supabase/migrations/002_antispam_constraints.sql` in your Supabase SQL editor to add the unique constraint on `twitch_clip_id`.
+
 ### Speaker Diarization (Optional)
 
 | Variable | Required | Description |
