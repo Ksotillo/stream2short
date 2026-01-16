@@ -2,10 +2,10 @@ import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import crypto from 'crypto';
 import { config } from '../config.js';
 import { getAuthUrl, exchangeCodeForTokens, getTwitchUser } from '../twitch.js';
-import { upsertChannel, upsertTokens, type OAuthToken } from '../db.js';
+import { upsertChannel, upsertTokens, getChannelByBroadcasterId, type OAuthToken } from '../db.js';
 
 // Simple in-memory state store (use Redis in production for multi-instance)
-const stateStore = new Map<string, { expires: number }>();
+const stateStore = new Map<string, { expires: number; redirect_uri?: string }>();
 
 // Clean expired states periodically
 setInterval(() => {
@@ -19,12 +19,24 @@ setInterval(() => {
 
 export async function authRoutes(fastify: FastifyInstance): Promise<void> {
   // Start OAuth flow
-  fastify.get('/auth/twitch/start', async (request: FastifyRequest, reply: FastifyReply) => {
+  fastify.get('/auth/twitch/start', async (
+    request: FastifyRequest<{
+      Querystring: {
+        redirect_uri?: string;
+      };
+    }>,
+    reply: FastifyReply
+  ) => {
+    const { redirect_uri } = request.query;
+    
     // Generate a random state for CSRF protection
     const state = crypto.randomBytes(16).toString('hex');
     
-    // Store state with 10 minute expiry
-    stateStore.set(state, { expires: Date.now() + 10 * 60 * 1000 });
+    // Store state with 10 minute expiry and optional redirect URI for dashboard
+    stateStore.set(state, { 
+      expires: Date.now() + 10 * 60 * 1000,
+      redirect_uri: redirect_uri || undefined,
+    });
     
     const authUrl = getAuthUrl(state);
     
@@ -75,6 +87,10 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
       `);
     }
     
+    // Get stored state data (including optional redirect_uri)
+    const stateData = stateStore.get(state)!;
+    const dashboardRedirectUri = stateData.redirect_uri;
+    
     // Remove used state
     stateStore.delete(state);
     
@@ -121,6 +137,21 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
       
       fastify.log.info(`Channel ${channel.twitch_login} connected successfully`);
       
+      // If this is a dashboard login, redirect back with user info
+      if (dashboardRedirectUri) {
+        const redirectUrl = new URL(dashboardRedirectUri);
+        redirectUrl.searchParams.set('channel_id', channel.id);
+        redirectUrl.searchParams.set('twitch_id', user.id);
+        redirectUrl.searchParams.set('login', user.login);
+        redirectUrl.searchParams.set('display_name', user.display_name);
+        if (user.profile_image_url) {
+          redirectUrl.searchParams.set('profile_image_url', user.profile_image_url);
+        }
+        
+        return reply.redirect(redirectUrl.toString());
+      }
+      
+      // Standard HTML response for direct OAuth
       return reply.type('text/html').send(`
         <!DOCTYPE html>
         <html>
@@ -162,6 +193,13 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
       `);
     } catch (err) {
       fastify.log.error({ err }, 'OAuth callback error');
+      
+      // If dashboard redirect, send error via redirect
+      if (dashboardRedirectUri) {
+        const redirectUrl = new URL(dashboardRedirectUri);
+        redirectUrl.searchParams.set('error', err instanceof Error ? err.message : 'auth_failed');
+        return reply.redirect(redirectUrl.toString());
+      }
       
       return reply.type('text/html').send(`
         <!DOCTYPE html>

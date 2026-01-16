@@ -2,20 +2,61 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --background: #0a0a0b;
-  --foreground: #fafafa;
-  --card: #18181b;
-  --card-hover: #27272a;
-  --border: #3f3f46;
-  --muted: #71717a;
-  --accent: #9146ff;
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 262 83% 58%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 262 83% 58%;
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 6%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 10% 6%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 262 83% 58%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 262 83% 58%;
+  }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
 }
 
 /* Custom scrollbar */
@@ -25,35 +66,74 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--background);
+  @apply bg-background;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 4px;
+  @apply bg-border rounded-full;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--muted);
+  @apply bg-muted-foreground/50;
+}
+
+/* Gradient backgrounds */
+.gradient-bg {
+  background: linear-gradient(135deg, hsl(262 83% 58% / 0.1) 0%, hsl(240 10% 6%) 50%, hsl(200 80% 50% / 0.05) 100%);
+}
+
+.card-gradient {
+  background: linear-gradient(180deg, hsl(240 10% 8%) 0%, hsl(240 10% 6%) 100%);
+}
+
+/* Glass effect */
+.glass {
+  @apply bg-card/50 backdrop-blur-xl border border-border/50;
+}
+
+/* Glow effects */
+.glow-purple {
+  box-shadow: 0 0 40px -10px hsl(262 83% 58% / 0.3);
+}
+
+.glow-success {
+  box-shadow: 0 0 20px -5px hsl(142 76% 36% / 0.3);
 }
 
 /* Status badges */
 .status-badge {
-  @apply px-2 py-0.5 rounded-full text-xs font-medium;
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
 }
 
-.status-queued { @apply bg-yellow-500/20 text-yellow-400; }
+.status-queued {
+  @apply bg-yellow-500/10 text-yellow-500 border border-yellow-500/20;
+}
+
 .status-creating_clip,
 .status-waiting_clip,
 .status-downloading,
 .status-transcribing,
 .status-rendering,
-.status-uploading { @apply bg-blue-500/20 text-blue-400; }
-.status-ready { @apply bg-green-500/20 text-green-400; }
-.status-failed { @apply bg-red-500/20 text-red-400; }
+.status-uploading {
+  @apply bg-blue-500/10 text-blue-400 border border-blue-500/20;
+}
 
-/* Review status badges */
-.review-pending { @apply bg-gray-500/20 text-gray-400; }
-.review-approved { @apply bg-green-500/20 text-green-400; }
-.review-rejected { @apply bg-red-500/20 text-red-400; }
+.status-ready {
+  @apply bg-emerald-500/10 text-emerald-400 border border-emerald-500/20;
+}
 
+.status-failed {
+  @apply bg-red-500/10 text-red-400 border border-red-500/20;
+}
+
+.review-pending {
+  @apply bg-zinc-500/10 text-zinc-400 border border-zinc-500/20;
+}
+
+.review-approved {
+  @apply bg-emerald-500/10 text-emerald-400 border border-emerald-500/20;
+}
+
+.review-rejected {
+  @apply bg-red-500/10 text-red-400 border border-red-500/20;
+}
