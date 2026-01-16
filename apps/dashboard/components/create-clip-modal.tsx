@@ -3,7 +3,6 @@
 import { useState } from 'react'
 import { Button } from './ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card'
-import { processClip } from '@/lib/api'
 import { Plus, Loader2, CheckCircle, XCircle, Link2, Sparkles } from 'lucide-react'
 
 export function CreateClipButton() {
@@ -47,9 +46,19 @@ function CreateClipModal({ onClose }: { onClose: () => void }) {
     setMessage('')
     
     try {
-      const result = await processClip(clipUrl, 'dashboard')
+      // Call our internal API route (avoids mixed content issues)
+      const res = await fetch('/api/clips/process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clip_url: clipUrl,
+          requested_by: 'dashboard',
+        }),
+      })
       
-      if (result.success) {
+      const result = await res.json()
+      
+      if (res.ok && result.success) {
         setStatus('success')
         setMessage(result.message || 'Clip queued for processing!')
         setJobId(result.job_id || null)
