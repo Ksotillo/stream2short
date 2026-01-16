@@ -459,8 +459,21 @@ def upload_file(
         
         print(f"✅ Uploaded: {file['name']} (ID: {file['id']})")
         
-        # Files in Shared Drives inherit the drive's sharing settings
-        # No need to manually set permissions
+        # Set "Anyone with the link can view" permission
+        try:
+            permission = {
+                'type': 'anyone',
+                'role': 'reader'
+            }
+            service.permissions().create(
+                fileId=file['id'],
+                body=permission,
+                supportsAllDrives=True
+            ).execute()
+            print(f"🔓 Set public link sharing for: {file['name']}")
+        except HttpError as perm_error:
+            # Log but don't fail upload if permission setting fails
+            print(f"⚠️ Warning: Could not set public sharing: {perm_error}")
         
         return {
             'id': file['id'],
