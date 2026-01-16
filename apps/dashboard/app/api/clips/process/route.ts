@@ -4,6 +4,15 @@ import { cookies } from 'next/headers'
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'
 const API_KEY = process.env.DASHBOARD_API_KEY || ''
 
+// GET handler for debugging - confirms route exists
+export async function GET() {
+  return NextResponse.json({ 
+    status: 'ok', 
+    message: 'Use POST to process a clip',
+    api_url_configured: !!API_URL,
+  })
+}
+
 export async function POST(request: NextRequest) {
   // Check session
   const session = cookies().get('stream2short_session')
