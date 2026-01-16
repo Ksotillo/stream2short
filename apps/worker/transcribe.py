@@ -73,14 +73,17 @@ def transcribe_video(video_path: str, output_srt_path: str) -> str:
 
 def transcribe_video_with_segments(
     video_path: str,
-    words_per_subtitle: int = 3
+    words_per_subtitle: int = 3,
+    audio_path: str = None,
 ) -> tuple[list[dict], str]:
     """
-    Transcribe video and return segment data for diarization processing.
+    Transcribe video/audio and return segment data for diarization processing.
     
     Args:
-        video_path: Path to input video file
+        video_path: Path to input video file (used if audio_path not provided)
         words_per_subtitle: Max words per subtitle chunk
+        audio_path: Optional path to preprocessed audio file (16kHz mono WAV)
+                   If provided, uses this instead of extracting from video
         
     Returns:
         Tuple of (segments list, transcript text)
@@ -88,11 +91,13 @@ def transcribe_video_with_segments(
     """
     model = get_model()
     
-    print(f"🎙️ Transcribing: {video_path}")
+    # Use preprocessed audio if available, otherwise video
+    input_path = audio_path if audio_path else video_path
+    print(f"🎙️ Transcribing: {input_path}" + (" (preprocessed audio)" if audio_path else ""))
     
     # Transcribe with word-level timestamps
     segments, info = model.transcribe(
-        video_path,
+        input_path,  # Use preprocessed audio if available
         beam_size=5,
         word_timestamps=True,
         vad_filter=True,

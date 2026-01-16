@@ -29,6 +29,10 @@ from disk_utils import (
     cleanup_old_temp_directories,
     print_disk_status,
 )
+from audio_preprocess import (
+    preprocess_audio_for_pipeline,
+    AudioPreprocessError,
+)
 
 
 class PipelineError(Exception):
@@ -140,6 +144,20 @@ def _process_job_stages(
         update_job(job_id, raw_video_path=raw_video_path)
         print(f"✅ Downloaded to: {raw_video_path}")
         
+        # Stage 3b: Audio preprocessing (normalization + extraction)
+        # Single extraction used for both transcription and diarization
+        print("🔊 Stage 3b: Preprocessing audio...")
+        try:
+            preprocessed_audio = preprocess_audio_for_pipeline(
+                video_path=raw_video_path,
+                temp_dir=str(temp_dir),
+            )
+            print(f"✅ Audio preprocessed: {preprocessed_audio}")
+        except AudioPreprocessError as e:
+            print(f"⚠️ Audio preprocessing failed: {e}")
+            print("   Falling back to direct video processing...")
+            preprocessed_audio = None
+        
         # Stage 4: Transcribe + Diarization
         update_job_status(job_id, "transcribing")
         print("🎙️ Stage 4: Transcribing audio...")
@@ -147,8 +165,11 @@ def _process_job_stages(
         # Get channel settings for per-channel diarization toggle
         channel_settings = channel.get("settings", {}) or {}
         
-        # Get transcript segments
-        segments, transcript_text_raw = transcribe_video_with_segments(raw_video_path)
+        # Get transcript segments (using preprocessed audio if available)
+        segments, transcript_text_raw = transcribe_video_with_segments(
+            video_path=raw_video_path,
+            audio_path=preprocessed_audio,  # Use normalized audio
+        )
         print(f"✅ Transcription complete: {len(segments)} segments")
         
         # Stage 4b: Speaker diarization (if enabled)
@@ -161,6 +182,7 @@ def _process_job_stages(
                 video_path=raw_video_path,
                 temp_dir=str(temp_dir),
                 channel_settings=channel_settings,
+                audio_path=preprocessed_audio,  # Use same preprocessed audio
             )
             
             if diarization_result:

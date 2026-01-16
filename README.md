@@ -402,6 +402,31 @@ Prevents chat spam and duplicate processing:
 
 **Database migration:** Run `supabase/migrations/002_antispam_constraints.sql` in your Supabase SQL editor to add the unique constraint on `twitch_clip_id`.
 
+### Audio Preprocessing
+
+Improves transcription accuracy and speaker detection:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_AUDIO_NORMALIZATION` | true | Apply EBU R128 loudness normalization |
+
+**How it works:**
+
+1. **Single extraction:** Audio is extracted once and shared by both Whisper (transcription) and pyannote (diarization)
+
+2. **Loudness normalization:** Uses FFmpeg's `loudnorm` filter (EBU R128 standard):
+   - Target: -16 LUFS (optimal for speech)
+   - Consistent levels regardless of source volume
+
+3. **High-pass filter:** Removes low-frequency noise below 80Hz
+
+4. **Consistent format:** 16kHz mono WAV (required by both Whisper and pyannote)
+
+**Benefits:**
+- Improved speech recognition accuracy
+- Better speaker separation in diarization
+- Consistent results across clips with varying audio levels
+
 ### Speaker Diarization (Optional)
 
 | Variable | Required | Description |

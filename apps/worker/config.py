@@ -49,6 +49,9 @@ class Config:
     CLIP_POLL_INTERVAL: float = 1.0  # seconds
     CLIP_POLL_MAX_ATTEMPTS: int = 15
     
+    # Audio preprocessing
+    ENABLE_AUDIO_NORMALIZATION: bool = os.getenv("ENABLE_AUDIO_NORMALIZATION", "true").lower() == "true"
+    
     # Speaker Diarization (pyannote.audio)
     HF_TOKEN: str = os.getenv("HF_TOKEN", "")  # Hugging Face token for gated models
     ENABLE_DIARIZATION: bool = os.getenv("ENABLE_DIARIZATION", "false").lower() == "true"

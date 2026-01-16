@@ -529,7 +529,8 @@ def analyze_all_speakers(
 def diarize_video(
     video_path: str,
     temp_dir: str,
-    channel_settings: Optional[dict] = None
+    channel_settings: Optional[dict] = None,
+    audio_path: Optional[str] = None,
 ) -> Optional[DiarizationResult]:
     """
     Full diarization pipeline for a video.
@@ -543,6 +544,8 @@ def diarize_video(
         video_path: Path to video file
         temp_dir: Directory for temporary files
         channel_settings: Optional channel settings dict (may contain enable_diarization)
+        audio_path: Optional path to preprocessed audio (16kHz mono WAV)
+                   If provided, skips audio extraction
         
     Returns:
         DiarizationResult if successful, None if disabled or failed
@@ -563,10 +566,13 @@ def diarize_video(
         return None
     
     try:
-        # Extract audio
-        audio_path = os.path.join(temp_dir, "diarization_audio.wav")
-        print("🎤 Extracting audio for diarization...")
-        extract_audio_for_diarization(video_path, audio_path)
+        # Use preprocessed audio if provided, otherwise extract
+        if audio_path and os.path.exists(audio_path):
+            print(f"🎤 Using preprocessed audio: {audio_path}")
+        else:
+            audio_path = os.path.join(temp_dir, "diarization_audio.wav")
+            print("🎤 Extracting audio for diarization...")
+            extract_audio_for_diarization(video_path, audio_path)
         
         # Run diarization
         turns = run_diarization(audio_path)
