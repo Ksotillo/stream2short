@@ -147,11 +147,12 @@ function StatsCard({
 }
 
 function ClipCard({ job }: { job: any }) {
-  const statusVariant = {
+  const statusVariantMap: Record<string, string> = {
     ready: 'success',
     failed: 'destructive',
     queued: 'warning',
-  }[job.status] || 'info'
+  }
+  const statusVariant = statusVariantMap[job.status as string] || 'info'
   
   return (
     <Link href={`/clips/${job.id}`}>
