@@ -31,6 +31,10 @@ export type JobStatus =
   | 'ready'
   | 'failed';
 
+export type ReviewStatus = 'pending' | 'approved' | 'rejected';
+export type LastStage = 'download' | 'transcribe' | 'render' | 'upload';
+export type RenderPreset = 'default' | 'clean' | 'boxed' | 'minimal' | 'bold';
+
 export interface ClipJob {
   id: string;
   channel_id: string;
@@ -43,9 +47,27 @@ export interface ClipJob {
   raw_video_path: string | null;
   final_video_path: string | null;
   final_video_url: string | null;
+  no_subtitles_url: string | null;
   error: string | null;
   created_at: string;
   updated_at: string;
+  // Phase 1: Review & dashboard fields
+  review_status: ReviewStatus | null;
+  review_notes: string | null;
+  reviewed_at: string | null;
+  last_stage: LastStage | null;
+  render_preset: RenderPreset;
+  transcript_text: string | null;
+}
+
+export interface JobEvent {
+  id: string;
+  job_id: string;
+  created_at: string;
+  level: 'info' | 'warn' | 'error';
+  stage: string | null;
+  message: string;
+  data: Record<string, unknown>;
 }
 
 // Create Supabase client with service role key (server-side only)
@@ -147,6 +169,213 @@ export async function getJobsByChannel(channelId: string, limit = 50): Promise<C
   
   if (error) return [];
   return data as ClipJob[];
+}
+
+// ============================================================================
+// Phase 1: Dashboard & Review Functions
+// ============================================================================
+
+/**
+ * Get all connected channels
+ */
+export async function getAllChannels(): Promise<Channel[]> {
+  const { data, error } = await supabase
+    .from('channels')
+    .select('*')
+    .order('created_at', { ascending: false });
+  
+  if (error) return [];
+  return data as Channel[];
+}
+
+/**
+ * Filter options for getJobsWithFilters
+ */
+export interface JobFilters {
+  channelId?: string;
+  status?: JobStatus | JobStatus[];
+  reviewStatus?: ReviewStatus | ReviewStatus[];
+  dateFrom?: string;
+  dateTo?: string;
+  limit?: number;
+  cursor?: string; // job ID for cursor-based pagination
+}
+
+/**
+ * Get jobs with advanced filters and pagination
+ */
+export async function getJobsWithFilters(filters: JobFilters): Promise<{ jobs: ClipJob[]; nextCursor: string | null }> {
+  let query = supabase
+    .from('clip_jobs')
+    .select('*')
+    .order('created_at', { ascending: false });
+  
+  // Channel filter
+  if (filters.channelId) {
+    query = query.eq('channel_id', filters.channelId);
+  }
+  
+  // Status filter (single or multiple)
+  if (filters.status) {
+    if (Array.isArray(filters.status)) {
+      query = query.in('status', filters.status);
+    } else {
+      query = query.eq('status', filters.status);
+    }
+  }
+  
+  // Review status filter
+  if (filters.reviewStatus) {
+    if (Array.isArray(filters.reviewStatus)) {
+      query = query.in('review_status', filters.reviewStatus);
+    } else {
+      query = query.eq('review_status', filters.reviewStatus);
+    }
+  }
+  
+  // Date range filters
+  if (filters.dateFrom) {
+    query = query.gte('created_at', filters.dateFrom);
+  }
+  if (filters.dateTo) {
+    query = query.lte('created_at', filters.dateTo);
+  }
+  
+  // Cursor-based pagination (get items after cursor)
+  if (filters.cursor) {
+    const cursorJob = await getJob(filters.cursor);
+    if (cursorJob) {
+      query = query.lt('created_at', cursorJob.created_at);
+    }
+  }
+  
+  // Limit (+1 to detect if there are more results)
+  const limit = filters.limit || 50;
+  query = query.limit(limit + 1);
+  
+  const { data, error } = await query;
+  
+  if (error) return { jobs: [], nextCursor: null };
+  
+  const jobs = data as ClipJob[];
+  
+  // Check if there are more results
+  let nextCursor: string | null = null;
+  if (jobs.length > limit) {
+    const lastJob = jobs.pop(); // Remove the extra item
+    nextCursor = lastJob?.id || null;
+  }
+  
+  return { jobs, nextCursor };
+}
+
+/**
+ * Review a job (approve/reject)
+ */
+export async function reviewJob(
+  jobId: string,
+  decision: ReviewStatus,
+  notes?: string
+): Promise<void> {
+  const { error } = await supabase
+    .from('clip_jobs')
+    .update({
+      review_status: decision,
+      review_notes: notes || null,
+      reviewed_at: new Date().toISOString(),
+    })
+    .eq('id', jobId);
+  
+  if (error) throw new Error(`Failed to review job: ${error.message}`);
+}
+
+/**
+ * Reset job for retry (clear error, reset status)
+ */
+export async function resetJobForRetry(
+  jobId: string,
+  fromStage?: LastStage
+): Promise<void> {
+  const updates: Partial<ClipJob> = {
+    status: 'queued',
+    error: null,
+  };
+  
+  // If retrying from a specific stage, we keep data from previous stages
+  // Otherwise, start fresh
+  if (!fromStage || fromStage === 'download') {
+    updates.raw_video_path = null;
+    updates.final_video_path = null;
+    updates.final_video_url = null;
+    updates.no_subtitles_url = null;
+    updates.transcript_text = null;
+    updates.last_stage = null;
+  }
+  
+  const { error } = await supabase
+    .from('clip_jobs')
+    .update(updates)
+    .eq('id', jobId);
+  
+  if (error) throw new Error(`Failed to reset job: ${error.message}`);
+}
+
+/**
+ * Update job's render preset (for re-render)
+ */
+export async function updateJobPreset(
+  jobId: string,
+  preset: RenderPreset
+): Promise<void> {
+  const { error } = await supabase
+    .from('clip_jobs')
+    .update({
+      render_preset: preset,
+      status: 'queued', // Re-queue for rendering
+      final_video_path: null,
+      final_video_url: null,
+      no_subtitles_url: null,
+    })
+    .eq('id', jobId);
+  
+  if (error) throw new Error(`Failed to update preset: ${error.message}`);
+}
+
+/**
+ * Create a job event (for logging/debugging)
+ */
+export async function createJobEvent(
+  jobId: string,
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  stage?: string,
+  data?: Record<string, unknown>
+): Promise<void> {
+  const { error } = await supabase
+    .from('job_events')
+    .insert({
+      job_id: jobId,
+      level,
+      message,
+      stage: stage || null,
+      data: data || {},
+    });
+  
+  if (error) throw new Error(`Failed to create job event: ${error.message}`);
+}
+
+/**
+ * Get events for a job
+ */
+export async function getJobEvents(jobId: string): Promise<JobEvent[]> {
+  const { data, error } = await supabase
+    .from('job_events')
+    .select('*')
+    .eq('job_id', jobId)
+    .order('created_at', { ascending: true });
+  
+  if (error) return [];
+  return data as JobEvent[];
 }
 
 export async function updateJob(jobId: string, updates: Partial<ClipJob>): Promise<void> {

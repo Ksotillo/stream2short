@@ -6,7 +6,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from config import config
-from db import get_job, get_channel, update_job, update_job_status, mark_job_failed
+from db import (
+    get_job, get_channel, update_job, update_job_status, mark_job_failed,
+    update_last_stage, log_job_event
+)
 from twitch_api import (
     get_valid_access_token,
     create_clip,
@@ -88,6 +91,26 @@ def process_job(job_id: str) -> None:
         mark_job_failed(job_id, error_msg)
 
 
+def _should_skip_to_stage(job: dict, target_stage: str) -> bool:
+    """
+    Check if we should skip to a specific stage based on job state.
+    Used for retry from a specific stage.
+    """
+    last_stage = job.get("last_stage")
+    if not last_stage:
+        return False
+    
+    # Stage order
+    stage_order = ["download", "transcribe", "render", "upload"]
+    
+    try:
+        last_idx = stage_order.index(last_stage)
+        target_idx = stage_order.index(target_stage)
+        return target_idx <= last_idx
+    except ValueError:
+        return False
+
+
 def _process_job_stages(
     job_id: str,
     job: dict,
@@ -98,7 +121,11 @@ def _process_job_stages(
     """
     Internal function that runs the actual processing stages.
     Separated from process_job to work with the cleanup context manager.
+    
+    Supports retry from a specific stage by checking job.last_stage.
     """
+    current_stage = None
+    
     try:
         # Get valid access token
         access_token = get_valid_access_token(job["channel_id"])
@@ -130,19 +157,30 @@ def _process_job_stages(
         print(f"✅ Clip available: {clip_info.get('url')}")
         
         # Stage 3: Download clip
-        update_job_status(job_id, "downloading")
-        print("📥 Stage 3: Downloading clip...")
+        current_stage = "download"
+        raw_video_path = job.get("raw_video_path")
         
-        # Get the clip page URL (e.g., https://www.twitch.tv/channel/clip/ClipSlug)
-        clip_page_url = clip_info.get("url", "")
-        print(f"🔗 Clip URL: {clip_page_url}")
-        
-        raw_video_path = str(temp_dir / "raw.mp4")
-        # Use yt-dlp to download the clip reliably
-        download_clip(clip_page_url, raw_video_path)
-        
-        update_job(job_id, raw_video_path=raw_video_path)
-        print(f"✅ Downloaded to: {raw_video_path}")
+        # Check if we can skip download (retry from later stage)
+        if raw_video_path and os.path.exists(raw_video_path):
+            print(f"⏭️ Skipping download - raw video exists: {raw_video_path}")
+            log_job_event(job_id, "info", "Skipping download - raw video exists", "download")
+        else:
+            update_job_status(job_id, "downloading")
+            print("📥 Stage 3: Downloading clip...")
+            log_job_event(job_id, "info", "Starting download", "download")
+            
+            # Get the clip page URL (e.g., https://www.twitch.tv/channel/clip/ClipSlug)
+            clip_page_url = clip_info.get("url", "")
+            print(f"🔗 Clip URL: {clip_page_url}")
+            
+            raw_video_path = str(temp_dir / "raw.mp4")
+            # Use yt-dlp to download the clip reliably
+            download_clip(clip_page_url, raw_video_path)
+            
+            update_job(job_id, raw_video_path=raw_video_path)
+            update_last_stage(job_id, "download")
+            log_job_event(job_id, "info", f"Downloaded to: {raw_video_path}", "download")
+            print(f"✅ Downloaded to: {raw_video_path}")
         
         # Stage 3b: Audio preprocessing (normalization + extraction)
         # Single extraction used for both transcription and diarization
@@ -159,8 +197,10 @@ def _process_job_stages(
             preprocessed_audio = None
         
         # Stage 4: Transcribe + Diarization
+        current_stage = "transcribe"
         update_job_status(job_id, "transcribing")
         print("🎙️ Stage 4: Transcribing audio...")
+        log_job_event(job_id, "info", "Starting transcription", "transcribe")
         
         # Get channel settings for per-channel diarization toggle
         channel_settings = channel.get("settings", {}) or {}
@@ -170,6 +210,11 @@ def _process_job_stages(
             video_path=raw_video_path,
             audio_path=preprocessed_audio,  # Use normalized audio
         )
+        
+        # Store transcript text for dashboard preview
+        update_job(job_id, transcript_text=transcript_text_raw)
+        update_last_stage(job_id, "transcribe")
+        log_job_event(job_id, "info", f"Transcription complete: {len(segments)} segments", "transcribe")
         print(f"✅ Transcription complete: {len(segments)} segments")
         
         # Stage 4b: Speaker diarization (if enabled)
@@ -225,8 +270,13 @@ def _process_job_stages(
         print(f"✅ Subtitles saved to: {subtitle_path}")
         
         # Stage 5: Render vertical videos (TWO versions: with and without subtitles)
+        current_stage = "render"
         update_job_status(job_id, "rendering")
-        print("🎬 Stage 5: Rendering vertical videos (2 versions)...")
+        
+        # Get render preset (default or specified by re-render request)
+        render_preset = job.get("render_preset", "default")
+        print(f"🎬 Stage 5: Rendering vertical videos (preset: {render_preset})...")
+        log_job_event(job_id, "info", f"Starting render with preset: {render_preset}", "render")
         
         # Version 1: WITHOUT subtitles (raw vertical crop)
         video_no_subs_path = str(temp_dir / "final_no_subs.mp4")
@@ -251,10 +301,14 @@ def _process_job_stages(
         print(f"✅ Rendered (with subs): {video_with_subs_path}")
         
         update_job(job_id, final_video_path=video_with_subs_path)
+        update_last_stage(job_id, "render")
+        log_job_event(job_id, "info", "Render complete (both versions)", "render")
         
         # Stage 6: Upload BOTH versions to Google Drive
+        current_stage = "upload"
         update_job_status(job_id, "uploading")
         print("📤 Stage 6: Uploading to Google Drive (2 versions)...")
+        log_job_event(job_id, "info", "Starting upload to Google Drive", "upload")
         
         # Use display_name or twitch_login for folder name
         streamer_name = channel.get("display_name") or channel.get("twitch_login") or broadcaster_id
@@ -264,6 +318,10 @@ def _process_job_stages(
         
         # Get clip timestamp from clip_info
         clip_timestamp = clip_info.get("created_at", "")
+        
+        # Variables to store URLs
+        final_url = ""
+        no_subs_url = ""
         
         # Check if Google Drive is configured
         if config.GOOGLE_SERVICE_ACCOUNT_FILE or config.GOOGLE_SERVICE_ACCOUNT_JSON:
@@ -277,6 +335,7 @@ def _process_job_stages(
                 clip_timestamp=clip_timestamp,
                 version_suffix="WITHOUT_SUBTITLES",
             )
+            no_subs_url = upload_result_no_subs.get("webViewLink") or upload_result_no_subs.get("webContentLink", "")
             print(f"📁 Saved: {upload_result_no_subs.get('path', '')}")
             
             # Upload version WITH subtitles
@@ -289,23 +348,29 @@ def _process_job_stages(
                 clip_timestamp=clip_timestamp,
                 version_suffix="WITH_SUBTITLES",
             )
-            print(f"📁 Saved: {upload_result_with_subs.get('path', '')}")
-            
-            # Use the WITH_SUBTITLES version as the primary URL
             final_url = upload_result_with_subs.get("webViewLink") or upload_result_with_subs.get("webContentLink", "")
             drive_path = upload_result_with_subs.get("path", "")
             
             print(f"📁 Both versions saved to: {'/'.join(drive_path.split('/')[:-1])}/")
+            log_job_event(job_id, "info", f"Uploaded both versions to Google Drive", "upload", {
+                "with_subtitles": final_url,
+                "without_subtitles": no_subs_url,
+            })
         else:
             # No Google Drive configured, keep local path
             print("⚠️ Google Drive not configured, keeping local files")
             final_url = video_with_subs_path
+            no_subs_url = video_no_subs_path
+            log_job_event(job_id, "warn", "Google Drive not configured, keeping local files", "upload")
         
-        # Mark job as ready
+        update_last_stage(job_id, "upload")
+        
+        # Mark job as ready with both URLs
         update_job(
             job_id,
             status="ready",
             final_video_url=final_url,
+            no_subtitles_url=no_subs_url,
         )
         
         print(f"\n{'='*60}")
@@ -316,21 +381,25 @@ def _process_job_stages(
     except TwitchAPIError as e:
         error_msg = f"Twitch API error: {e}"
         print(f"❌ {error_msg}")
-        mark_job_failed(job_id, error_msg)
+        log_job_event(job_id, "error", error_msg, current_stage)
+        mark_job_failed(job_id, error_msg, current_stage)
         
     except VideoProcessingError as e:
         error_msg = f"Video processing error: {e}"
         print(f"❌ {error_msg}")
-        mark_job_failed(job_id, error_msg)
+        log_job_event(job_id, "error", error_msg, current_stage)
+        mark_job_failed(job_id, error_msg, current_stage)
     
     except SharedDriveError as e:
         error_msg = f"Google Drive error: {e}"
         print(f"❌ {error_msg}")
-        mark_job_failed(job_id, error_msg)
+        log_job_event(job_id, "error", error_msg, current_stage)
+        mark_job_failed(job_id, error_msg, current_stage)
         
     except Exception as e:
         error_msg = f"Unexpected error: {type(e).__name__}: {e}"
         print(f"❌ {error_msg}")
-        mark_job_failed(job_id, error_msg)
+        log_job_event(job_id, "error", error_msg, current_stage)
+        mark_job_failed(job_id, error_msg, current_stage)
         raise  # Re-raise to trigger cleanup in context manager
 

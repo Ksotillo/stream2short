@@ -55,7 +55,7 @@
 **Why:** Turn the pipeline into a workflow creators/editors can actually use.
 
 ### 1.1 Next.js Dashboard (`apps/dashboard`)
-- **Status:** Not Started
+- **Status:** ✅ Complete
 - **Effort:** ~4-6 hours
 
 **Pages:**
@@ -76,7 +76,7 @@
 - **Option B (proper):** Supabase Auth + RLS (can defer to Phase 2)
 
 ### 1.2 New API Endpoints
-- **Status:** Not Started
+- **Status:** ✅ Complete
 - **Effort:** ~2 hours
 
 ```
@@ -91,7 +91,7 @@ POST /api/jobs/:id/rerender     → { preset: "clean"|"boxed"|... }
 **Security:** Add `DASHBOARD_API_KEY` header requirement for dashboard endpoints.
 
 ### 1.3 Database Schema Updates
-- **Status:** Not Started
+- **Status:** ✅ Complete
 - **Effort:** ~30 min
 
 **Add to `clip_jobs`:**
@@ -117,7 +117,7 @@ CREATE TABLE job_events (
 ```
 
 ### 1.4 Discord Notifications
-- **Status:** Not Started
+- **Status:** ⏭️ Skipped (for later)
 - **Effort:** ~1 hour
 
 **Features:**
@@ -132,7 +132,7 @@ PUBLIC_DASHBOARD_URL=https://your-domain.com/dashboard
 ```
 
 ### 1.5 Retry + Re-render Mechanics
-- **Status:** Not Started
+- **Status:** ✅ Complete
 - **Effort:** ~2 hours
 
 **Retry:** Re-queue same job, worker resumes from failed stage.
@@ -143,12 +143,12 @@ PUBLIC_DASHBOARD_URL=https://your-domain.com/dashboard
 - `minimal` - Small, unobtrusive
 
 ### Phase 1 Acceptance Criteria
-- [ ] Dashboard shows jobs for multiple streamers
-- [ ] Can preview WITH/WITHOUT subtitles
-- [ ] Can approve/reject with notes
-- [ ] Can retry a failed job from specific stage
-- [ ] Can re-render with different preset without re-downloading
-- [ ] Discord notification fires on job completion
+- [x] Dashboard shows jobs for multiple streamers
+- [x] Can preview WITH/WITHOUT subtitles
+- [x] Can approve/reject with notes
+- [x] Can retry a failed job from specific stage
+- [x] Can re-render with different preset without re-downloading
+- [ ] ~~Discord notification fires on job completion~~ (skipped for later)
 
 ---
 

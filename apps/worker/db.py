@@ -50,9 +50,37 @@ def update_job_status(job_id: str, status: str) -> None:
     update_job(job_id, status=status)
 
 
-def mark_job_failed(job_id: str, error: str) -> None:
-    """Mark a job as failed with an error message."""
-    update_job(job_id, status="failed", error=error)
+def mark_job_failed(job_id: str, error: str, last_stage: str = None) -> None:
+    """Mark a job as failed with an error message and last completed stage."""
+    updates = {"status": "failed", "error": error}
+    if last_stage:
+        updates["last_stage"] = last_stage
+    update_job(job_id, **updates)
+
+
+def update_last_stage(job_id: str, stage: str) -> None:
+    """Update the last completed stage for a job."""
+    update_job(job_id, last_stage=stage)
+
+
+def log_job_event(
+    job_id: str,
+    level: str,
+    message: str,
+    stage: str = None,
+    data: dict = None
+) -> None:
+    """Log an event for a job (for debugging/progress tracking)."""
+    try:
+        supabase.table("job_events").insert({
+            "job_id": job_id,
+            "level": level,
+            "message": message,
+            "stage": stage,
+            "data": data or {},
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ Failed to log job event: {e}")
 
 
 def increment_attempt_count(job_id: str) -> int:

@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #0a0a0b;
+  --foreground: #fafafa;
+  --card: #18181b;
+  --card-hover: #27272a;
+  --border: #3f3f46;
+  --muted: #71717a;
+  --accent: #9146ff;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--background);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+/* Status badges */
+.status-badge {
+  @apply px-2 py-0.5 rounded-full text-xs font-medium;
+}
+
+.status-queued { @apply bg-yellow-500/20 text-yellow-400; }
+.status-creating_clip,
+.status-waiting_clip,
+.status-downloading,
+.status-transcribing,
+.status-rendering,
+.status-uploading { @apply bg-blue-500/20 text-blue-400; }
+.status-ready { @apply bg-green-500/20 text-green-400; }
+.status-failed { @apply bg-red-500/20 text-red-400; }
+
+/* Review status badges */
+.review-pending { @apply bg-gray-500/20 text-gray-400; }
+.review-approved { @apply bg-green-500/20 text-green-400; }
+.review-rejected { @apply bg-red-500/20 text-red-400; }
+

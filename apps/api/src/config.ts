@@ -7,6 +7,10 @@ export const config = {
   port: parseInt(process.env.API_PORT || '3000', 10),
   baseUrl: process.env.BASE_URL || 'http://localhost:3000',
   
+  // Dashboard
+  dashboardApiKey: process.env.DASHBOARD_API_KEY || '',
+  publicDashboardUrl: process.env.PUBLIC_DASHBOARD_URL || '',
+  
   // StreamElements
   seSharedSecret: process.env.SE_SHARED_SECRET || '',
   

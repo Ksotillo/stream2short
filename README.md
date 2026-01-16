@@ -14,6 +14,7 @@ A **!clip** command in your Twitch chat creates a vertical 9:16 video with burne
 - 👥 **Multi-streamer support** - works for multiple connected streamers
 - 📦 **Google Drive storage** - organized by streamer and date
 - 🔄 **Job queue** - handles multiple clip requests efficiently
+- 🖥️ **Dashboard** - web UI to review, approve, retry, and re-render clips
 
 ## Folder Structure in Google Drive
 
@@ -456,6 +457,49 @@ WHERE twitch_login = 'streamer_name';
 UPDATE channels 
 SET settings = jsonb_set(settings, '{enable_diarization}', 'false')
 WHERE twitch_login = 'streamer_name';
+```
+
+## Dashboard
+
+The dashboard is a web UI for managing and reviewing clips.
+
+### Access
+
+- **URL:** `http://your-server:3001`
+- **Auth:** Set `DASHBOARD_API_KEY` in your `.env` file
+
+### Features
+
+| Page | Description |
+|------|-------------|
+| `/` | Overview with stats and recent jobs |
+| `/jobs` | Full job list with filters (channel, status, review) |
+| `/jobs/[id]` | Job details with video preview, transcript, actions |
+
+### Actions
+
+| Action | When Available | Description |
+|--------|----------------|-------------|
+| **Approve** | Job ready | Mark clip as approved |
+| **Reject** | Job ready | Mark as rejected with notes |
+| **Retry** | Job failed | Re-queue job from start |
+| **Re-render** | Job ready | Re-render with different preset |
+
+### Environment Variables
+
+```bash
+# API (.env)
+DASHBOARD_API_KEY=your-secret-key     # Required to access dashboard endpoints
+PUBLIC_DASHBOARD_URL=http://...       # Used in notifications (optional)
+```
+
+### Database Migration
+
+Run this migration to add review columns:
+
+```sql
+-- supabase/migrations/003_dashboard_review.sql
+-- Adds: review_status, review_notes, reviewed_at, last_stage, render_preset
 ```
 
 ## License
