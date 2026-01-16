@@ -41,6 +41,10 @@ class Config:
     MAX_ATTEMPTS: int = int(os.getenv("MAX_ATTEMPTS", "2"))
     TEMP_DIR: str = os.getenv("TEMP_DIR", "/tmp/stream2short")
     
+    # Disk space management
+    MIN_DISK_SPACE_GB: float = float(os.getenv("MIN_DISK_SPACE_GB", "2.0"))  # Minimum free space required
+    CLEANUP_TEMP: bool = os.getenv("CLEANUP_TEMP", "true").lower() == "true"  # Default to cleanup
+    
     # Clip polling
     CLIP_POLL_INTERVAL: float = 1.0  # seconds
     CLIP_POLL_MAX_ATTEMPTS: int = 15

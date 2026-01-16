@@ -23,6 +23,12 @@ from diarization import (
     DiarizationResult,
 )
 from ass_writer import segments_to_ass_with_diarization
+from disk_utils import (
+    job_temp_directory,
+    DiskSpaceError,
+    cleanup_old_temp_directories,
+    print_disk_status,
+)
 
 
 class PipelineError(Exception):
@@ -63,10 +69,32 @@ def process_job(job_id: str) -> None:
     
     broadcaster_id = channel["twitch_broadcaster_id"]
     
-    # Create temp directory for this job
-    temp_dir = Path(config.TEMP_DIR) / job_id
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    
+    # Use context manager for temp directory (guarantees cleanup)
+    try:
+        with job_temp_directory(job_id) as (temp_dir, disk_stats):
+            _process_job_stages(job_id, job, channel, broadcaster_id, temp_dir)
+    except DiskSpaceError as e:
+        error_msg = f"Disk space error: {e}"
+        print(f"❌ {error_msg}")
+        mark_job_failed(job_id, error_msg)
+    except Exception as e:
+        # Any other error - cleanup still happens via context manager
+        error_msg = f"Unexpected error: {type(e).__name__}: {e}"
+        print(f"❌ {error_msg}")
+        mark_job_failed(job_id, error_msg)
+
+
+def _process_job_stages(
+    job_id: str,
+    job: dict,
+    channel: dict,
+    broadcaster_id: str,
+    temp_dir: Path
+) -> None:
+    """
+    Internal function that runs the actual processing stages.
+    Separated from process_job to work with the cleanup context manager.
+    """
     try:
         # Get valid access token
         access_token = get_valid_access_token(job["channel_id"])
@@ -282,10 +310,5 @@ def process_job(job_id: str) -> None:
         error_msg = f"Unexpected error: {type(e).__name__}: {e}"
         print(f"❌ {error_msg}")
         mark_job_failed(job_id, error_msg)
-        
-    finally:
-        # Cleanup temp directory (optional - keep for debugging)
-        if os.getenv("CLEANUP_TEMP", "false").lower() == "true":
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            print(f"🧹 Cleaned up temp directory: {temp_dir}")
+        raise  # Re-raise to trigger cleanup in context manager
 

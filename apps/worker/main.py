@@ -10,6 +10,11 @@ import redis
 from config import config
 from pipeline import process_job
 from db import increment_attempt_count, mark_job_failed
+from disk_utils import (
+    print_disk_status,
+    cleanup_old_temp_directories,
+    check_disk_space,
+)
 
 # Global flag for graceful shutdown
 running = True
@@ -47,9 +52,22 @@ def main():
 ╔═══════════════════════════════════════════════════════════╗
 ║               Stream2Short Worker                         ║
 ╠═══════════════════════════════════════════════════════════╣
-║  Connecting to Redis...                                   ║
+║  Starting up...                                           ║
 ╚═══════════════════════════════════════════════════════════╝
 """)
+    
+    # Print disk status and check space
+    print_disk_status()
+    
+    has_space, free_gb = check_disk_space()
+    if not has_space:
+        print(f"⚠️ Warning: Low disk space! {free_gb:.2f}GB free, {config.MIN_DISK_SPACE_GB:.1f}GB required")
+        print("   Worker will fail jobs until more space is available.")
+    
+    # Cleanup stale temp directories from crashed jobs
+    stale_cleaned = cleanup_old_temp_directories(max_age_hours=24)
+    if stale_cleaned > 0:
+        print(f"🧹 Cleaned {stale_cleaned} stale temp directories from previous runs")
     
     # Connect to Redis
     try:

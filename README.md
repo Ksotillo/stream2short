@@ -335,6 +335,43 @@ queued → creating_clip → waiting_clip → downloading → transcribing → r
 
 *One of `GOOGLE_SERVICE_ACCOUNT_FILE` or `GOOGLE_SERVICE_ACCOUNT_JSON` is required for uploads.
 
+### Disk Space Management
+
+Prevents disk space exhaustion from accumulated temp files:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MIN_DISK_SPACE_GB` | 2.0 | Minimum free disk space required before processing |
+| `CLEANUP_TEMP` | true | Auto-delete temp files after each job |
+
+**How it works:**
+
+1. **Pre-job disk check:** Before processing starts, the worker verifies there's at least `MIN_DISK_SPACE_GB` free. If not, the job fails immediately with a clear error.
+
+2. **Guaranteed cleanup:** Each job uses its own temp directory. The cleanup happens automatically when the job finishes - even if it crashes or errors out.
+
+3. **Stale directory cleanup:** On startup, the worker removes any temp directories older than 24 hours (leftovers from crashed containers).
+
+**Disk usage per clip (approximate):**
+- Downloaded video: 20-100MB
+- Extracted audio (WAV): 10-50MB
+- Subtitle files: <1MB
+- Two rendered outputs: 40-200MB each
+- **Total per job:** ~100-500MB (cleaned up after upload)
+
+**Troubleshooting low disk space:**
+```bash
+# Check disk usage on the VM
+df -h
+
+# Manually clear temp files
+rm -rf /tmp/stream2short/*
+
+# Check Docker volumes
+docker system df
+docker system prune -a  # Remove unused containers/images
+```
+
 ### Anti-Spam / Cooldown Settings
 
 Prevents chat spam and duplicate processing:

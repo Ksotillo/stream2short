@@ -2,7 +2,31 @@
 -- Prevents duplicate processing of the same Twitch clip
 
 -- ============================================================================
--- PARTIAL UNIQUE INDEX ON twitch_clip_id
+-- STEP 1: Clean up existing duplicates before adding constraint
+-- ============================================================================
+-- For any duplicate twitch_clip_id, keep only the MOST RECENT job
+-- Set older duplicates to NULL so they don't block the constraint
+
+-- First, identify and nullify duplicates (keep the newest one)
+UPDATE clip_jobs
+SET twitch_clip_id = NULL
+WHERE id IN (
+    SELECT id FROM (
+        SELECT 
+            id,
+            twitch_clip_id,
+            ROW_NUMBER() OVER (
+                PARTITION BY twitch_clip_id 
+                ORDER BY created_at DESC
+            ) as rn
+        FROM clip_jobs
+        WHERE twitch_clip_id IS NOT NULL
+    ) ranked
+    WHERE rn > 1  -- All but the most recent
+);
+
+-- ============================================================================
+-- STEP 2: PARTIAL UNIQUE INDEX ON twitch_clip_id
 -- ============================================================================
 -- Only enforce uniqueness when twitch_clip_id is NOT NULL
 -- This allows multiple jobs with NULL clip_id (e.g., jobs that failed before clip creation)
