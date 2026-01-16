@@ -67,7 +67,7 @@ export default async function ClipsPage({ searchParams }: PageProps) {
           </FilterButton>
           <FilterButton 
             href="/clips?status=queued,downloading,transcribing,rendering,uploading" 
-            active={status?.includes('queued')}
+            active={status?.includes('queued') ?? false}
           >
             <RefreshCw className="w-3 h-3" />
             Processing
