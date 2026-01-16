@@ -29,7 +29,7 @@ export async function POST(request: NextRequest) {
     }
     
     // Call the API server-side (no mixed content issues)
-    const res = await fetch(`${API_URL}/process-clip`, {
+    const res = await fetch(`${API_URL}/api/process-clip`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
