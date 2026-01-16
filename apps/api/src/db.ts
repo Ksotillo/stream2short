@@ -213,13 +213,24 @@ export async function getRecentJobByUser(
 /**
  * Check if there's an active (queued or processing) job for this channel.
  * Active statuses are anything not 'ready' or 'failed'.
+ * 
+ * Only considers jobs created within the last 10 minutes as "active".
+ * Older jobs are likely stuck and shouldn't block new requests.
  */
-export async function getActiveJobForChannel(channelId: string): Promise<ClipJob | null> {
+export async function getActiveJobForChannel(
+  channelId: string,
+  maxAgeMinutes: number = 10
+): Promise<ClipJob | null> {
+  // Only consider jobs created in the last N minutes as "active"
+  // Older jobs are likely stuck and shouldn't block new requests
+  const cutoff = new Date(Date.now() - maxAgeMinutes * 60 * 1000).toISOString();
+  
   const { data, error } = await supabase
     .from('clip_jobs')
     .select('*')
     .eq('channel_id', channelId)
     .not('status', 'in', '("ready","failed")')
+    .gte('created_at', cutoff)  // Only recent jobs
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
