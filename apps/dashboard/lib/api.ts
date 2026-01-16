@@ -123,3 +123,22 @@ export async function rerenderJob(
     body: { preset },
   })
 }
+
+export async function processClip(
+  clipUrl: string,
+  requestedBy?: string
+): Promise<{ 
+  success: boolean
+  message: string
+  job_id?: string
+  twitch_clip_url?: string
+  error?: string
+}> {
+  return fetchAPI('/process-clip', {
+    method: 'POST',
+    body: { 
+      clip_url: clipUrl,
+      requested_by: requestedBy || 'dashboard',
+    },
+  })
+}

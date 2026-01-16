@@ -3,6 +3,7 @@ import { getJobs } from '@/lib/api'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CreateClipButton } from '@/components/create-clip-modal'
 import Link from 'next/link'
 import { formatRelativeTime } from '@/lib/utils'
 import { Film, CheckCircle, Clock, AlertCircle, ArrowRight } from 'lucide-react'
@@ -80,12 +81,15 @@ export default async function DashboardPage() {
       <div>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-xl font-semibold">Recent Clips</h2>
-          <Link href="/clips">
-            <Button variant="ghost" className="gap-1">
-              View all
-              <ArrowRight className="w-4 h-4" />
-            </Button>
-          </Link>
+          <div className="flex items-center gap-2">
+            <CreateClipButton />
+            <Link href="/clips">
+              <Button variant="ghost" className="gap-1">
+                View all
+                <ArrowRight className="w-4 h-4" />
+              </Button>
+            </Link>
+          </div>
         </div>
         
         {error ? (

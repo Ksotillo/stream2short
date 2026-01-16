@@ -3,6 +3,7 @@ import { getJobs } from '@/lib/api'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CreateClipButton } from '@/components/create-clip-modal'
 import Link from 'next/link'
 import { formatRelativeTime, formatDate } from '@/lib/utils'
 import { Film, Clock, CheckCircle, XCircle, RefreshCw, Filter } from 'lucide-react'
@@ -52,30 +53,32 @@ export default async function ClipsPage({ searchParams }: PageProps) {
           </p>
         </div>
         
-        {/* Filters */}
-        <div className="flex flex-wrap gap-2">
-          <FilterButton href="/clips" active={!status && !review}>
-            All
-          </FilterButton>
-          <FilterButton href="/clips?status=ready" active={status === 'ready'}>
-            <CheckCircle className="w-3 h-3" />
-            Ready
-          </FilterButton>
-          <FilterButton href="/clips?status=failed" active={status === 'failed'}>
-            <XCircle className="w-3 h-3" />
-            Failed
-          </FilterButton>
-          <FilterButton 
-            href="/clips?status=queued,downloading,transcribing,rendering,uploading" 
-            active={status?.includes('queued') ?? false}
-          >
-            <RefreshCw className="w-3 h-3" />
-            Processing
-          </FilterButton>
-          <FilterButton href="/clips?review=pending" active={review === 'pending'}>
-            Needs Review
-          </FilterButton>
-        </div>
+        <CreateClipButton />
+      </div>
+      
+      {/* Filters */}
+      <div className="flex flex-wrap gap-2">
+        <FilterButton href="/clips" active={!status && !review}>
+          All
+        </FilterButton>
+        <FilterButton href="/clips?status=ready" active={status === 'ready'}>
+          <CheckCircle className="w-3 h-3" />
+          Ready
+        </FilterButton>
+        <FilterButton href="/clips?status=failed" active={status === 'failed'}>
+          <XCircle className="w-3 h-3" />
+          Failed
+        </FilterButton>
+        <FilterButton 
+          href="/clips?status=queued,downloading,transcribing,rendering,uploading" 
+          active={status?.includes('queued') ?? false}
+        >
+          <RefreshCw className="w-3 h-3" />
+          Processing
+        </FilterButton>
+        <FilterButton href="/clips?review=pending" active={review === 'pending'}>
+          Needs Review
+        </FilterButton>
       </div>
       
       {error ? (
