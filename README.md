@@ -461,12 +461,26 @@ WHERE twitch_login = 'streamer_name';
 
 ## Dashboard
 
-The dashboard is a web UI for managing and reviewing clips.
+The dashboard is a web UI for managing and reviewing clips. It's designed to be deployed on **Vercel** (free).
+
+### Deploy to Vercel
+
+1. Go to [vercel.com](https://vercel.com) → **Add New Project**
+2. Import your GitHub repo
+3. Set **Root Directory** to `apps/dashboard`
+4. Add environment variables:
+
+| Variable | Value |
+|----------|-------|
+| `NEXT_PUBLIC_API_URL` | Your API URL (e.g., `https://your-vm:3443`) |
+| `DASHBOARD_API_KEY` | Same secret key as in your API's `.env` |
+
+5. Deploy!
 
 ### Access
 
-- **URL:** `http://your-server:3001`
-- **Auth:** Set `DASHBOARD_API_KEY` in your `.env` file
+- **URL:** Your Vercel URL (e.g., `https://stream2short-dashboard.vercel.app`)
+- **Auth:** Requires `DASHBOARD_API_KEY` for API calls
 
 ### Features
 

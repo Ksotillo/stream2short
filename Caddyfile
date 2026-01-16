@@ -14,8 +14,3 @@
 :80 {
     reverse_proxy api:3000
 }
-
-# Dashboard (port 3001 inside container -> 3001 on host)
-:3001 {
-    reverse_proxy dashboard:3001
-}

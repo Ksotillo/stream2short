@@ -6,14 +6,12 @@ services:
     ports:
       - "3080:80"        # API HTTP
       - "3443:443"       # API HTTPS
-      - "3001:3001"      # Dashboard
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
       - api
-      - dashboard
     restart: unless-stopped
 
   # Redis - Queue broker
@@ -53,23 +51,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    restart: unless-stopped
-  
-  # Next.js Dashboard
-  dashboard:
-    build:
-      context: ./apps/dashboard
-      dockerfile: Dockerfile
-      args:
-        - NEXT_PUBLIC_API_URL=http://api:3000
-    container_name: stream2short-dashboard
-    expose:
-      - "3001"
-    environment:
-      - DASHBOARD_API_KEY=${DASHBOARD_API_KEY}
-      - NEXT_PUBLIC_API_URL=${BASE_URL}
-    depends_on:
-      - api
     restart: unless-stopped
 
   # Python Worker
