@@ -9,8 +9,11 @@ supabase>=2.0.0
 # HTTP client
 httpx>=0.25.0
 
-# Whisper for transcription
+# Whisper for transcription (local fallback)
 faster-whisper>=0.10.0
+
+# Groq API for fast cloud transcription
+groq>=0.4.0
 
 # Google Drive API
 google-api-python-client>=2.111.0

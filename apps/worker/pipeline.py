@@ -17,7 +17,8 @@ from twitch_api import (
     download_clip,
     TwitchAPIError,
 )
-from transcribe import transcribe_video, transcribe_video_with_segments
+from transcribe import transcribe_video
+from groq_transcribe import transcribe_with_segments
 from video import render_vertical_video, render_video_auto, VideoProcessingError
 from storage import upload_file, SharedDriveError
 from diarization import (
@@ -206,7 +207,8 @@ def _process_job_stages(
         channel_settings = channel.get("settings", {}) or {}
         
         # Get transcript segments (using preprocessed audio if available)
-        segments, transcript_text_raw = transcribe_video_with_segments(
+        # Uses Groq API if configured, otherwise falls back to local Whisper
+        segments, transcript_text_raw = transcribe_with_segments(
             video_path=raw_video_path,
             audio_path=preprocessed_audio,  # Use normalized audio
         )

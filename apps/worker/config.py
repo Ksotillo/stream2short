@@ -37,9 +37,16 @@ class Config:
     GOOGLE_DRIVE_FOLDER_ID: str = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
     
     # Worker settings
-    WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
     MAX_ATTEMPTS: int = int(os.getenv("MAX_ATTEMPTS", "2"))
     TEMP_DIR: str = os.getenv("TEMP_DIR", "/tmp/stream2short")
+    
+    # Transcription settings
+    # Groq API (fast cloud transcription) - set GROQ_API_KEY to enable
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "whisper-large-v3-turbo")  # or "whisper-large-v3"
+    
+    # Local Whisper (fallback if Groq not configured)
+    WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
     
     # Disk space management
     MIN_DISK_SPACE_GB: float = float(os.getenv("MIN_DISK_SPACE_GB", "2.0"))  # Minimum free space required
