@@ -117,8 +117,8 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
       const clipData = await createClip(channelRecord.twitch_broadcaster_id, accessToken);
       
       // Build the clip URL (edit_url redirects to clip page)
-      // Format: https://clips.twitch.tv/{channel}/clip/{clip_id}
-      const clipUrl = `https://clips.twitch.tv/${channelRecord.twitch_login}/clip/${clipData.id}`;
+      // Format: https://clips.twitch.tv/{clip_id}
+      const clipUrl = `https://clips.twitch.tv/${clipData.id}`;
       
       // Create job record with clip already created
       const job = await createJob({
