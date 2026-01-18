@@ -485,6 +485,27 @@ export async function getJobByClipId(twitchClipId: string): Promise<ClipJob | nu
 }
 
 /**
+ * Delete a job by ID (for force reprocessing).
+ */
+export async function deleteJob(jobId: string): Promise<void> {
+  // First delete any job events
+  await supabase
+    .from('job_events')
+    .delete()
+    .eq('job_id', jobId);
+  
+  // Then delete the job
+  const { error } = await supabase
+    .from('clip_jobs')
+    .delete()
+    .eq('id', jobId);
+  
+  if (error) {
+    throw new Error(`Failed to delete job: ${error.message}`);
+  }
+}
+
+/**
  * Result of anti-spam checks.
  */
 export interface CooldownCheckResult {

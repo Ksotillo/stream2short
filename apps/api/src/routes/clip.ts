@@ -7,6 +7,7 @@ import {
   updateJob,
   checkCooldowns,
   getJobByClipId,
+  deleteJob,
 } from '../db.js';
 import { enqueueJob } from '../queue.js';
 import { getValidAccessToken, createClip, getClip } from '../twitch.js';
@@ -341,7 +342,14 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
       // Skip duplicate check if force=true (for testing/reprocessing)
       // ====================================================================
       if (force) {
-        fastify.log.info(`Force mode enabled - skipping duplicate check for clip ${clipInfo.id}`);
+        fastify.log.info(`Force mode enabled - checking for existing job to delete for clip ${clipInfo.id}`);
+        
+        // Delete existing job if it exists (to avoid unique constraint violation)
+        const existingJob = await getJobByClipId(clipInfo.id);
+        if (existingJob) {
+          fastify.log.info(`Deleting existing job ${existingJob.id} for forced reprocessing`);
+          await deleteJob(existingJob.id);
+        }
       }
       
       const cooldownResult = await checkCooldowns(
