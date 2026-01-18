@@ -288,6 +288,7 @@ def _process_job_stages(
             output_path=video_no_subs_path,
             subtitle_path=None,  # No subtitles
             enable_webcam_detection=True,
+            temp_dir=str(temp_dir),
         )
         print(f"✅ Rendered (no subs): {video_no_subs_path}")
         
@@ -299,6 +300,7 @@ def _process_job_stages(
             output_path=video_with_subs_path,
             subtitle_path=subtitle_path,
             enable_webcam_detection=True,
+            temp_dir=str(temp_dir),
         )
         print(f"✅ Rendered (with subs): {video_with_subs_path}")
         

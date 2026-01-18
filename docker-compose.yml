@@ -75,6 +75,8 @@ services:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - GROQ_MODEL=${GROQ_MODEL:-whisper-large-v3-turbo}
       - WHISPER_MODEL=${WHISPER_MODEL:-small}
+      # Vision AI - Gemini (webcam detection)
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MAX_ATTEMPTS=${MAX_ATTEMPTS:-2}
       - CLEANUP_TEMP=${CLEANUP_TEMP:-false}
       # Speaker diarization (optional - requires HF token and model access)

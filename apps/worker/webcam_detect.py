@@ -156,21 +156,76 @@ def detect_faces_in_region(
 def detect_webcam_region(
     video_path: str,
     sample_times: list[float] = [3.0, 10.0, 15.0],
+    temp_dir: str = "/tmp",
 ) -> Optional[WebcamRegion]:
     """
     Detect the webcam/facecam region in a video.
     
-    Samples multiple frames and looks for faces in the corner regions.
-    Returns the region where a face is most consistently detected.
+    First tries Gemini Vision AI for accurate webcam rectangle detection.
+    Falls back to OpenCV face detection if Gemini is not configured or fails.
     
     Args:
         video_path: Path to the video file
         sample_times: List of times (in seconds) to sample frames from
+        temp_dir: Directory for temporary frame extraction
         
     Returns:
         WebcamRegion if webcam detected, None otherwise
     """
     print(f"🔍 Detecting webcam region in: {video_path}")
+    
+    # =========================================================================
+    # Strategy 1: Try Gemini Vision AI first (more accurate)
+    # =========================================================================
+    try:
+        from gemini_vision import detect_webcam_with_gemini, extract_frame_for_analysis
+        from config import config
+        
+        if config.GEMINI_API_KEY:
+            print("  🤖 Attempting Gemini Vision detection...")
+            
+            # Get video dimensions
+            width, height = get_video_dimensions(video_path)
+            
+            # Extract a frame for analysis
+            frame_path = f"{temp_dir}/webcam_detect_frame.jpg"
+            if extract_frame_for_analysis(video_path, frame_path, timestamp=5.0):
+                result = detect_webcam_with_gemini(frame_path, width, height)
+                
+                # Clean up frame
+                try:
+                    import os
+                    os.remove(frame_path)
+                except:
+                    pass
+                
+                if result:
+                    print(f"  ✅ Gemini found webcam: {result}")
+                    # Determine position based on coordinates
+                    position = 'top-left'
+                    if result['x'] > width / 2:
+                        position = 'top-right' if result['y'] < height / 2 else 'bottom-right'
+                    elif result['y'] > height / 2:
+                        position = 'bottom-left'
+                    
+                    return WebcamRegion(
+                        x=result['x'],
+                        y=result['y'],
+                        width=result['width'],
+                        height=result['height'],
+                        position=position
+                    )
+            
+            print("  ⚠️ Gemini didn't find webcam, falling back to face detection")
+    except ImportError:
+        print("  ⚠️ Gemini module not available")
+    except Exception as e:
+        print(f"  ⚠️ Gemini detection failed: {e}")
+    
+    # =========================================================================
+    # Strategy 2: Fall back to OpenCV face detection
+    # =========================================================================
+    print("  🔍 Using OpenCV face detection...")
     
     # Load OpenCV's pre-trained face detector
     # Try multiple paths for the cascade file

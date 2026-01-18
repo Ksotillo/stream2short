@@ -48,6 +48,9 @@ class Config:
     # Local Whisper (fallback if Groq not configured)
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
     
+    # Gemini Vision (for webcam detection) - set GEMINI_API_KEY to enable
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    
     # Disk space management
     MIN_DISK_SPACE_GB: float = float(os.getenv("MIN_DISK_SPACE_GB", "2.0"))  # Minimum free space required
     CLEANUP_TEMP: bool = os.getenv("CLEANUP_TEMP", "true").lower() == "true"  # Default to cleanup

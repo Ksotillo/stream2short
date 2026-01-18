@@ -393,6 +393,7 @@ def render_video_auto(
     width: int = 1080,
     height: int = 1920,
     enable_webcam_detection: bool = True,
+    temp_dir: str = "/tmp",
 ) -> str:
     """
     Automatically render the best layout based on webcam detection.
@@ -407,6 +408,7 @@ def render_video_auto(
         width: Output width (default 1080)
         height: Output height (default 1920)
         enable_webcam_detection: Whether to try detecting webcam (default True)
+        temp_dir: Temporary directory for frame extraction
         
     Returns:
         Path to output video
@@ -415,7 +417,7 @@ def render_video_auto(
     
     if enable_webcam_detection:
         try:
-            webcam_region = detect_webcam_region(input_path)
+            webcam_region = detect_webcam_region(input_path, temp_dir=temp_dir)
         except Exception as e:
             print(f"⚠️ Webcam detection failed: {e}")
             webcam_region = None
