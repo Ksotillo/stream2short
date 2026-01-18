@@ -8,29 +8,26 @@ the webcam overlay rectangle, which is more reliable than face detection.
 import os
 import re
 import json
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Dict
 from config import config
 
 # Lazy import to avoid loading if not configured
-_genai = None
-_model = None
+_client = None
 
 
-def get_gemini_model():
-    """Get or create the Gemini model instance."""
-    global _genai, _model
+def get_gemini_client():
+    """Get or create the Gemini client instance."""
+    global _client
     
     if not config.GEMINI_API_KEY:
         return None
     
-    if _model is None:
-        import google.generativeai as genai
-        _genai = genai
-        genai.configure(api_key=config.GEMINI_API_KEY)
-        _model = genai.GenerativeModel('gemini-1.5-flash')
+    if _client is None:
+        from google import genai
+        _client = genai.Client(api_key=config.GEMINI_API_KEY)
         print("✅ Gemini Vision initialized")
     
-    return _model
+    return _client
 
 
 def detect_webcam_with_gemini(frame_path: str, video_width: int, video_height: int) -> Optional[Dict[str, int]]:
@@ -45,14 +42,15 @@ def detect_webcam_with_gemini(frame_path: str, video_width: int, video_height: i
     Returns:
         Dict with x, y, width, height of webcam region, or None if not detected
     """
-    model = get_gemini_model()
-    if model is None:
+    client = get_gemini_client()
+    if client is None:
         print("⚠️ Gemini not configured, skipping vision detection")
         return None
     
     try:
-        # Upload the frame image
-        image_file = _genai.upload_file(frame_path)
+        # Read the image file
+        with open(frame_path, 'rb') as f:
+            image_bytes = f.read()
         
         prompt = f"""Analyze this video game stream screenshot. The image is {video_width}x{video_height} pixels.
 
@@ -72,13 +70,20 @@ If there is NO webcam overlay visible, respond with:
 
 IMPORTANT: Respond with ONLY the JSON, no other text."""
 
-        response = model.generate_content([prompt, image_file])
+        # Upload image and generate content
+        from google.genai import types
         
-        # Clean up uploaded file
-        try:
-            _genai.delete_file(image_file.name)
-        except:
-            pass
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                types.Content(
+                    parts=[
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                        types.Part.from_text(text=prompt),
+                    ]
+                )
+            ]
+        )
         
         # Parse response
         response_text = response.text.strip()
@@ -150,4 +155,3 @@ def extract_frame_for_analysis(video_path: str, output_path: str, timestamp: flo
     except Exception as e:
         print(f"⚠️ Frame extraction failed: {e}")
         return False
-

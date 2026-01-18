@@ -16,7 +16,7 @@ faster-whisper>=0.10.0
 groq>=0.4.0
 
 # Google Gemini for vision AI (webcam detection)
-google-generativeai>=0.4.0
+google-genai>=1.0.0
 
 # Google Drive API
 google-api-python-client>=2.111.0
