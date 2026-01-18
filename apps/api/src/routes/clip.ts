@@ -237,7 +237,8 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
   //   {
   //     "clip_url": "https://clips.twitch.tv/ClipSlug",
   //     // OR
-  //     "clip_id": "ClipSlug"
+  //     "clip_id": "ClipSlug",
+  //     "force": true  // Optional: bypass duplicate check (for testing)
   //   }
   // ============================================================================
   fastify.post('/api/process-clip', async (
@@ -246,11 +247,12 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
         clip_url?: string;
         clip_id?: string;
         requested_by?: string;
+        force?: boolean;
       };
     }>,
     reply: FastifyReply
   ) => {
-    const { clip_url, clip_id, requested_by } = request.body || {};
+    const { clip_url, clip_id, requested_by, force } = request.body || {};
     
     // Validate input
     if (!clip_url && !clip_id) {
@@ -336,7 +338,12 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
       
       // ====================================================================
       // ANTI-SPAM CHECKS (including duplicate clip check)
+      // Skip duplicate check if force=true (for testing/reprocessing)
       // ====================================================================
+      if (force) {
+        fastify.log.info(`Force mode enabled - skipping duplicate check for clip ${clipInfo.id}`);
+      }
+      
       const cooldownResult = await checkCooldowns(
         channelRecord.id,
         requested_by || 'api-process-clip',
@@ -345,7 +352,7 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
           channelCooldownSeconds: 0, // No channel cooldown for process-clip
           userCooldownSeconds: 0,    // No user cooldown for process-clip
           blockOnActiveJob: config.cooldown.blockOnActiveJob,
-          blockDuplicateClips: config.cooldown.blockDuplicateClips,
+          blockDuplicateClips: force ? false : config.cooldown.blockDuplicateClips, // Skip if force=true
         }
       );
       
