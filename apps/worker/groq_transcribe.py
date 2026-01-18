@@ -60,13 +60,14 @@ def transcribe_with_groq(
         raise ValueError(f"Audio file too large for Groq ({file_size_mb:.1f}MB > 25MB limit)")
     
     # Call Groq API with word-level timestamps
+    # Note: Don't set language param - let Whisper auto-detect for multilingual support
     with open(audio_path, "rb") as audio_file:
         transcription = client.audio.transcriptions.create(
             file=audio_file,
             model=config.GROQ_MODEL,
             response_format="verbose_json",
             timestamp_granularities=["word", "segment"],
-            language="en",  # Can be made configurable
+            # language parameter omitted - Whisper auto-detects the language
             temperature=0.0,
         )
     
