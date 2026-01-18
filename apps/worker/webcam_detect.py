@@ -76,12 +76,13 @@ def detect_faces_in_region(
     width: int,
     height: int,
     face_cascade: cv2.CascadeClassifier,
-    padding_ratio: float = 0.5,  # How much padding around face (0.5 = 50% extra on each side)
+    padding_ratio: float = 2.0,  # How much padding around face (2.0 = 200% extra - much more zoomed out)
 ) -> Optional[WebcamRegion]:
     """
     Detect faces in a specific region of the frame.
     
-    Returns WebcamRegion tightly cropped around the face with padding.
+    Returns WebcamRegion with generous padding around face to capture
+    the full webcam frame, not just a close-up of the face.
     """
     frame_height, frame_width = frame.shape[:2]
     
@@ -105,22 +106,28 @@ def detect_faces_in_region(
         largest_face = max(faces, key=lambda f: f[2] * f[3])
         fx, fy, fw, fh = largest_face
         
-        # Calculate tight crop around face with padding
+        # Calculate crop around face with GENEROUS padding
+        # Goal: Capture the full webcam frame, not just the face
         # The face coordinates are relative to the region, convert to frame coordinates
         face_center_x = x_start + fx + fw // 2
         face_center_y = y_start + fy + fh // 2
         
-        # Calculate crop size with padding (make it square-ish for better framing)
+        # Calculate crop size with generous padding
+        # We want to see shoulders/torso, not just face
         face_size = max(fw, fh)
-        crop_size = int(face_size * (1 + padding_ratio * 2))  # Face + padding on both sides
         
-        # Make the crop wider than tall for a nice webcam frame (16:9 aspect)
-        crop_width = int(crop_size * 1.5)
-        crop_height = crop_size
+        # Much larger multiplier to zoom out and show more of the person
+        crop_height = int(face_size * (1 + padding_ratio * 2))  # Face + lots of padding
         
-        # Calculate crop coordinates centered on face
+        # Make the crop wider than tall (16:9 webcam aspect ratio)
+        crop_width = int(crop_height * 16 / 9)
+        
+        # Shift the center down slightly to show more body (face typically in upper third of webcam)
+        adjusted_center_y = face_center_y + int(face_size * 0.3)
+        
+        # Calculate crop coordinates centered on adjusted position
         crop_x = face_center_x - crop_width // 2
-        crop_y = face_center_y - crop_height // 2
+        crop_y = adjusted_center_y - crop_height // 2
         
         # Clamp to frame boundaries
         crop_x = max(0, min(crop_x, frame_width - crop_width))
@@ -128,7 +135,12 @@ def detect_faces_in_region(
         crop_width = min(crop_width, frame_width - crop_x)
         crop_height = min(crop_height, frame_height - crop_y)
         
-        print(f"  ✅ Face detected in {region_name}: face={fw}x{fh}, crop={crop_width}x{crop_height}")
+        # Ensure we have reasonable dimensions
+        if crop_width < 100 or crop_height < 100:
+            print(f"  ⚠️ Crop too small in {region_name}, skipping")
+            return None
+        
+        print(f"  ✅ Face detected in {region_name}: face={fw}x{fh}, crop={crop_width}x{crop_height} (zoomed out)")
         
         return WebcamRegion(
             x=crop_x,
