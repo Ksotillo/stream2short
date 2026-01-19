@@ -74,7 +74,7 @@ IMPORTANT: Respond with ONLY the JSON, no other text."""
         from google.genai import types
         
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-1.5-flash-8b",  # Free tier model
             contents=[
                 types.Content(
                     parts=[
