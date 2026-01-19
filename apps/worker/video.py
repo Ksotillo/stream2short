@@ -221,21 +221,26 @@ def render_split_layout_video(
     subtitle_path: str | None = None,
     width: int = 1080,
     height: int = 1920,
-    webcam_height_ratio: float = 0.25,  # Webcam takes 25% of height (less zoom)
+    max_upscale: float = 2.0,  # Maximum upscale to avoid pixelation
+    min_webcam_ratio: float = 0.15,  # Minimum 15% for visibility
+    max_webcam_ratio: float = 0.35,  # Maximum 35% to leave room for game
 ) -> str:
     """
     Render a split-layout vertical video with webcam on top and main content below.
     
     Layout:
     ┌──────────────────┐
-    │    WEBCAM        │  30% height
+    │    WEBCAM        │  adaptive height
     │   (face crop)    │
     ├──────────────────┤
     │                  │
-    │  MAIN CONTENT    │  70% height
+    │  MAIN CONTENT    │  remaining height
     │   (gameplay)     │
     │                  │
     └──────────────────┘
+    
+    The webcam height is calculated adaptively based on the source webcam size
+    to avoid excessive upscaling (pixelation) or downscaling (wasted space).
     
     Args:
         input_path: Path to input video
@@ -244,7 +249,9 @@ def render_split_layout_video(
         subtitle_path: Optional path to subtitle file
         width: Output width (default 1080)
         height: Output height (default 1920)
-        webcam_height_ratio: Ratio of height for webcam (default 0.30)
+        max_upscale: Maximum upscale factor to avoid pixelation (default 2.0)
+        min_webcam_ratio: Minimum webcam section ratio (default 0.15 = 15%)
+        max_webcam_ratio: Maximum webcam section ratio (default 0.35 = 35%)
         
     Returns:
         Path to output video
@@ -255,11 +262,26 @@ def render_split_layout_video(
     print(f"🎬 Rendering split-layout video: {input_path} -> {output_path}")
     print(f"   Webcam region: {webcam_region}")
     
-    # Calculate layout dimensions
-    webcam_h = int(height * webcam_height_ratio)
+    # Calculate ADAPTIVE webcam height based on source size
+    # Goal: avoid pixelation by limiting upscale, but ensure visibility
+    
+    # Calculate what the webcam height would be at max_upscale
+    ideal_webcam_h = int(webcam_region.height * max_upscale)
+    
+    # Convert to ratio of output height
+    ideal_ratio = ideal_webcam_h / height
+    
+    # Clamp to min/max bounds
+    webcam_ratio = max(min_webcam_ratio, min(max_webcam_ratio, ideal_ratio))
+    webcam_h = int(height * webcam_ratio)
     content_h = height - webcam_h
     
-    print(f"   Layout: webcam={webcam_h}px, content={content_h}px")
+    # Calculate actual upscale for logging
+    actual_upscale = webcam_h / webcam_region.height
+    
+    print(f"   Source webcam: {webcam_region.width}x{webcam_region.height}")
+    print(f"   Adaptive layout: webcam={webcam_h}px ({webcam_ratio*100:.0f}%), content={content_h}px")
+    print(f"   Upscale factor: {actual_upscale:.1f}x (max allowed: {max_upscale}x)")
     
     # Get source video dimensions
     src_width, src_height = get_video_dimensions(input_path)
@@ -378,7 +400,6 @@ def render_split_layout_video(
                 subtitle_path=None,
                 width=width,
                 height=height,
-                webcam_height_ratio=webcam_height_ratio,
             )
         
         error_msg = f"FFmpeg failed: {e.stderr}"
