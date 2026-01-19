@@ -191,39 +191,51 @@ def detect_webcam_region(
             # Get video dimensions
             width, height = get_video_dimensions(video_path)
             
-            # Extract a frame for analysis
-            frame_path = f"{temp_dir}/webcam_detect_frame.jpg"
-            if extract_frame_for_analysis(video_path, frame_path, timestamp=5.0):
-                result = detect_webcam_with_gemini(frame_path, width, height)
+            # Try multiple frames for better detection
+            timestamps_to_try = [3.0, 8.0, 15.0]
+            
+            for ts in timestamps_to_try:
+                frame_path = f"{temp_dir}/webcam_detect_frame_{int(ts)}.jpg"
+                print(f"  📸 Analyzing frame at {ts}s...")
                 
-                # Clean up frame
-                try:
-                    import os
-                    os.remove(frame_path)
-                except:
-                    pass
-                
-                if result:
-                    if result.get('no_webcam_confirmed'):
-                        # Gemini explicitly said there's no webcam - trust it, skip OpenCV
-                        print("  ℹ️ Gemini confirmed: NO webcam in this video")
-                        gemini_explicitly_no_webcam = True
-                    else:
-                        print(f"  ✅ Gemini found webcam: {result}")
-                        # Determine position based on coordinates
-                        position = 'top-left'
-                        if result['x'] > width / 2:
-                            position = 'top-right' if result['y'] < height / 2 else 'bottom-right'
-                        elif result['y'] > height / 2:
-                            position = 'bottom-left'
-                        
-                        return WebcamRegion(
-                            x=result['x'],
-                            y=result['y'],
-                            width=result['width'],
-                            height=result['height'],
-                            position=position
-                        )
+                if extract_frame_for_analysis(video_path, frame_path, timestamp=ts):
+                    result = detect_webcam_with_gemini(frame_path, width, height)
+                    
+                    # Clean up frame
+                    try:
+                        import os
+                        os.remove(frame_path)
+                    except:
+                        pass
+                    
+                    if result:
+                        if result.get('no_webcam_confirmed'):
+                            # Gemini explicitly said there's no webcam - trust it, skip OpenCV
+                            print("  ℹ️ Gemini confirmed: NO webcam in this video")
+                            gemini_explicitly_no_webcam = True
+                            break  # Don't try more frames
+                        else:
+                            print(f"  ✅ Gemini found webcam: {result}")
+                            # Use corner from Gemini if available
+                            position = result.get('corner', 'top-left')
+                            if position == 'unknown':
+                                # Fallback: determine from coordinates
+                                if result['x'] > width / 2:
+                                    position = 'top-right' if result['y'] < height / 2 else 'bottom-right'
+                                elif result['y'] > height / 2:
+                                    position = 'bottom-left'
+                                else:
+                                    position = 'top-left'
+                            
+                            return WebcamRegion(
+                                x=result['x'],
+                                y=result['y'],
+                                width=result['width'],
+                                height=result['height'],
+                                position=position
+                            )
+                else:
+                    print(f"  ⚠️ Could not extract frame at {ts}s")
             
             if not gemini_explicitly_no_webcam:
                 print("  ⚠️ Gemini didn't find webcam, falling back to face detection")
