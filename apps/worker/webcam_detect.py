@@ -5,14 +5,39 @@ the region coordinates for video compositing.
 
 Strategy:
 1. Use Gemini Vision AI to detect IF a webcam exists and WHICH corner
-2. Refine the bounding box using OpenCV edge/contour detection
-3. Fall back to OpenCV face detection if Gemini unavailable
+2. Refine the bounding box using multi-frame OpenCV edge/contour detection
+3. Use IoU tracking to find stable webcam rectangle across frames
+4. Fall back to OpenCV face detection if Gemini unavailable
 """
 
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
+from dataclasses import dataclass
+
+
+@dataclass
+class BBoxCandidate:
+    """A webcam bounding box candidate with scoring metadata."""
+    x: int
+    y: int
+    width: int
+    height: int
+    area: int
+    ar: float  # aspect ratio
+    score: float
+    corner: str
+    frame_idx: int = 0  # which frame this came from
+    
+    def to_dict(self) -> Dict[str, int]:
+        return {
+            'x': self.x,
+            'y': self.y,
+            'width': self.width,
+            'height': self.height,
+            'corner': self.corner
+        }
 
 
 class WebcamRegion:
@@ -33,31 +58,49 @@ class WebcamRegion:
         return f"crop={self.width}:{self.height}:{self.x}:{self.y}"
 
 
-def refine_webcam_bbox(
+def compute_iou(box1: BBoxCandidate, box2: BBoxCandidate) -> float:
+    """Compute Intersection over Union between two bounding boxes."""
+    x1 = max(box1.x, box2.x)
+    y1 = max(box1.y, box2.y)
+    x2 = min(box1.x + box1.width, box2.x + box2.width)
+    y2 = min(box1.y + box1.height, box2.y + box2.height)
+    
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    
+    intersection = (x2 - x1) * (y2 - y1)
+    union = box1.area + box2.area - intersection
+    
+    return intersection / union if union > 0 else 0.0
+
+
+def refine_webcam_bbox_candidates(
     frame_bgr: np.ndarray,
     corner: str,
     video_width: int,
     video_height: int,
-    roi_ratio: float = 0.45,
-) -> Optional[Dict[str, int]]:
+    roi_ratio: float = 0.55,  # Larger ROI (55% instead of 45%)
+    top_n: int = 5,
+    frame_idx: int = 0,
+) -> List[BBoxCandidate]:
     """
-    Refine webcam bounding box using edge detection and contour analysis.
+    Find top N webcam bounding box candidates using edge detection.
     
     Gemini often returns face-like square bboxes instead of the actual webcam overlay.
-    This function analyzes the corner region to find the true rectangular overlay.
+    This function analyzes the corner region to find rectangular overlay candidates.
     
     Args:
         frame_bgr: Full video frame (BGR)
         corner: Which corner to search ('top-left', 'top-right', 'bottom-left', 'bottom-right')
         video_width: Full frame width
         video_height: Full frame height
-        roi_ratio: What fraction of the frame to use as ROI (0.45 = 45%)
+        roi_ratio: What fraction of the frame to use as ROI
+        top_n: Number of top candidates to return
+        frame_idx: Index of this frame (for tracking)
     
     Returns:
-        Dict with x, y, width, height in full-frame coordinates, or None
+        List of BBoxCandidate objects (up to top_n), sorted by score descending
     """
-    print(f"  🔬 Refining bbox in {corner} using edge detection...")
-    
     # Calculate ROI bounds
     roi_w = int(video_width * roi_ratio)
     roi_h = int(video_height * roi_ratio)
@@ -71,8 +114,7 @@ def refine_webcam_bbox(
     elif corner == 'bottom-right':
         roi_x, roi_y = video_width - roi_w, video_height - roi_h
     else:
-        print(f"  ⚠️ Unknown corner: {corner}")
-        return None
+        return []
     
     # Extract ROI
     roi = frame_bgr[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w].copy()
@@ -91,22 +133,26 @@ def refine_webcam_bbox(
     kernel = np.ones((7, 7), np.uint8)
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
     
-    # Find contours
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Find contours (try both EXTERNAL and TREE to catch nested rectangles)
+    contours_ext, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_tree, _ = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     
-    if not contours:
-        print(f"  ⚠️ No contours found in {corner} ROI")
-        return None
+    # Combine and deduplicate
+    all_contours = list(contours_ext) + list(contours_tree)
+    
+    if not all_contours:
+        return []
+    
+    # Expected aspect ratios for webcams
+    AR_16_9 = 16 / 9  # 1.778
+    AR_4_3 = 4 / 3    # 1.333
     
     # Filter and score candidates
     candidates = []
-    min_area = roi_area * 0.05  # At least 5% of ROI
+    min_area = roi_area * 0.03  # At least 3% of ROI (lowered for better detection)
+    seen_boxes = set()  # Deduplicate similar boxes
     
-    for contour in contours:
-        # Approximate to polygon
-        epsilon = 0.02 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-        
+    for contour in all_contours:
         # Get bounding rectangle
         bx, by, bw, bh = cv2.boundingRect(contour)
         area = bw * bh
@@ -120,7 +166,27 @@ def refine_webcam_bbox(
         if ar < 1.1 or ar > 2.6:
             continue
         
-        # Calculate corner distance (prefer boxes closer to the actual corner)
+        # Deduplicate (boxes within 10px are considered same)
+        box_key = (bx // 10, by // 10, bw // 10, bh // 10)
+        if box_key in seen_boxes:
+            continue
+        seen_boxes.add(box_key)
+        
+        # ============================================================
+        # SCORING COMPONENTS
+        # ============================================================
+        
+        # 1. Area score (larger is better, but normalized)
+        area_score = min(1.0, (area / roi_area) * 3)  # Cap at 1.0
+        
+        # 2. Aspect ratio score (closer to 16:9 or 4:3 is better)
+        ar_diff_16_9 = abs(ar - AR_16_9)
+        ar_diff_4_3 = abs(ar - AR_4_3)
+        best_ar_diff = min(ar_diff_16_9, ar_diff_4_3)
+        ar_score = max(0, 1 - (best_ar_diff / 0.5))  # Penalize if AR differs by >0.5
+        
+        # 3. Corner proximity score (closer to corner is better)
+        roi_diag = np.sqrt(roi_w**2 + roi_h**2)
         if corner == 'top-left':
             corner_dist = bx + by
         elif corner == 'top-right':
@@ -131,51 +197,261 @@ def refine_webcam_bbox(
             corner_dist = (roi_w - (bx + bw)) + (roi_h - (by + bh))
         else:
             corner_dist = bx + by
+        proximity_score = 1 - (corner_dist / roi_diag)
         
-        # Score: prefer larger area and closer to corner
-        # Normalize distance by ROI diagonal
-        roi_diag = np.sqrt(roi_w**2 + roi_h**2)
-        dist_score = 1 - (corner_dist / roi_diag)  # 0-1, higher = closer to corner
-        area_score = area / roi_area  # 0-1, higher = larger
+        # 4. "Outermost" bias - prefer boxes that extend TO the corner edge
+        # This helps select the overlay boundary, not inner content
+        if corner == 'top-left':
+            # Prefer smaller x+y (touching top-left)
+            outermost_score = 1 - ((bx + by) / (roi_w + roi_h))
+        elif corner == 'top-right':
+            # Prefer larger (x+w) and smaller y
+            right_edge_dist = roi_w - (bx + bw)
+            outermost_score = 1 - ((right_edge_dist + by) / (roi_w + roi_h))
+        elif corner == 'bottom-left':
+            # Prefer smaller x and larger (y+h)
+            bottom_edge_dist = roi_h - (by + bh)
+            outermost_score = 1 - ((bx + bottom_edge_dist) / (roi_w + roi_h))
+        elif corner == 'bottom-right':
+            # Prefer larger (x+w) and larger (y+h)
+            right_edge_dist = roi_w - (bx + bw)
+            bottom_edge_dist = roi_h - (by + bh)
+            outermost_score = 1 - ((right_edge_dist + bottom_edge_dist) / (roi_w + roi_h))
+        else:
+            outermost_score = 0.5
         
-        # Combined score (weight area more)
-        score = area_score * 0.7 + dist_score * 0.3
+        # Combined score with weights
+        # Outermost bias is important to avoid inner rectangles
+        score = (
+            area_score * 0.30 +
+            ar_score * 0.25 +
+            proximity_score * 0.20 +
+            outermost_score * 0.25
+        )
         
-        candidates.append({
-            'x': bx,
-            'y': by,
-            'width': bw,
-            'height': bh,
-            'area': area,
-            'ar': ar,
-            'corner_dist': corner_dist,
-            'score': score,
-            'vertices': len(approx)
-        })
+        # Convert to full-frame coordinates
+        full_x = roi_x + bx
+        full_y = roi_y + by
         
-        print(f"     Candidate: {bw}x{bh} at ({bx},{by}), AR={ar:.2f}, dist={corner_dist}, score={score:.3f}")
+        candidates.append(BBoxCandidate(
+            x=full_x,
+            y=full_y,
+            width=bw,
+            height=bh,
+            area=area,
+            ar=ar,
+            score=score,
+            corner=corner,
+            frame_idx=frame_idx
+        ))
     
-    if not candidates:
-        print(f"  ⚠️ No valid rectangle candidates in {corner} ROI")
+    # Sort by score (highest first) and return top N
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return candidates[:top_n]
+
+
+def choose_stable_webcam_bbox(
+    candidates_per_frame: List[List[BBoxCandidate]],
+    corner: str,
+    iou_threshold: float = 0.35,
+    ar_diff_threshold: float = 0.35,
+) -> Optional[Dict[str, int]]:
+    """
+    Choose the most stable webcam bbox across multiple frames using IoU tracking.
+    
+    Args:
+        candidates_per_frame: List of candidate lists (one per frame)
+        corner: Which corner we're looking in
+        iou_threshold: Minimum IoU to consider boxes as matching
+        ar_diff_threshold: Maximum aspect ratio difference for matching
+    
+    Returns:
+        Dict with x, y, width, height of the chosen bbox, or None
+    """
+    # Flatten all candidates if we only have one frame
+    all_candidates = [c for frame_cands in candidates_per_frame for c in frame_cands]
+    
+    if not all_candidates:
+        print("  ⚠️ No candidates found in any frame")
         return None
     
-    # Sort by score (highest first)
-    candidates.sort(key=lambda c: c['score'], reverse=True)
-    best = candidates[0]
+    if len(candidates_per_frame) == 1 or len(all_candidates) == 1:
+        # Single frame or single candidate - just return best
+        best = max(all_candidates, key=lambda c: c.score)
+        print(f"  📍 Single-frame best: {best.width}x{best.height} at ({best.x},{best.y}), AR={best.ar:.2f}, score={best.score:.3f}")
+        return best.to_dict()
     
-    # Convert to full-frame coordinates
-    full_x = roi_x + best['x']
-    full_y = roi_y + best['y']
+    # Build tracks across frames using IoU matching
+    tracks: List[List[BBoxCandidate]] = []
     
-    print(f"  ✅ Refined bbox: {best['width']}x{best['height']} at ({full_x},{full_y}), AR={best['ar']:.2f}")
+    # Start tracks from first frame's candidates
+    for cand in candidates_per_frame[0]:
+        tracks.append([cand])
     
-    return {
-        'x': full_x,
-        'y': full_y,
-        'width': best['width'],
-        'height': best['height'],
-        'corner': corner
-    }
+    # Match candidates from subsequent frames
+    for frame_idx in range(1, len(candidates_per_frame)):
+        frame_cands = candidates_per_frame[frame_idx]
+        
+        # For each track, find best matching candidate in this frame
+        for track in tracks:
+            last_box = track[-1]
+            best_match = None
+            best_iou = 0
+            
+            for cand in frame_cands:
+                # Check IoU
+                iou = compute_iou(last_box, cand)
+                if iou < iou_threshold:
+                    continue
+                
+                # Check aspect ratio similarity
+                ar_diff = abs(last_box.ar - cand.ar)
+                if ar_diff > ar_diff_threshold:
+                    continue
+                
+                if iou > best_iou:
+                    best_iou = iou
+                    best_match = cand
+            
+            if best_match:
+                track.append(best_match)
+    
+    # Score each track
+    track_scores = []
+    for track in tracks:
+        if len(track) < 2:
+            # Penalize tracks that don't span multiple frames
+            track_score = track[0].score * 0.5
+        else:
+            # Track score = mean score + consistency bonus - variance penalty
+            mean_score = np.mean([c.score for c in track])
+            mean_area = np.mean([c.area for c in track])
+            
+            # Consistency: low variance in area and AR is good
+            area_std = np.std([c.area for c in track]) if len(track) > 1 else 0
+            ar_std = np.std([c.ar for c in track]) if len(track) > 1 else 0
+            
+            # Normalize variance penalties
+            area_penalty = (area_std / mean_area) * 0.3 if mean_area > 0 else 0
+            ar_penalty = ar_std * 0.5
+            
+            # Bonus for longer tracks (more consistent detection)
+            length_bonus = len(track) / len(candidates_per_frame) * 0.2
+            
+            track_score = mean_score + length_bonus - area_penalty - ar_penalty
+        
+        track_scores.append((track, track_score))
+    
+    # Sort tracks by score
+    track_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    if not track_scores:
+        print("  ⚠️ No valid tracks found")
+        return None
+    
+    best_track, best_track_score = track_scores[0]
+    
+    # Log track info
+    print(f"  📊 Best track: {len(best_track)} frames, score={best_track_score:.3f}")
+    for i, cand in enumerate(best_track):
+        print(f"     Frame {cand.frame_idx}: {cand.width}x{cand.height} at ({cand.x},{cand.y}), AR={cand.ar:.2f}")
+    
+    # Return bbox from middle frame, or average if we want more stability
+    if len(best_track) >= 2:
+        # Average the boxes for more stability
+        avg_x = int(np.mean([c.x for c in best_track]))
+        avg_y = int(np.mean([c.y for c in best_track]))
+        avg_w = int(np.mean([c.width for c in best_track]))
+        avg_h = int(np.mean([c.height for c in best_track]))
+        
+        print(f"  ✅ Stable bbox (averaged): {avg_w}x{avg_h} at ({avg_x},{avg_y}), AR={avg_w/avg_h:.2f}")
+        
+        return {
+            'x': avg_x,
+            'y': avg_y,
+            'width': avg_w,
+            'height': avg_h,
+            'corner': corner
+        }
+    else:
+        # Single candidate - use as is
+        cand = best_track[0]
+        print(f"  ✅ Best single candidate: {cand.width}x{cand.height} at ({cand.x},{cand.y}), AR={cand.ar:.2f}")
+        return cand.to_dict()
+
+
+def run_multiframe_refinement(
+    video_path: str,
+    corner: str,
+    video_width: int,
+    video_height: int,
+    timestamps: List[float] = [3.0, 10.0, 15.0],
+    top_n_per_frame: int = 5,
+) -> Optional[Dict[str, int]]:
+    """
+    Run webcam bbox refinement across multiple frames and choose stable result.
+    
+    Args:
+        video_path: Path to video file
+        corner: Which corner to search
+        video_width: Video width
+        video_height: Video height
+        timestamps: List of timestamps to sample
+        top_n_per_frame: Number of candidates to keep per frame
+    
+    Returns:
+        Dict with x, y, width, height of the stable bbox, or None
+    """
+    print(f"  🔬 Running multi-frame refinement in {corner}...")
+    
+    candidates_per_frame: List[List[BBoxCandidate]] = []
+    
+    for i, ts in enumerate(timestamps):
+        frame = extract_frame(video_path, ts)
+        if frame is None:
+            print(f"     Frame {i} ({ts}s): extraction failed")
+            continue
+        
+        cands = refine_webcam_bbox_candidates(
+            frame, corner, video_width, video_height,
+            top_n=top_n_per_frame, frame_idx=i
+        )
+        
+        if cands:
+            print(f"     Frame {i} ({ts}s): {len(cands)} candidates")
+            for c in cands[:3]:  # Log top 3
+                print(f"       - {c.width}x{c.height} at ({c.x},{c.y}), AR={c.ar:.2f}, score={c.score:.3f}")
+            candidates_per_frame.append(cands)
+        else:
+            print(f"     Frame {i} ({ts}s): no candidates")
+    
+    if not candidates_per_frame:
+        print("  ⚠️ No candidates found in any frame")
+        return None
+    
+    return choose_stable_webcam_bbox(candidates_per_frame, corner)
+
+
+# Keep the old function name for backward compatibility
+def refine_webcam_bbox(
+    frame_bgr: np.ndarray,
+    corner: str,
+    video_width: int,
+    video_height: int,
+    roi_ratio: float = 0.55,
+) -> Optional[Dict[str, int]]:
+    """
+    Refine webcam bounding box using edge detection (single frame).
+    
+    This is a compatibility wrapper - for better results use run_multiframe_refinement().
+    """
+    candidates = refine_webcam_bbox_candidates(
+        frame_bgr, corner, video_width, video_height, roi_ratio, top_n=1
+    )
+    
+    if candidates:
+        return candidates[0].to_dict()
+    return None
 
 
 def is_bbox_suspicious(bbox: Dict[str, int], video_width: int, video_height: int) -> Tuple[bool, str]:
@@ -500,18 +776,36 @@ def detect_webcam_region(
                             
                             print(f"  📐 Gemini bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y}), AR={gemini_ar:.2f}")
                             
-                            if is_suspicious:
-                                print(f"  ⚠️ Gemini bbox suspicious: {suspicious_reason}")
-                                print(f"  🔬 Running OpenCV refinement in {position} corner...")
+                            # ============================================================
+                            # REFINEMENT: Always run multi-frame refinement for precision
+                            # ============================================================
+                            # Even if Gemini bbox looks valid, refinement can improve it
+                            # Only skip refinement if bbox is already very confident (large + good AR)
+                            
+                            should_refine = is_suspicious
+                            
+                            # Also refine if bbox is "okay but could be better"
+                            # e.g., AR slightly off from 16:9 or 4:3
+                            if not is_suspicious:
+                                ar_diff_16_9 = abs(gemini_ar - (16/9))
+                                ar_diff_4_3 = abs(gemini_ar - (4/3))
+                                best_ar_diff = min(ar_diff_16_9, ar_diff_4_3)
+                                if best_ar_diff > 0.15:  # AR is more than 0.15 off from ideal
+                                    should_refine = True
+                                    print(f"  📐 Gemini AR={gemini_ar:.2f} is slightly off, refining anyway")
+                            
+                            if should_refine:
+                                if is_suspicious:
+                                    print(f"  ⚠️ Gemini bbox suspicious: {suspicious_reason}")
                                 
-                                # Load the frame for refinement
-                                frame_for_refine = cv2.imread(frame_path)
-                                refined_bbox = None
+                                # Run MULTI-FRAME refinement for better stability
+                                print(f"  🔬 Running multi-frame refinement in {position} corner...")
                                 
-                                if frame_for_refine is not None:
-                                    refined_bbox = refine_webcam_bbox(
-                                        frame_for_refine, position, width, height
-                                    )
+                                refined_bbox = run_multiframe_refinement(
+                                    video_path, position, width, height,
+                                    timestamps=[3.0, 10.0, 15.0],
+                                    top_n_per_frame=5
+                                )
                                 
                                 if refined_bbox:
                                     # Use refined bbox
@@ -531,7 +825,7 @@ def detect_webcam_region(
                                     cam_w = fallback['width']
                                     cam_h = fallback['height']
                             else:
-                                print(f"  ✅ Gemini bbox looks valid (not suspicious)")
+                                print(f"  ✅ Gemini bbox looks valid (not suspicious, good AR)")
                             
                             # ============================================================
                             # APPLY PADDING (after refinement/fallback)
