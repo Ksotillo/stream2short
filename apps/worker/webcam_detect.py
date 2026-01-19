@@ -285,45 +285,37 @@ def check_guardrails(
     corner: str,
     video_width: int,
     video_height: int,
-    center_band_ratio: float = 0.45,
+    center_band_ratio: float = 0.60,  # Stricter: 60% limit
 ) -> Tuple[bool, str]:
     """
     Check if a bbox violates geometric guardrails (extends too far into center).
     
     Webcam overlays should stay in their corner and not extend into gameplay area.
     
+    For 1920 width:
+    - top-right/bottom-right: x must be >= 1152 (60%)
+    - top-left/bottom-left: x+w must be <= 768 (40%)
+    
     Args:
         bbox: Dict with x, y, width, height
         corner: Which corner the webcam should be in
         video_width: Video width
         video_height: Video height
-        center_band_ratio: How far from edge webcam can extend (0.45 = 45% of frame)
+        center_band_ratio: Minimum x for right-side webcams (0.60 = 60%)
     
     Returns:
         Tuple of (passes_guardrail, reason)
     """
     x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
     
-    # Calculate bounds
-    center_x_limit = int(video_width * center_band_ratio)
-    center_y_limit = int(video_height * center_band_ratio)
+    if corner in ['top-right', 'bottom-right']:
+        # Right-side webcams: left edge must be >= 60% of width
+        min_x = int(video_width * center_band_ratio)
+        if x < min_x:
+            return False, f"extends too far left (x={x} < {min_x})"
     
-    if corner == 'top-right':
-        # Webcam must stay in right portion: x >= center_x_limit
-        if x < center_x_limit:
-            return False, f"extends too far left (x={x} < {center_x_limit})"
-    
-    elif corner == 'top-left':
-        # Webcam must stay in left portion: x + w <= (1 - center_band_ratio) * width
-        max_right = int(video_width * (1 - center_band_ratio))
-        if x + w > max_right:
-            return False, f"extends too far right (x+w={x+w} > {max_right})"
-    
-    elif corner == 'bottom-right':
-        if x < center_x_limit:
-            return False, f"extends too far left (x={x} < {center_x_limit})"
-    
-    elif corner == 'bottom-left':
+    elif corner in ['top-left', 'bottom-left']:
+        # Left-side webcams: right edge must be <= 40% of width
         max_right = int(video_width * (1 - center_band_ratio))
         if x + w > max_right:
             return False, f"extends too far right (x+w={x+w} > {max_right})"
@@ -1432,27 +1424,27 @@ def detect_webcam_region(
                             )
                             
                             if not passes_guardrail:
-                                print(f"  ⚠️ Final bbox fails guardrails: {guardrail_reason}")
-                                print(f"  🔧 Clamping to corner band...")
+                                print(f"  ⚠️ Pre-padding bbox fails guardrails: {guardrail_reason}")
+                                print(f"  🔧 Clamping to corner band (60%)...")
                                 
-                                # Clamp to corner band (45% from edge)
-                                center_limit = int(width * 0.45)
-                                
+                                # Clamp to corner band (60% for right, 40% for left)
                                 if position in ['top-right', 'bottom-right']:
-                                    # Right side: ensure x >= center_limit
-                                    if cam_x < center_limit:
+                                    min_x = int(width * 0.60)
+                                    if cam_x < min_x:
+                                        # Keep right edge fixed, reduce width from left
                                         old_x = cam_x
-                                        cam_w = cam_x + cam_w - center_limit
-                                        cam_x = center_limit
+                                        old_right = cam_x + cam_w
+                                        cam_w = old_right - min_x
+                                        cam_x = min_x
                                         print(f"     Clamped: x {old_x} -> {cam_x}, w -> {cam_w}")
                                 else:
-                                    # Left side: ensure x + w <= width - center_limit
-                                    max_right = width - center_limit
+                                    # Left side: ensure x + w <= 40%
+                                    max_right = int(width * 0.40)
                                     if cam_x + cam_w > max_right:
                                         cam_w = max_right - cam_x
                                         print(f"     Clamped: w -> {cam_w}")
                                 
-                                if refinement_method not in ["face-forced"]:
+                                if refinement_method and "clamped" not in refinement_method:
                                     refinement_method = f"{refinement_method}-clamped"
                             
                             # Clamp to video bounds
@@ -1461,15 +1453,20 @@ def detect_webcam_region(
                             cam_w = min(cam_w, width - cam_x)
                             cam_h = min(cam_h, height - cam_y)
                             
-                            # Log final result
+                            # ============================================================
+                            # DETAILED DEBUG LOGGING
+                            # ============================================================
+                            print(f"\n  ═══════════════════════════════════════")
                             print(f"  📋 Refinement method: {refinement_method}")
+                            print(f"  📐 Gemini bbox: {result['width']}x{result['height']} at ({result['x']},{result['y']})")
+                            print(f"  📐 Refined bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
                             if detected_face:
-                                print(f"  👤 Face detected: ({detected_face.x},{detected_face.y}) {detected_face.width}x{detected_face.height}")
+                                print(f"  👤 Face: {detected_face.width}x{detected_face.height} at ({detected_face.x},{detected_face.y})")
                             
                             # ============================================================
-                            # APPLY PADDING (after refinement/fallback)
+                            # APPLY PADDING (relative to refined bbox ONLY)
                             # ============================================================
-                            # Add 15% padding on each side
+                            # Add 15% padding on each side, computed from REFINED bbox
                             padding_x = int(cam_w * 0.15)
                             padding_y = int(cam_h * 0.15)
                             
@@ -1479,34 +1476,75 @@ def detect_webcam_region(
                             new_w = cam_w + (padding_x * 2)
                             new_h = cam_h + (padding_y * 2)
                             
-                            # Clamp to video bounds based on corner position
+                            print(f"  📐 After padding (+15%): {new_w}x{new_h} at ({new_x},{new_y})")
+                            
+                            # ============================================================
+                            # CLAMP TO VIDEO BOUNDS (DO NOT shift position for refined bbox)
+                            # For refined methods: only clamp, don't reposition!
+                            # ============================================================
+                            is_refined = refinement_method in ["face-anchor", "contour", "face-forced"]
+                            
                             if 'right' in position:
-                                # Right-side: ensure we don't go past right edge
+                                # Right-side: if bbox extends past right edge, REDUCE WIDTH (not shift x)
                                 if new_x + new_w > width:
-                                    new_x = width - new_w
+                                    overflow = (new_x + new_w) - width
+                                    new_w = new_w - overflow
+                                    print(f"     Right overflow: reduced w by {overflow} -> {new_w}")
+                                
+                                # If x is negative, only reduce width (don't shift right)
                                 if new_x < 0:
-                                    new_w = new_w + new_x  # Reduce width
-                                    new_x = 0
+                                    if is_refined:
+                                        # For refined: reduce width from left side
+                                        new_w = new_w + new_x
+                                        new_x = 0
+                                        print(f"     Left overflow (refined): x=0, w={new_w}")
+                                    else:
+                                        # For fallback: allow shifting
+                                        new_w = new_w + new_x
+                                        new_x = 0
                             else:
-                                # Left-side: ensure we don't go past left edge
+                                # Left-side: if x is negative, just clamp to 0
                                 if new_x < 0:
                                     new_x = 0
+                                # If extends past right, reduce width
                                 if new_x + new_w > width:
                                     new_w = width - new_x
                             
-                            if 'bottom' in position:
-                                if new_y + new_h > height:
-                                    new_y = height - new_h
-                                if new_y < 0:
-                                    new_h = new_h + new_y
-                                    new_y = 0
-                            else:
-                                if new_y < 0:
-                                    new_y = 0
-                                if new_y + new_h > height:
-                                    new_h = height - new_y
+                            # Vertical clamping
+                            if new_y < 0:
+                                new_h = new_h + new_y
+                                new_y = 0
+                            if new_y + new_h > height:
+                                new_h = height - new_y
                             
-                            print(f"  📐 Final bbox: {new_w}x{new_h} at ({new_x},{new_y}) (with padding)")
+                            print(f"  📐 After frame clamp: {new_w}x{new_h} at ({new_x},{new_y})")
+                            
+                            # ============================================================
+                            # GAME BLEED GUARDRAIL (stricter 60% for right-side)
+                            # For top-right: left edge must be >= 60% of width
+                            # For top-left: right edge must be <= 40% of width
+                            # ============================================================
+                            if 'right' in position:
+                                min_x = int(width * 0.60)  # 1152 for 1920 width
+                                if new_x < min_x:
+                                    # REDUCE width from LEFT, keep right edge fixed
+                                    old_w = new_w
+                                    old_right_edge = new_x + new_w
+                                    new_w = old_right_edge - min_x
+                                    new_x = min_x
+                                    print(f"  ⚠️ Game bleed guardrail: x {new_x - (old_w - new_w)} -> {new_x}, w {old_w} -> {new_w}")
+                            else:
+                                max_right = int(width * 0.40)  # 768 for 1920 width
+                                if new_x + new_w > max_right:
+                                    new_w = max_right - new_x
+                                    print(f"  ⚠️ Game bleed guardrail: w -> {new_w}")
+                            
+                            # Ensure minimum dimensions
+                            new_w = max(100, new_w)
+                            new_h = max(100, new_h)
+                            
+                            print(f"  📐 FINAL bbox: {new_w}x{new_h} at ({new_x},{new_y})")
+                            print(f"  ═══════════════════════════════════════\n")
                             
                             # Save debug frame showing where webcam was detected
                             debug_frame_path = f"{temp_dir}/debug_webcam_detection.jpg"
