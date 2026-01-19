@@ -2,12 +2,17 @@
 
 Detects the webcam overlay position in stream recordings and returns
 the region coordinates for video compositing.
+
+Strategy:
+1. Use Gemini Vision AI to detect IF a webcam exists and WHICH corner
+2. Refine the bounding box using OpenCV edge/contour detection
+3. Fall back to OpenCV face detection if Gemini unavailable
 """
 
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 
 class WebcamRegion:
@@ -26,6 +31,260 @@ class WebcamRegion:
     def to_ffmpeg_crop(self) -> str:
         """Return FFmpeg crop filter string."""
         return f"crop={self.width}:{self.height}:{self.x}:{self.y}"
+
+
+def refine_webcam_bbox(
+    frame_bgr: np.ndarray,
+    corner: str,
+    video_width: int,
+    video_height: int,
+    roi_ratio: float = 0.45,
+) -> Optional[Dict[str, int]]:
+    """
+    Refine webcam bounding box using edge detection and contour analysis.
+    
+    Gemini often returns face-like square bboxes instead of the actual webcam overlay.
+    This function analyzes the corner region to find the true rectangular overlay.
+    
+    Args:
+        frame_bgr: Full video frame (BGR)
+        corner: Which corner to search ('top-left', 'top-right', 'bottom-left', 'bottom-right')
+        video_width: Full frame width
+        video_height: Full frame height
+        roi_ratio: What fraction of the frame to use as ROI (0.45 = 45%)
+    
+    Returns:
+        Dict with x, y, width, height in full-frame coordinates, or None
+    """
+    print(f"  🔬 Refining bbox in {corner} using edge detection...")
+    
+    # Calculate ROI bounds
+    roi_w = int(video_width * roi_ratio)
+    roi_h = int(video_height * roi_ratio)
+    
+    if corner == 'top-left':
+        roi_x, roi_y = 0, 0
+    elif corner == 'top-right':
+        roi_x, roi_y = video_width - roi_w, 0
+    elif corner == 'bottom-left':
+        roi_x, roi_y = 0, video_height - roi_h
+    elif corner == 'bottom-right':
+        roi_x, roi_y = video_width - roi_w, video_height - roi_h
+    else:
+        print(f"  ⚠️ Unknown corner: {corner}")
+        return None
+    
+    # Extract ROI
+    roi = frame_bgr[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w].copy()
+    roi_area = roi_w * roi_h
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    
+    # Apply Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Canny edge detection
+    edges = cv2.Canny(blurred, 50, 150)
+    
+    # Morphological close to connect broken edges
+    kernel = np.ones((7, 7), np.uint8)
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    
+    # Find contours
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        print(f"  ⚠️ No contours found in {corner} ROI")
+        return None
+    
+    # Filter and score candidates
+    candidates = []
+    min_area = roi_area * 0.05  # At least 5% of ROI
+    
+    for contour in contours:
+        # Approximate to polygon
+        epsilon = 0.02 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        
+        # Get bounding rectangle
+        bx, by, bw, bh = cv2.boundingRect(contour)
+        area = bw * bh
+        
+        # Filter by area
+        if area < min_area:
+            continue
+        
+        # Filter by aspect ratio (typical webcam: 1.1 to 2.6)
+        ar = bw / bh if bh > 0 else 0
+        if ar < 1.1 or ar > 2.6:
+            continue
+        
+        # Calculate corner distance (prefer boxes closer to the actual corner)
+        if corner == 'top-left':
+            corner_dist = bx + by
+        elif corner == 'top-right':
+            corner_dist = (roi_w - (bx + bw)) + by
+        elif corner == 'bottom-left':
+            corner_dist = bx + (roi_h - (by + bh))
+        elif corner == 'bottom-right':
+            corner_dist = (roi_w - (bx + bw)) + (roi_h - (by + bh))
+        else:
+            corner_dist = bx + by
+        
+        # Score: prefer larger area and closer to corner
+        # Normalize distance by ROI diagonal
+        roi_diag = np.sqrt(roi_w**2 + roi_h**2)
+        dist_score = 1 - (corner_dist / roi_diag)  # 0-1, higher = closer to corner
+        area_score = area / roi_area  # 0-1, higher = larger
+        
+        # Combined score (weight area more)
+        score = area_score * 0.7 + dist_score * 0.3
+        
+        candidates.append({
+            'x': bx,
+            'y': by,
+            'width': bw,
+            'height': bh,
+            'area': area,
+            'ar': ar,
+            'corner_dist': corner_dist,
+            'score': score,
+            'vertices': len(approx)
+        })
+        
+        print(f"     Candidate: {bw}x{bh} at ({bx},{by}), AR={ar:.2f}, dist={corner_dist}, score={score:.3f}")
+    
+    if not candidates:
+        print(f"  ⚠️ No valid rectangle candidates in {corner} ROI")
+        return None
+    
+    # Sort by score (highest first)
+    candidates.sort(key=lambda c: c['score'], reverse=True)
+    best = candidates[0]
+    
+    # Convert to full-frame coordinates
+    full_x = roi_x + best['x']
+    full_y = roi_y + best['y']
+    
+    print(f"  ✅ Refined bbox: {best['width']}x{best['height']} at ({full_x},{full_y}), AR={best['ar']:.2f}")
+    
+    return {
+        'x': full_x,
+        'y': full_y,
+        'width': best['width'],
+        'height': best['height'],
+        'corner': corner
+    }
+
+
+def is_bbox_suspicious(bbox: Dict[str, int], video_width: int, video_height: int) -> Tuple[bool, str]:
+    """
+    Check if Gemini's bbox looks suspicious (likely a face crop, not webcam overlay).
+    
+    Args:
+        bbox: Dict with x, y, width, height
+        video_width: Full frame width
+        video_height: Full frame height
+    
+    Returns:
+        Tuple of (is_suspicious, reason)
+    """
+    w = bbox.get('width', 0)
+    h = bbox.get('height', 0)
+    
+    if w <= 0 or h <= 0:
+        return True, "invalid dimensions"
+    
+    ar = w / h
+    area = w * h
+    frame_area = video_width * video_height
+    area_ratio = area / frame_area
+    
+    # Check 1: Near-square aspect ratio (faces are ~1:1, webcams are wider)
+    if 0.85 <= ar <= 1.15:
+        return True, f"near-square AR={ar:.2f} (likely face crop)"
+    
+    # Check 2: Too small (less than 3% of frame)
+    if area_ratio < 0.03:
+        return True, f"too small ({area_ratio*100:.1f}% of frame)"
+    
+    # Check 3: Inverted aspect ratio (taller than wide)
+    if ar < 1.0:
+        return True, f"inverted AR={ar:.2f} (taller than wide)"
+    
+    return False, "looks valid"
+
+
+def create_fallback_widescreen_bbox(
+    corner: str,
+    gemini_height: int,
+    video_width: int,
+    video_height: int,
+    target_ar: float = 16/9,
+    max_ratio: float = 0.50,
+) -> Dict[str, int]:
+    """
+    Create a fallback widescreen bbox when refinement fails.
+    
+    Uses the height from Gemini (or a reasonable default) and computes
+    width to achieve target aspect ratio (16:9).
+    
+    Args:
+        corner: Which corner to anchor the bbox
+        gemini_height: Height from Gemini's bbox (or 0 for default)
+        video_width: Full frame width
+        video_height: Full frame height
+        target_ar: Target aspect ratio (width/height)
+        max_ratio: Max fraction of frame for any dimension
+    
+    Returns:
+        Dict with x, y, width, height
+    """
+    print(f"  🎯 Creating fallback widescreen bbox in {corner}...")
+    
+    # Use Gemini height or reasonable default (20% of frame height)
+    h = gemini_height if gemini_height > 50 else int(video_height * 0.20)
+    
+    # Compute width for target AR
+    w = int(h * target_ar)
+    
+    # Clamp to max ratio
+    max_w = int(video_width * max_ratio)
+    max_h = int(video_height * max_ratio)
+    
+    if w > max_w:
+        w = max_w
+        h = int(w / target_ar)
+    if h > max_h:
+        h = max_h
+        w = int(h * target_ar)
+    
+    # Make even
+    w = w - (w % 2)
+    h = h - (h % 2)
+    
+    # Anchor to corner
+    if corner == 'top-left':
+        x, y = 0, 0
+    elif corner == 'top-right':
+        x, y = video_width - w, 0
+    elif corner == 'bottom-left':
+        x, y = 0, video_height - h
+    elif corner == 'bottom-right':
+        x, y = video_width - w, video_height - h
+    else:
+        x, y = video_width - w, 0  # Default to top-right
+    
+    print(f"  📐 Fallback bbox: {w}x{h} at ({x},{y}), AR={w/h:.2f}")
+    
+    return {
+        'x': x,
+        'y': y,
+        'width': w,
+        'height': h,
+        'corner': corner
+    }
 
 
 def extract_frame(video_path: str, time_sec: float = 5.0) -> Optional[np.ndarray]:
@@ -228,13 +487,55 @@ def detect_webcam_region(
                                 else:
                                     position = 'top-left'
                             
-                            # Expand the detected region slightly to avoid too-tight crops
-                            # This gives some breathing room and reduces pixelation
                             cam_x = result['x']
                             cam_y = result['y']
                             cam_w = result['width']
                             cam_h = result['height']
                             
+                            # ============================================================
+                            # CHECK IF GEMINI BBOX IS SUSPICIOUS (face crop vs overlay)
+                            # ============================================================
+                            gemini_ar = cam_w / cam_h if cam_h > 0 else 0
+                            is_suspicious, suspicious_reason = is_bbox_suspicious(result, width, height)
+                            
+                            print(f"  📐 Gemini bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y}), AR={gemini_ar:.2f}")
+                            
+                            if is_suspicious:
+                                print(f"  ⚠️ Gemini bbox suspicious: {suspicious_reason}")
+                                print(f"  🔬 Running OpenCV refinement in {position} corner...")
+                                
+                                # Load the frame for refinement
+                                frame_for_refine = cv2.imread(frame_path)
+                                refined_bbox = None
+                                
+                                if frame_for_refine is not None:
+                                    refined_bbox = refine_webcam_bbox(
+                                        frame_for_refine, position, width, height
+                                    )
+                                
+                                if refined_bbox:
+                                    # Use refined bbox
+                                    print(f"  ✅ Using refined bbox instead of Gemini's")
+                                    cam_x = refined_bbox['x']
+                                    cam_y = refined_bbox['y']
+                                    cam_w = refined_bbox['width']
+                                    cam_h = refined_bbox['height']
+                                else:
+                                    # Refinement failed - use fallback heuristic
+                                    print(f"  ⚠️ Refinement failed, using fallback widescreen bbox")
+                                    fallback = create_fallback_widescreen_bbox(
+                                        position, cam_h, width, height
+                                    )
+                                    cam_x = fallback['x']
+                                    cam_y = fallback['y']
+                                    cam_w = fallback['width']
+                                    cam_h = fallback['height']
+                            else:
+                                print(f"  ✅ Gemini bbox looks valid (not suspicious)")
+                            
+                            # ============================================================
+                            # APPLY PADDING (after refinement/fallback)
+                            # ============================================================
                             # Add 15% padding on each side
                             padding_x = int(cam_w * 0.15)
                             padding_y = int(cam_h * 0.15)
@@ -272,8 +573,7 @@ def detect_webcam_region(
                                 if new_y + new_h > height:
                                     new_h = height - new_y
                             
-                            print(f"  📐 Original: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
-                            print(f"  📐 Expanded: {new_w}x{new_h} at ({new_x},{new_y}) (+15% padding)")
+                            print(f"  📐 Final bbox: {new_w}x{new_h} at ({new_x},{new_y}) (with padding)")
                             
                             # Save debug frame showing where webcam was detected
                             debug_frame_path = f"{temp_dir}/debug_webcam_detection.jpg"
