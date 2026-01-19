@@ -181,7 +181,7 @@ def detect_webcam_region(
     gemini_explicitly_no_webcam = False
     
     try:
-        from gemini_vision import detect_webcam_with_gemini, extract_frame_for_analysis
+        from gemini_vision import detect_webcam_with_gemini, extract_frame_for_analysis, save_debug_frame_with_box
         from config import config
         
         if config.GEMINI_API_KEY:
@@ -216,6 +216,14 @@ def detect_webcam_region(
                             break  # Don't try more frames
                         else:
                             print(f"  ✅ Gemini found webcam: {result}")
+                            
+                            # Save debug frame showing where webcam was detected
+                            debug_frame_path = f"{temp_dir}/debug_webcam_detection.jpg"
+                            save_debug_frame_with_box(
+                                frame_path, debug_frame_path,
+                                result['x'], result['y'], result['width'], result['height']
+                            )
+                            
                             # Use corner from Gemini if available
                             position = result.get('corner', 'top-left')
                             if position == 'unknown':

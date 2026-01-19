@@ -221,7 +221,7 @@ OR
 
 def extract_frame_for_analysis(video_path: str, output_path: str, timestamp: float = 2.0) -> bool:
     """
-    Extract a single frame from video for analysis.
+    Extract a single FULL frame from video for analysis.
     
     Args:
         video_path: Path to source video
@@ -234,18 +234,49 @@ def extract_frame_for_analysis(video_path: str, output_path: str, timestamp: flo
     import subprocess
     
     try:
+        # Extract FULL frame at original resolution
         cmd = [
             'ffmpeg', '-y',
             '-ss', str(timestamp),
             '-i', video_path,
             '-vframes', '1',
-            '-q:v', '2',  # High quality JPEG
+            '-q:v', '1',  # Highest quality JPEG
+            '-vf', 'scale=-1:-1',  # Keep original size, no scaling
             output_path
         ]
         
         result = subprocess.run(cmd, capture_output=True, timeout=30)
-        return result.returncode == 0 and os.path.exists(output_path)
+        
+        if result.returncode == 0 and os.path.exists(output_path):
+            # Log the extracted frame dimensions
+            import cv2
+            img = cv2.imread(output_path)
+            if img is not None:
+                h, w = img.shape[:2]
+                file_size = os.path.getsize(output_path) / 1024
+                print(f"  📷 Extracted frame: {w}x{h} pixels, {file_size:.1f}KB")
+            return True
+        else:
+            stderr = result.stderr.decode() if result.stderr else "unknown error"
+            print(f"  ⚠️ FFmpeg failed: {stderr[:200]}")
+            return False
         
     except Exception as e:
         print(f"⚠️ Frame extraction failed: {e}")
         return False
+
+
+def save_debug_frame_with_box(frame_path: str, output_path: str, x: int, y: int, w: int, h: int):
+    """Save a debug image showing the detected webcam box."""
+    try:
+        import cv2
+        img = cv2.imread(frame_path)
+        if img is not None:
+            # Draw rectangle where webcam was detected
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 3)
+            cv2.putText(img, f"WEBCAM: {x},{y} {w}x{h}", (x, y - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.imwrite(output_path, img)
+            print(f"  🖼️ Debug frame saved: {output_path}")
+    except Exception as e:
+        print(f"  ⚠️ Could not save debug frame: {e}")
