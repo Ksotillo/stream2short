@@ -72,51 +72,48 @@ def detect_webcam_with_gemini(frame_path: str, video_width: int, video_height: i
         with open(frame_path, 'rb') as f:
             image_bytes = f.read()
         
-        prompt = f"""TASK: Find the STREAMER'S WEBCAM OVERLAY in this gaming stream screenshot.
+        prompt = f"""TASK: Find the WEBCAM OVERLAY RECTANGLE in this gaming stream screenshot.
 
-IMAGE DIMENSIONS: {video_width} pixels wide × {video_height} pixels tall
-COORDINATE SYSTEM: x=0 is LEFT edge, y=0 is TOP edge
+IMAGE SIZE: {video_width} × {video_height} pixels
+COORDINATES: x=0 is LEFT edge, y=0 is TOP edge
 
-STEP 1 - SCAN THE IMAGE:
-Look at ALL four corners for a small rectangular area showing a REAL HUMAN PERSON:
-- TOP-LEFT corner (x near 0, y near 0)
-- TOP-RIGHT corner (x near {video_width}, y near 0)  
-- BOTTOM-LEFT corner (x near 0, y near {video_height})
-- BOTTOM-RIGHT corner (x near {video_width}, y near {video_height})
+IMPORTANT: I need the RECTANGLE BOUNDARY of the webcam overlay, NOT the face position!
 
-STEP 2 - IDENTIFY THE WEBCAM:
-A webcam overlay shows:
-✓ A REAL HUMAN face/body (not a game character)
-✓ Real-world lighting (room lights, not game lighting)
-✓ Often has a border, frame, or different background
-✓ Typical size: 200-500px wide, 150-400px tall
+WHAT TO LOOK FOR:
+A webcam overlay is a rectangular video feed showing a REAL PERSON overlaid on the game.
+It usually has a VISIBLE BOUNDARY where it meets the game - this is what I need you to measure.
 
-NOT a webcam:
-✗ Game UI (health bars, maps, inventory)
-✗ Game characters or NPCs
-✗ Game environments (walls, floors, ceilings)
+HOW TO MEASURE:
+1. Find where the webcam overlay STARTS (left edge of the webcam rectangle)
+2. Find where the webcam overlay ENDS (right edge of the webcam rectangle)  
+3. Measure the FULL rectangle including any border/frame
 
-STEP 3 - MEASURE PRECISELY:
-If you find a webcam, give the EXACT pixel coordinates of its bounding box:
-- x = distance from LEFT edge of image to LEFT edge of webcam
-- y = distance from TOP edge of image to TOP edge of webcam
-- width = webcam rectangle width in pixels
-- height = webcam rectangle height in pixels
+COMMON POSITIONS:
+- TOP-RIGHT: The webcam rectangle's RIGHT edge touches or nearly touches x={video_width}
+- TOP-LEFT: The webcam rectangle's LEFT edge touches or nearly touches x=0
+- Webcams are usually 300-500 pixels wide and 200-350 pixels tall
 
-EXAMPLES for a 1920x1080 video:
-- TOP-LEFT webcam (400x300): x=0, y=0 → {{"found": true, "corner": "top-left", "x": 0, "y": 0, "width": 400, "height": 300}}
-- TOP-RIGHT webcam (400x300): x=1520, y=0 → {{"found": true, "corner": "top-right", "x": 1520, "y": 0, "width": 400, "height": 300}}
-  (Note: 1920-400=1520, so x=1520 means it touches the RIGHT edge)
+MEASUREMENT RULES:
+- x = LEFT edge of the webcam rectangle (not the face, the RECTANGLE)
+- y = TOP edge of the webcam rectangle
+- width = FULL width of webcam rectangle (right_edge - left_edge)
+- height = FULL height of webcam rectangle (bottom_edge - top_edge)
 
-VERIFICATION:
-- For TOP-RIGHT: x + width should equal {video_width} (or be very close)
-- For TOP-LEFT: x should be 0 (or very close)
-- For BOTTOM: y + height should equal {video_height} (or be very close)
+EXAMPLE for {video_width}x{video_height}:
+If webcam is in TOP-RIGHT, touching the right edge, and is 400px wide:
+- Right edge of webcam = {video_width}
+- Left edge of webcam = {video_width} - 400 = {video_width - 400}
+- Answer: {{"found": true, "corner": "top-right", "x": {video_width - 400}, "y": 0, "width": 400, "height": 250}}
+
+DOUBLE-CHECK YOUR ANSWER:
+- If corner is "top-right": x + width should ≈ {video_width}
+- If corner is "top-left": x should ≈ 0
+- If corner is "bottom-right": x + width should ≈ {video_width} AND y + height should ≈ {video_height}
 
 RESPOND WITH ONLY JSON:
-{{"found": true, "corner": "<which corner>", "x": <number>, "y": <number>, "width": <number>, "height": <number>}}
+{{"found": true, "corner": "<corner>", "x": <number>, "y": <number>, "width": <number>, "height": <number>}}
 OR
-{{"found": false, "reason": "<describe what you see in the corners>"}}"""
+{{"found": false, "reason": "<what you see>"}}"""
 
         # Try models in order of preference (free tier)
         models_to_try = [
@@ -161,27 +158,39 @@ OR
                         
                         print(f"  📍 Webcam at {corner}: x={x}, y={y}, w={width}, h={height}")
                         
-                        # Sanity check: verify coordinates match the stated corner
+                        # Sanity check: verify x+width or y+height match edges for corner positions
+                        # Only adjust if SIGNIFICANTLY off (>20% of webcam size)
+                        adjustment_threshold = max(width, height) * 0.2
+                        
                         if corner == 'top-right':
-                            expected_x = video_width - width
-                            if abs(x - expected_x) > 100:  # More than 100px off
-                                print(f"  ⚠️ WARNING: top-right webcam x={x}, but expected x≈{expected_x}")
-                                print(f"     Adjusting x from {x} to {expected_x}")
-                                x = expected_x
+                            expected_right_edge = video_width
+                            actual_right_edge = x + width
+                            gap = expected_right_edge - actual_right_edge
+                            if gap > adjustment_threshold:
+                                # Webcam should touch right edge but doesn't
+                                print(f"  ⚠️ top-right webcam ends at x={actual_right_edge}, but video width={video_width} (gap={gap}px)")
+                                print(f"     Adjusting x from {x} to {video_width - width}")
+                                x = video_width - width
                         elif corner == 'top-left':
-                            if x > 100:  # Should be near 0
-                                print(f"  ⚠️ WARNING: top-left webcam x={x}, but expected x≈0")
-                                print(f"     Adjusting x from {x} to 0")
+                            if x > adjustment_threshold:
+                                print(f"  ⚠️ top-left webcam starts at x={x}, adjusting to 0")
                                 x = 0
                         elif corner == 'bottom-right':
-                            expected_x = video_width - width
-                            if abs(x - expected_x) > 100:
-                                print(f"  ⚠️ WARNING: bottom-right webcam x={x}, adjusting to {expected_x}")
-                                x = expected_x
+                            expected_right_edge = video_width
+                            actual_right_edge = x + width
+                            gap = expected_right_edge - actual_right_edge
+                            if gap > adjustment_threshold:
+                                print(f"  ⚠️ bottom-right webcam ends at x={actual_right_edge}, adjusting")
+                                x = video_width - width
+                            expected_bottom = video_height
+                            actual_bottom = y + height
+                            if expected_bottom - actual_bottom > adjustment_threshold:
+                                y = video_height - height
                         elif corner == 'bottom-left':
-                            if x > 100:
-                                print(f"  ⚠️ WARNING: bottom-left webcam x={x}, adjusting to 0")
+                            if x > adjustment_threshold:
                                 x = 0
+                            if video_height - (y + height) > adjustment_threshold:
+                                y = video_height - height
                         
                         # Validate bounds
                         if width > 50 and height > 50 and x >= 0 and y >= 0:
