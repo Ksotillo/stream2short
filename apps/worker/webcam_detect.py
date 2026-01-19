@@ -74,6 +74,431 @@ def compute_iou(box1: BBoxCandidate, box2: BBoxCandidate) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+# =============================================================================
+# DNN FACE DETECTION
+# =============================================================================
+
+# Global DNN face detector (lazy loaded)
+_dnn_face_net = None
+_dnn_face_available = None
+
+
+def get_dnn_face_detector():
+    """
+    Get or create the OpenCV DNN face detector.
+    
+    Uses OpenCV's built-in DNN face detector (ResNet-10 SSD).
+    Returns None if model files are not available.
+    """
+    global _dnn_face_net, _dnn_face_available
+    
+    if _dnn_face_available is False:
+        return None
+    
+    if _dnn_face_net is not None:
+        return _dnn_face_net
+    
+    # Try to load the DNN face detector
+    # OpenCV 4.5+ includes a pre-trained face detector
+    try:
+        # Method 1: Use OpenCV's FaceDetectorYN (OpenCV 4.5.4+)
+        if hasattr(cv2, 'FaceDetectorYN'):
+            # YuNet face detector - fast and accurate
+            model_path = cv2.data.haarcascades + '../face_detect_yunet/face_detection_yunet_2023mar.onnx'
+            if Path(model_path).exists():
+                _dnn_face_net = cv2.FaceDetectorYN.create(
+                    model_path,
+                    "",
+                    (320, 320),
+                    0.6,  # score threshold
+                    0.3,  # NMS threshold
+                    5000  # top_k
+                )
+                _dnn_face_available = True
+                print("  ✅ Loaded YuNet face detector")
+                return _dnn_face_net
+    except Exception as e:
+        print(f"  ⚠️ YuNet not available: {e}")
+    
+    # Method 2: Fall back to Haar Cascade (always available)
+    try:
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        if Path(cascade_path).exists():
+            _dnn_face_net = cv2.CascadeClassifier(cascade_path)
+            if not _dnn_face_net.empty():
+                _dnn_face_available = True
+                print("  ✅ Loaded Haar Cascade face detector")
+                return _dnn_face_net
+    except Exception as e:
+        print(f"  ⚠️ Haar Cascade not available: {e}")
+    
+    _dnn_face_available = False
+    return None
+
+
+@dataclass
+class FaceDetection:
+    """Detected face with bounding box and confidence."""
+    x: int
+    y: int
+    width: int
+    height: int
+    confidence: float
+    
+    @property
+    def center_x(self) -> int:
+        return self.x + self.width // 2
+    
+    @property
+    def center_y(self) -> int:
+        return self.y + self.height // 2
+
+
+def detect_face_dnn(
+    frame_bgr: np.ndarray,
+    roi_x: int = 0,
+    roi_y: int = 0,
+    roi_w: int = 0,
+    roi_h: int = 0,
+    min_confidence: float = 0.5,
+) -> Optional[FaceDetection]:
+    """
+    Detect the best face in a region using DNN or Haar Cascade.
+    
+    Args:
+        frame_bgr: Full video frame (BGR)
+        roi_x, roi_y, roi_w, roi_h: Region of interest (0 = use full frame)
+        min_confidence: Minimum detection confidence
+    
+    Returns:
+        FaceDetection with full-frame coordinates, or None
+    """
+    detector = get_dnn_face_detector()
+    if detector is None:
+        return None
+    
+    # Extract ROI if specified
+    if roi_w > 0 and roi_h > 0:
+        roi = frame_bgr[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w].copy()
+    else:
+        roi = frame_bgr
+        roi_x, roi_y = 0, 0
+        roi_h, roi_w = frame_bgr.shape[:2]
+    
+    faces = []
+    
+    # Detect based on detector type
+    if isinstance(detector, cv2.CascadeClassifier):
+        # Haar Cascade detection
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        detections = detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(40, 40),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+        
+        for (fx, fy, fw, fh) in detections:
+            # Haar doesn't give confidence, assume 0.8 for detected faces
+            faces.append(FaceDetection(
+                x=roi_x + fx,
+                y=roi_y + fy,
+                width=fw,
+                height=fh,
+                confidence=0.8
+            ))
+    
+    elif hasattr(cv2, 'FaceDetectorYN') and isinstance(detector, cv2.FaceDetectorYN):
+        # YuNet detection
+        detector.setInputSize((roi_w, roi_h))
+        _, detections = detector.detect(roi)
+        
+        if detections is not None:
+            for det in detections:
+                fx, fy, fw, fh = int(det[0]), int(det[1]), int(det[2]), int(det[3])
+                conf = float(det[-1])
+                
+                if conf >= min_confidence:
+                    faces.append(FaceDetection(
+                        x=roi_x + fx,
+                        y=roi_y + fy,
+                        width=fw,
+                        height=fh,
+                        confidence=conf
+                    ))
+    
+    if not faces:
+        return None
+    
+    # Return the face with highest confidence (and reasonable size)
+    # Filter out very small faces
+    valid_faces = [f for f in faces if f.width >= 30 and f.height >= 30]
+    if not valid_faces:
+        return None
+    
+    best_face = max(valid_faces, key=lambda f: f.confidence * (f.width * f.height))
+    return best_face
+
+
+def bbox_contains_face(
+    bbox: Dict[str, int],
+    face: FaceDetection,
+    margin_ratio: float = 0.1,
+) -> bool:
+    """
+    Check if a bounding box fully contains a face with required margin.
+    
+    Args:
+        bbox: Dict with x, y, width, height
+        face: FaceDetection object
+        margin_ratio: Required margin as ratio of face size (0.1 = 10%)
+    
+    Returns:
+        True if bbox contains the face with margin
+    """
+    margin_x = int(face.width * margin_ratio)
+    margin_y = int(face.height * margin_ratio)
+    
+    # Face bounds with margin
+    face_left = face.x - margin_x
+    face_right = face.x + face.width + margin_x
+    face_top = face.y - margin_y
+    face_bottom = face.y + face.height + margin_y
+    
+    # Bbox bounds
+    bbox_left = bbox['x']
+    bbox_right = bbox['x'] + bbox['width']
+    bbox_top = bbox['y']
+    bbox_bottom = bbox['y'] + bbox['height']
+    
+    return (
+        bbox_left <= face_left and
+        bbox_right >= face_right and
+        bbox_top <= face_top and
+        bbox_bottom >= face_bottom
+    )
+
+
+def refine_webcam_bbox_face_anchor(
+    frame_bgr: np.ndarray,
+    corner: str,
+    video_width: int,
+    video_height: int,
+    roi_ratio: float = 0.55,
+) -> Tuple[Optional[Dict[str, int]], Optional[FaceDetection]]:
+    """
+    Find webcam bbox anchored around a detected face.
+    
+    This is more reliable than contour detection because webcams MUST contain faces.
+    
+    Args:
+        frame_bgr: Full video frame (BGR)
+        corner: Which corner to search
+        video_width: Video width
+        video_height: Video height
+        roi_ratio: ROI size as fraction of frame
+    
+    Returns:
+        Tuple of (bbox dict or None, FaceDetection or None)
+    """
+    print(f"  👤 Attempting face-anchored detection in {corner}...")
+    
+    # Calculate ROI bounds
+    roi_w = int(video_width * roi_ratio)
+    roi_h = int(video_height * roi_ratio)
+    
+    if corner == 'top-left':
+        roi_x, roi_y = 0, 0
+    elif corner == 'top-right':
+        roi_x, roi_y = video_width - roi_w, 0
+    elif corner == 'bottom-left':
+        roi_x, roi_y = 0, video_height - roi_h
+    elif corner == 'bottom-right':
+        roi_x, roi_y = video_width - roi_w, video_height - roi_h
+    else:
+        return None, None
+    
+    # Detect face in ROI
+    face = detect_face_dnn(frame_bgr, roi_x, roi_y, roi_w, roi_h)
+    
+    if face is None:
+        print(f"  ⚠️ No face detected in {corner} ROI")
+        return None, None
+    
+    print(f"  👤 Face found: {face.width}x{face.height} at ({face.x},{face.y}), conf={face.confidence:.2f}")
+    
+    # Generate candidate webcam rectangles around the face
+    # Aspect ratios to try (common webcam ratios)
+    aspect_ratios = [16/9, 4/3, 1.5]
+    
+    # Scale factors for rectangle size relative to face
+    # (how many times bigger than face the webcam might be)
+    scale_factors = [1.8, 2.2, 2.8, 3.5, 4.5]
+    
+    # Get edge map for scoring
+    roi = frame_bgr[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    candidates = []
+    
+    for ar in aspect_ratios:
+        for scale in scale_factors:
+            # Calculate candidate size based on face size
+            face_size = max(face.width, face.height)
+            
+            # Height based on scale, width based on AR
+            cand_h = int(face_size * scale)
+            cand_w = int(cand_h * ar)
+            
+            # Don't exceed ROI bounds
+            if cand_w > roi_w * 0.95 or cand_h > roi_h * 0.95:
+                continue
+            
+            # Position: center on face, shifted slightly down (face usually in upper third)
+            face_rel_x = face.x - roi_x
+            face_rel_y = face.y - roi_y
+            
+            # Center horizontally on face
+            cand_x = face_rel_x + face.width // 2 - cand_w // 2
+            
+            # Position vertically: face should be in upper 40% of webcam
+            # So shift the rectangle down from face center
+            cand_y = face_rel_y - int(cand_h * 0.25)  # Face at ~30% from top
+            
+            # Clamp to ROI
+            cand_x = max(0, min(cand_x, roi_w - cand_w))
+            cand_y = max(0, min(cand_y, roi_h - cand_h))
+            
+            # HARD CONSTRAINT: Must contain the face with margin
+            temp_bbox = {
+                'x': roi_x + cand_x,
+                'y': roi_y + cand_y,
+                'width': cand_w,
+                'height': cand_h
+            }
+            if not bbox_contains_face(temp_bbox, face, margin_ratio=0.05):
+                continue
+            
+            # Score the candidate
+            score = score_webcam_candidate(
+                edges, cand_x, cand_y, cand_w, cand_h,
+                face_rel_x, face_rel_y, face.width, face.height,
+                corner, roi_w, roi_h
+            )
+            
+            candidates.append({
+                'x': roi_x + cand_x,
+                'y': roi_y + cand_y,
+                'width': cand_w,
+                'height': cand_h,
+                'ar': ar,
+                'scale': scale,
+                'score': score,
+                'corner': corner
+            })
+    
+    if not candidates:
+        print(f"  ⚠️ No valid webcam candidates contain the face")
+        return None, face
+    
+    # Sort by score and pick best
+    candidates.sort(key=lambda c: c['score'], reverse=True)
+    best = candidates[0]
+    
+    print(f"  ✅ Face-anchored bbox: {best['width']}x{best['height']} at ({best['x']},{best['y']}), AR={best['ar']:.2f}, score={best['score']:.3f}")
+    
+    return best, face
+
+
+def score_webcam_candidate(
+    edges: np.ndarray,
+    x: int, y: int, w: int, h: int,
+    face_x: int, face_y: int, face_w: int, face_h: int,
+    corner: str,
+    roi_w: int, roi_h: int,
+) -> float:
+    """
+    Score a webcam candidate rectangle using edge evidence and positioning.
+    
+    Components:
+    1. Border edge strength (webcam overlays often have visible borders)
+    2. Face margin (face shouldn't be too close to edges)
+    3. Corner alignment (webcam should be near the specified corner)
+    4. Area preference (slight preference for larger, but not dominant)
+    """
+    # 1. Border edge strength (sample pixels along rectangle perimeter)
+    border_samples = []
+    thickness = 3  # Sample 3 pixels thick
+    
+    # Top edge
+    if y >= 0 and y + thickness < edges.shape[0]:
+        border_samples.append(np.mean(edges[y:y+thickness, max(0,x):min(edges.shape[1],x+w)]))
+    # Bottom edge
+    if y + h - thickness >= 0 and y + h < edges.shape[0]:
+        border_samples.append(np.mean(edges[y+h-thickness:y+h, max(0,x):min(edges.shape[1],x+w)]))
+    # Left edge
+    if x >= 0 and x + thickness < edges.shape[1]:
+        border_samples.append(np.mean(edges[max(0,y):min(edges.shape[0],y+h), x:x+thickness]))
+    # Right edge
+    if x + w - thickness >= 0 and x + w < edges.shape[1]:
+        border_samples.append(np.mean(edges[max(0,y):min(edges.shape[0],y+h), x+w-thickness:x+w]))
+    
+    border_strength = np.mean(border_samples) / 255.0 if border_samples else 0
+    
+    # 2. Face margin score (face should have breathing room)
+    face_center_x = face_x + face_w // 2
+    face_center_y = face_y + face_h // 2
+    
+    # Distance from face to each edge
+    left_margin = face_x - x
+    right_margin = (x + w) - (face_x + face_w)
+    top_margin = face_y - y
+    bottom_margin = (y + h) - (face_y + face_h)
+    
+    # Minimum margin should be at least 10% of face size
+    min_desired = max(face_w, face_h) * 0.1
+    
+    margin_scores = [
+        min(1.0, left_margin / max(1, min_desired)),
+        min(1.0, right_margin / max(1, min_desired)),
+        min(1.0, top_margin / max(1, min_desired)),
+        min(1.0, bottom_margin / max(1, min_desired)),
+    ]
+    face_margin_score = np.mean(margin_scores)
+    
+    # 3. Corner alignment score
+    if corner == 'top-left':
+        corner_dist = x + y
+    elif corner == 'top-right':
+        corner_dist = (roi_w - (x + w)) + y
+    elif corner == 'bottom-left':
+        corner_dist = x + (roi_h - (y + h))
+    elif corner == 'bottom-right':
+        corner_dist = (roi_w - (x + w)) + (roi_h - (y + h))
+    else:
+        corner_dist = x + y
+    
+    roi_diag = np.sqrt(roi_w**2 + roi_h**2)
+    corner_alignment = 1 - (corner_dist / roi_diag)
+    
+    # 4. Area score (slight preference for larger, normalized)
+    area = w * h
+    roi_area = roi_w * roi_h
+    area_score = min(1.0, (area / roi_area) * 2)  # Cap at 1.0
+    
+    # Combined score
+    score = (
+        border_strength * 0.35 +      # Edge evidence is important
+        face_margin_score * 0.30 +    # Face should have margin
+        corner_alignment * 0.25 +     # Should be in the corner
+        area_score * 0.10             # Slight size preference
+    )
+    
+    return score
+
+
 def refine_webcam_bbox_candidates(
     frame_bgr: np.ndarray,
     corner: str,
@@ -794,38 +1219,111 @@ def detect_webcam_region(
                                     should_refine = True
                                     print(f"  📐 Gemini AR={gemini_ar:.2f} is slightly off, refining anyway")
                             
-                            if should_refine:
-                                if is_suspicious:
-                                    print(f"  ⚠️ Gemini bbox suspicious: {suspicious_reason}")
-                                
-                                # Run MULTI-FRAME refinement for better stability
-                                print(f"  🔬 Running multi-frame refinement in {position} corner...")
-                                
-                                refined_bbox = run_multiframe_refinement(
-                                    video_path, position, width, height,
-                                    timestamps=[3.0, 10.0, 15.0],
-                                    top_n_per_frame=5
+                            # ============================================================
+                            # REFINEMENT STRATEGY:
+                            # 1. Try FACE-ANCHORED detection first (most reliable)
+                            # 2. Fall back to contour-based multi-frame refinement
+                            # 3. Fall back to widescreen heuristic
+                            # ============================================================
+                            
+                            if is_suspicious:
+                                print(f"  ⚠️ Gemini bbox suspicious: {suspicious_reason}")
+                            
+                            # Load frame for refinement
+                            frame_for_refine = cv2.imread(frame_path)
+                            detected_face = None
+                            refinement_method = None
+                            
+                            if frame_for_refine is not None:
+                                # Strategy 1: Face-anchored detection (preferred)
+                                face_bbox, detected_face = refine_webcam_bbox_face_anchor(
+                                    frame_for_refine, position, width, height
                                 )
                                 
-                                if refined_bbox:
-                                    # Use refined bbox
-                                    print(f"  ✅ Using refined bbox instead of Gemini's")
-                                    cam_x = refined_bbox['x']
-                                    cam_y = refined_bbox['y']
-                                    cam_w = refined_bbox['width']
-                                    cam_h = refined_bbox['height']
+                                if face_bbox:
+                                    print(f"  ✅ Using FACE-ANCHORED bbox")
+                                    cam_x = face_bbox['x']
+                                    cam_y = face_bbox['y']
+                                    cam_w = face_bbox['width']
+                                    cam_h = face_bbox['height']
+                                    refinement_method = "face-anchor"
                                 else:
-                                    # Refinement failed - use fallback heuristic
-                                    print(f"  ⚠️ Refinement failed, using fallback widescreen bbox")
-                                    fallback = create_fallback_widescreen_bbox(
-                                        position, cam_h, width, height
-                                    )
-                                    cam_x = fallback['x']
-                                    cam_y = fallback['y']
-                                    cam_w = fallback['width']
-                                    cam_h = fallback['height']
-                            else:
-                                print(f"  ✅ Gemini bbox looks valid (not suspicious, good AR)")
+                                    # Strategy 2: Multi-frame contour refinement
+                                    if should_refine:
+                                        print(f"  🔬 Face-anchor failed, trying contour refinement...")
+                                        
+                                        refined_bbox = run_multiframe_refinement(
+                                            video_path, position, width, height,
+                                            timestamps=[3.0, 10.0, 15.0],
+                                            top_n_per_frame=5
+                                        )
+                                        
+                                        if refined_bbox:
+                                            # HARD CONSTRAINT: If we detected a face earlier,
+                                            # the contour bbox MUST contain it
+                                            if detected_face and not bbox_contains_face(refined_bbox, detected_face, margin_ratio=0.05):
+                                                print(f"  ❌ Contour bbox doesn't contain face! Rejecting.")
+                                                refined_bbox = None
+                                            else:
+                                                print(f"  ✅ Using CONTOUR-refined bbox")
+                                                cam_x = refined_bbox['x']
+                                                cam_y = refined_bbox['y']
+                                                cam_w = refined_bbox['width']
+                                                cam_h = refined_bbox['height']
+                                                refinement_method = "contour"
+                                        
+                                        if not refined_bbox:
+                                            # Strategy 3: Fallback widescreen heuristic
+                                            print(f"  ⚠️ All refinements failed, using fallback")
+                                            fallback = create_fallback_widescreen_bbox(
+                                                position, cam_h, width, height
+                                            )
+                                            cam_x = fallback['x']
+                                            cam_y = fallback['y']
+                                            cam_w = fallback['width']
+                                            cam_h = fallback['height']
+                                            refinement_method = "fallback"
+                                    else:
+                                        # Gemini bbox looks valid, but let's verify it contains face
+                                        print(f"  ✅ Gemini bbox looks valid")
+                                        refinement_method = "gemini"
+                            
+                            # ============================================================
+                            # HARD CONSTRAINT: Final bbox MUST contain detected face
+                            # ============================================================
+                            if detected_face:
+                                final_bbox_check = {
+                                    'x': cam_x, 'y': cam_y,
+                                    'width': cam_w, 'height': cam_h
+                                }
+                                
+                                if not bbox_contains_face(final_bbox_check, detected_face, margin_ratio=0.05):
+                                    print(f"  ❌ HARD CONSTRAINT FAILED: bbox doesn't contain face!")
+                                    print(f"     Face: ({detected_face.x},{detected_face.y}) {detected_face.width}x{detected_face.height}")
+                                    print(f"     Bbox: ({cam_x},{cam_y}) {cam_w}x{cam_h}")
+                                    
+                                    # Force bbox to be face-centered with generous padding
+                                    print(f"  🔧 Forcing face-centered bbox...")
+                                    
+                                    # Calculate generous bbox around face
+                                    face_size = max(detected_face.width, detected_face.height)
+                                    cam_h = int(face_size * 3.0)  # 3x face size for height
+                                    cam_w = int(cam_h * 16 / 9)   # 16:9 aspect ratio
+                                    
+                                    # Center on face, shifted down slightly
+                                    cam_x = detected_face.center_x - cam_w // 2
+                                    cam_y = detected_face.center_y - int(cam_h * 0.35)
+                                    
+                                    # Clamp to video bounds
+                                    cam_x = max(0, min(cam_x, width - cam_w))
+                                    cam_y = max(0, min(cam_y, height - cam_h))
+                                    cam_w = min(cam_w, width - cam_x)
+                                    cam_h = min(cam_h, height - cam_y)
+                                    
+                                    refinement_method = "face-forced"
+                                    print(f"  ✅ Forced bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
+                            
+                            print(f"  📋 Refinement method: {refinement_method}")
                             
                             # ============================================================
                             # APPLY PADDING (after refinement/fallback)
