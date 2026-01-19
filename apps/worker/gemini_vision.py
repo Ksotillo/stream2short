@@ -155,6 +155,9 @@ If NO webcam: {{"found": false, "reason": "<why no webcam detected>"}}"""
                     else:
                         reason = result.get('reason', 'unknown')
                         print(f"ℹ️ Gemini: No webcam found. Reason: {reason}")
+                        # Return special flag so we know Gemini explicitly said "no webcam"
+                        # (vs an API error where we should fall back to OpenCV)
+                        return {'no_webcam_confirmed': True, 'reason': reason}
                 else:
                     print(f"⚠️ Could not parse Gemini response: {response_text[:300]}")
                 

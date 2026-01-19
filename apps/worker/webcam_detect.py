@@ -177,11 +177,15 @@ def detect_webcam_region(
     # =========================================================================
     # Strategy 1: Try Gemini Vision AI first (more accurate)
     # =========================================================================
+    gemini_attempted = False
+    gemini_explicitly_no_webcam = False
+    
     try:
         from gemini_vision import detect_webcam_with_gemini, extract_frame_for_analysis
         from config import config
         
         if config.GEMINI_API_KEY:
+            gemini_attempted = True
             print("  🤖 Attempting Gemini Vision detection...")
             
             # Get video dimensions
@@ -200,30 +204,43 @@ def detect_webcam_region(
                     pass
                 
                 if result:
-                    print(f"  ✅ Gemini found webcam: {result}")
-                    # Determine position based on coordinates
-                    position = 'top-left'
-                    if result['x'] > width / 2:
-                        position = 'top-right' if result['y'] < height / 2 else 'bottom-right'
-                    elif result['y'] > height / 2:
-                        position = 'bottom-left'
-                    
-                    return WebcamRegion(
-                        x=result['x'],
-                        y=result['y'],
-                        width=result['width'],
-                        height=result['height'],
-                        position=position
-                    )
+                    if result.get('no_webcam_confirmed'):
+                        # Gemini explicitly said there's no webcam - trust it, skip OpenCV
+                        print("  ℹ️ Gemini confirmed: NO webcam in this video")
+                        gemini_explicitly_no_webcam = True
+                    else:
+                        print(f"  ✅ Gemini found webcam: {result}")
+                        # Determine position based on coordinates
+                        position = 'top-left'
+                        if result['x'] > width / 2:
+                            position = 'top-right' if result['y'] < height / 2 else 'bottom-right'
+                        elif result['y'] > height / 2:
+                            position = 'bottom-left'
+                        
+                        return WebcamRegion(
+                            x=result['x'],
+                            y=result['y'],
+                            width=result['width'],
+                            height=result['height'],
+                            position=position
+                        )
             
-            print("  ⚠️ Gemini didn't find webcam, falling back to face detection")
+            if not gemini_explicitly_no_webcam:
+                print("  ⚠️ Gemini didn't find webcam, falling back to face detection")
     except ImportError:
         print("  ⚠️ Gemini module not available")
     except Exception as e:
         print(f"  ⚠️ Gemini detection failed: {e}")
     
+    # If Gemini explicitly said "no webcam", trust it and skip OpenCV
+    # (OpenCV has too many false positives with game graphics)
+    if gemini_explicitly_no_webcam:
+        print("  📹 Skipping OpenCV (Gemini confirmed no webcam) → using simple crop")
+        return None
+    
     # =========================================================================
     # Strategy 2: Fall back to OpenCV face detection
+    # Only if Gemini wasn't configured or had an API error (not "no webcam")
     # =========================================================================
     print("  🔍 Using OpenCV face detection...")
     
