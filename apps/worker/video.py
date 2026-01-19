@@ -297,23 +297,44 @@ def render_split_layout_video(
     
     # ==========================================================================
     # STEP 2: Calculate native webcam height (preserves exact aspect ratio)
+    # Priority: 1) Never crop  2) Avoid bars  3) Keep webcam small if possible
     # ==========================================================================
     native_webcam_h = even(round(width * (cam_h / cam_w)))
     
-    # Define bounds
-    min_h = even(int(height * min_webcam_ratio))  # 15% = 288px
-    max_h = even(int(height * max_webcam_ratio))  # 35% = 672px
+    # Define bounds with new priority system
+    min_webcam_h = even(int(height * min_webcam_ratio))      # 15% = 288px - minimum for visibility
+    soft_max_webcam_h = even(int(height * max_webcam_ratio)) # 35% = 672px - prefer to stay under this
+    hard_max_webcam_h = even(int(height * 0.60))             # 60% = 1152px - allow growth to avoid bars
+    min_content_h = even(int(height * 0.40))                 # 40% = 768px - ensure game still visible
     
-    # Check if native height fits within bounds
+    print(f"   Native webcam height: {native_webcam_h}px")
+    print(f"   Bounds: min={min_webcam_h}, soft_max={soft_max_webcam_h}, hard_max={hard_max_webcam_h}")
+    print(f"   Min content height: {min_content_h}px")
+    
+    # Choose webcam_h based on priority rules
     clamped = False
-    if min_h <= native_webcam_h <= max_h:
+    
+    if native_webcam_h <= soft_max_webcam_h:
+        # Native fits within soft max - use it (ideal case)
+        webcam_h = max(min_webcam_h, native_webcam_h)  # Also enforce minimum
+        print(f"   ✅ Native height {native_webcam_h}px <= soft_max {soft_max_webcam_h}px - BRANCH A (no bars)")
+        
+    elif native_webcam_h <= hard_max_webcam_h and (height - native_webcam_h) >= min_content_h:
+        # Native exceeds soft max but:
+        # - Still under hard max
+        # - Leaves enough room for content
+        # Use native to AVOID BARS
         webcam_h = native_webcam_h
-        print(f"   ✅ Native height {native_webcam_h}px fits bounds [{min_h}-{max_h}] - using BRANCH A (direct scale)")
+        print(f"   ✅ Native height {native_webcam_h}px exceeds soft_max but fits hard_max - BRANCH A (no bars)")
+        print(f"      Allowing larger webcam to avoid black bars")
+        
     else:
+        # Must clamp - webcam would take too much space
         clamped = True
-        webcam_h = even(max(min_h, min(max_h, native_webcam_h)))
-        print(f"   ⚠️ Native height {native_webcam_h}px outside bounds [{min_h}-{max_h}] - clamped to {webcam_h}px")
-        print(f"   Using BRANCH B (dimmed background fill)")
+        webcam_h = even(height - min_content_h)  # Give content its minimum, webcam gets the rest
+        webcam_h = max(min_webcam_h, min(hard_max_webcam_h, webcam_h))  # Clamp to bounds
+        print(f"   ⚠️ Native height {native_webcam_h}px too large - clamped to {webcam_h}px")
+        print(f"      Using BRANCH B (dimmed background fill, no blur)")
     
     content_h = even(height - webcam_h)
     
