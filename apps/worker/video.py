@@ -221,7 +221,7 @@ def render_split_layout_video(
     subtitle_path: str | None = None,
     width: int = 1080,
     height: int = 1920,
-    webcam_height_ratio: float = 0.30,  # Webcam takes 30% of height
+    webcam_height_ratio: float = 0.25,  # Webcam takes 25% of height (less zoom)
 ) -> str:
     """
     Render a split-layout vertical video with webcam on top and main content below.

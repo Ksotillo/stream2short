@@ -217,13 +217,6 @@ def detect_webcam_region(
                         else:
                             print(f"  ✅ Gemini found webcam: {result}")
                             
-                            # Save debug frame showing where webcam was detected
-                            debug_frame_path = f"{temp_dir}/debug_webcam_detection.jpg"
-                            save_debug_frame_with_box(
-                                frame_path, debug_frame_path,
-                                result['x'], result['y'], result['width'], result['height']
-                            )
-                            
                             # Use corner from Gemini if available
                             position = result.get('corner', 'top-left')
                             if position == 'unknown':
@@ -235,11 +228,65 @@ def detect_webcam_region(
                                 else:
                                     position = 'top-left'
                             
+                            # Expand the detected region slightly to avoid too-tight crops
+                            # This gives some breathing room and reduces pixelation
+                            cam_x = result['x']
+                            cam_y = result['y']
+                            cam_w = result['width']
+                            cam_h = result['height']
+                            
+                            # Add 15% padding on each side
+                            padding_x = int(cam_w * 0.15)
+                            padding_y = int(cam_h * 0.15)
+                            
+                            # Expand region
+                            new_x = cam_x - padding_x
+                            new_y = cam_y - padding_y
+                            new_w = cam_w + (padding_x * 2)
+                            new_h = cam_h + (padding_y * 2)
+                            
+                            # Clamp to video bounds based on corner position
+                            if 'right' in position:
+                                # Right-side: ensure we don't go past right edge
+                                if new_x + new_w > width:
+                                    new_x = width - new_w
+                                if new_x < 0:
+                                    new_w = new_w + new_x  # Reduce width
+                                    new_x = 0
+                            else:
+                                # Left-side: ensure we don't go past left edge
+                                if new_x < 0:
+                                    new_x = 0
+                                if new_x + new_w > width:
+                                    new_w = width - new_x
+                            
+                            if 'bottom' in position:
+                                if new_y + new_h > height:
+                                    new_y = height - new_h
+                                if new_y < 0:
+                                    new_h = new_h + new_y
+                                    new_y = 0
+                            else:
+                                if new_y < 0:
+                                    new_y = 0
+                                if new_y + new_h > height:
+                                    new_h = height - new_y
+                            
+                            print(f"  📐 Original: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
+                            print(f"  📐 Expanded: {new_w}x{new_h} at ({new_x},{new_y}) (+15% padding)")
+                            
+                            # Save debug frame showing where webcam was detected
+                            debug_frame_path = f"{temp_dir}/debug_webcam_detection.jpg"
+                            save_debug_frame_with_box(
+                                frame_path, debug_frame_path,
+                                new_x, new_y, new_w, new_h
+                            )
+                            
                             return WebcamRegion(
-                                x=result['x'],
-                                y=result['y'],
-                                width=result['width'],
-                                height=result['height'],
+                                x=new_x,
+                                y=new_y,
+                                width=new_w,
+                                height=new_h,
                                 position=position
                             )
                 else:
