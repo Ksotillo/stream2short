@@ -943,13 +943,12 @@ def is_gemini_bbox_good(
     corner: str,
     video_width: int,
     video_height: int,
-    edge_epsilon: int = 12,
 ) -> Tuple[bool, str]:
     """
     Check if Gemini's bbox is GOOD and should be kept without refinement.
     
     A good bbox:
-    - Touches the expected corner edges (within epsilon)
+    - Is positioned in the correct corner region (not strict edge touching)
     - Has reasonable size (12-38% of frame width, 10-35% of height)
     - Has reasonable aspect ratio (1.2 to 2.4)
     
@@ -958,7 +957,6 @@ def is_gemini_bbox_good(
         corner: Expected corner ('top-left', 'top-right', etc.)
         video_width: Frame width
         video_height: Frame height
-        edge_epsilon: How close to edge counts as "touching" (pixels)
     
     Returns:
         Tuple of (is_good, reason)
@@ -974,6 +972,8 @@ def is_gemini_bbox_good(
     ar = w / h
     w_ratio = w / video_width
     h_ratio = h / video_height
+    right_edge = x + w
+    bottom_edge = y + h
     
     # Check aspect ratio (1.2 to 2.4 for typical webcams)
     if ar < 1.2 or ar > 2.4:
@@ -989,33 +989,70 @@ def is_gemini_bbox_good(
     if h_ratio > 0.35:
         return False, f"too tall ({h_ratio*100:.1f}% > 35%)"
     
-    # Check corner edge touching
-    right_edge = x + w
-    bottom_edge = y + h
+    # ============================================================
+    # LOOSER CORNER POSITION RULES (not strict edge touching)
+    # ============================================================
+    # For top-right: y near top, bbox in right portion of screen
+    # For top-left: y near top, bbox in left portion of screen
+    # These are looser than "must touch edge within 12px"
     
     if corner == 'top-right':
-        if y > edge_epsilon:
-            return False, f"not touching top (y={y} > {edge_epsilon})"
-        if right_edge < video_width - edge_epsilon:
-            return False, f"not touching right (right_edge={right_edge} < {video_width - edge_epsilon})"
+        # y must be near top (within 20px or 3% of height)
+        max_y = max(20, int(video_height * 0.03))
+        if y > max_y:
+            return False, f"not near top (y={y} > {max_y})"
+        
+        # bbox must start in right 45% of screen (x >= 55%)
+        min_x = int(video_width * 0.55)
+        if x < min_x:
+            return False, f"too far left (x={x} < {min_x})"
+        
+        # right edge must reach at least 80% of screen width
+        min_right = int(video_width * 0.80)
+        if right_edge < min_right:
+            return False, f"right edge too far from edge (right={right_edge} < {min_right})"
     
     elif corner == 'top-left':
-        if y > edge_epsilon:
-            return False, f"not touching top (y={y} > {edge_epsilon})"
-        if x > edge_epsilon:
-            return False, f"not touching left (x={x} > {edge_epsilon})"
+        max_y = max(20, int(video_height * 0.03))
+        if y > max_y:
+            return False, f"not near top (y={y} > {max_y})"
+        
+        # bbox must end in left 45% of screen (x+w <= 45%)
+        max_right = int(video_width * 0.45)
+        if right_edge > max_right:
+            return False, f"extends too far right (right={right_edge} > {max_right})"
+        
+        # x must start within left 20%
+        max_x = int(video_width * 0.20)
+        if x > max_x:
+            return False, f"too far from left edge (x={x} > {max_x})"
     
     elif corner == 'bottom-right':
-        if bottom_edge < video_height - edge_epsilon:
-            return False, f"not touching bottom"
-        if right_edge < video_width - edge_epsilon:
-            return False, f"not touching right"
+        # bottom edge must be near bottom (within 20px or 3% of height)
+        min_bottom = video_height - max(20, int(video_height * 0.03))
+        if bottom_edge < min_bottom:
+            return False, f"not near bottom"
+        
+        min_x = int(video_width * 0.55)
+        if x < min_x:
+            return False, f"too far left (x={x} < {min_x})"
+        
+        min_right = int(video_width * 0.80)
+        if right_edge < min_right:
+            return False, f"right edge too far from edge"
     
     elif corner == 'bottom-left':
-        if bottom_edge < video_height - edge_epsilon:
-            return False, f"not touching bottom"
-        if x > edge_epsilon:
-            return False, f"not touching left"
+        min_bottom = video_height - max(20, int(video_height * 0.03))
+        if bottom_edge < min_bottom:
+            return False, f"not near bottom"
+        
+        max_right = int(video_width * 0.45)
+        if right_edge > max_right:
+            return False, f"extends too far right"
+        
+        max_x = int(video_width * 0.20)
+        if x > max_x:
+            return False, f"too far from left edge"
     
     return True, f"good bbox: {w}x{h} ({w_ratio*100:.0f}%x{h_ratio*100:.0f}%), AR={ar:.2f}"
 
@@ -1335,6 +1372,11 @@ def detect_webcam_region(
                             
                             cam_x, cam_y, cam_w, cam_h = gemini_x, gemini_y, gemini_w, gemini_h
                             
+                            # Initialize variables that must always be defined
+                            refinement_method = "gemini"  # Default: use Gemini as-is
+                            detected_face = None
+                            is_suspicious = False
+                            
                             print(f"  📐 Gemini bbox: {gemini_w}x{gemini_h} at ({gemini_x},{gemini_y}), AR={gemini_ar:.2f}")
                             
                             # ============================================================
@@ -1345,9 +1387,7 @@ def detect_webcam_region(
                             if is_good:
                                 print(f"  ✅ Gemini bbox GOOD -> using Gemini: {good_reason}")
                                 refinement_method = "gemini-good"
-                                detected_face = None
-                                # Skip to padding (use smaller padding for good Gemini bbox)
-                                # Will be handled below
+                                # Skip refinement, use smaller padding
                             else:
                                 print(f"  ⚠️ Gemini bbox not good: {good_reason}")
                                 
@@ -1363,22 +1403,24 @@ def detect_webcam_region(
                             # REFINEMENT LOGIC (only if Gemini bbox is NOT good)
                             # ============================================================
                             if refinement_method != "gemini-good":
-                                # Load frame for refinement - try disk first, then extract from video
-                                frame_for_refine = cv2.imread(frame_path) if frame_path else None
-                                
-                                if frame_for_refine is None:
-                                    print(f"  📹 Frame not on disk, extracting from video...")
-                                    frame_for_refine = extract_frame(video_path, ts)
-                                
-                                detected_face = None
-                                refinement_method = None
-                                
-                                if frame_for_refine is not None:
-                                    # --------------------------------------------------------
-                                    # Strategy 1: Try contour/overlay-boundary refinement FIRST
-                                    # (more conservative than face-anchor)
-                                    # --------------------------------------------------------
-                                    if is_suspicious:
+                                # Only attempt refinement if bbox is SUSPICIOUS
+                                # If not good but also not suspicious, just use Gemini with normal padding
+                                if not is_suspicious:
+                                    print(f"  📐 Gemini bbox not suspicious, using as-is (with normal padding)")
+                                    refinement_method = "gemini"
+                                else:
+                                    # Load frame for refinement - try disk first, then extract from video
+                                    frame_for_refine = cv2.imread(frame_path) if frame_path else None
+                                    
+                                    if frame_for_refine is None:
+                                        print(f"  📹 Frame not on disk, extracting from video...")
+                                        frame_for_refine = extract_frame(video_path, ts)
+                                    
+                                    if frame_for_refine is not None:
+                                        # --------------------------------------------------------
+                                        # Strategy 1: Try contour/overlay-boundary refinement FIRST
+                                        # (more conservative than face-anchor)
+                                        # --------------------------------------------------------
                                         print(f"  🔬 Trying contour refinement first...")
                                         
                                         contour_bbox = run_multiframe_refinement(
@@ -1397,64 +1439,64 @@ def detect_webcam_region(
                                                 cam_w = contour_bbox['width']
                                                 cam_h = contour_bbox['height']
                                                 refinement_method = "contour"
-                                    
-                                    # --------------------------------------------------------
-                                    # Strategy 2: Face-anchor as LAST RESORT (with strict gates)
-                                    # --------------------------------------------------------
-                                    if refinement_method is None and is_suspicious:
-                                        print(f"  👤 Trying face-anchor as last resort...")
                                         
-                                        face_bbox, detected_face = refine_webcam_bbox_face_anchor(
-                                            frame_for_refine, position, width, height
-                                        )
-                                        
-                                        if face_bbox:
-                                            face_w = face_bbox['width']
-                                            face_h = face_bbox['height']
-                                            face_area = face_w * face_h
+                                        # --------------------------------------------------------
+                                        # Strategy 2: Face-anchor as LAST RESORT (with strict gates)
+                                        # --------------------------------------------------------
+                                        if refinement_method == "gemini":  # Still using default
+                                            print(f"  👤 Trying face-anchor as last resort...")
                                             
-                                            # STRICT GATE: Face-anchor cannot grow wildly compared to Gemini
-                                            # Reject if: width > gemini_w * 1.25 OR area > gemini_area * 1.4
-                                            if face_w > gemini_w * 1.25:
-                                                print(f"  ❌ Face-anchor REJECTED: width {face_w} > {gemini_w}*1.25 = {int(gemini_w*1.25)}")
-                                            elif face_area > gemini_area * 1.4:
-                                                print(f"  ❌ Face-anchor REJECTED: area {face_area} > {gemini_area}*1.4 = {int(gemini_area*1.4)}")
+                                            face_bbox, detected_face = refine_webcam_bbox_face_anchor(
+                                                frame_for_refine, position, width, height
+                                            )
+                                            
+                                            if face_bbox:
+                                                face_w = face_bbox['width']
+                                                face_h = face_bbox['height']
+                                                face_area = face_w * face_h
+                                                
+                                                # STRICT GATE: Face-anchor cannot grow wildly compared to Gemini
+                                                # Reject if: width > gemini_w * 1.25 OR area > gemini_area * 1.4
+                                                if face_w > gemini_w * 1.25:
+                                                    print(f"  ❌ Face-anchor REJECTED: width {face_w} > {gemini_w}*1.25 = {int(gemini_w*1.25)}")
+                                                elif face_area > gemini_area * 1.4:
+                                                    print(f"  ❌ Face-anchor REJECTED: area {face_area} > {gemini_area}*1.4 = {int(gemini_area*1.4)}")
+                                                else:
+                                                    # Face-anchor passed the gate
+                                                    print(f"  ✅ Face-anchor passed gate, using it")
+                                                    cam_x = face_bbox['x']
+                                                    cam_y = face_bbox['y']
+                                                    cam_w = face_bbox['width']
+                                                    cam_h = face_bbox['height']
+                                                    refinement_method = "face-anchor"
+                                        
+                                        # --------------------------------------------------------
+                                        # Fallback: Use Gemini bbox (with validation)
+                                        # --------------------------------------------------------
+                                        if refinement_method == "gemini":
+                                            print(f"  📐 Using Gemini bbox (refinements failed or rejected)")
+                                            cam_x, cam_y, cam_w, cam_h = gemini_x, gemini_y, gemini_w, gemini_h
+                                            refinement_method = "gemini-fallback"
+                                            
+                                            # Try to detect face for validation
+                                            roi_w = int(width * 0.55)
+                                            roi_h = int(height * 0.55)
+                                            
+                                            if position == 'top-left':
+                                                roi_x, roi_y = 0, 0
+                                            elif position == 'top-right':
+                                                roi_x, roi_y = width - roi_w, 0
+                                            elif position == 'bottom-left':
+                                                roi_x, roi_y = 0, height - roi_h
                                             else:
-                                                # Face-anchor passed the gate
-                                                print(f"  ✅ Face-anchor passed gate, using it")
-                                                cam_x = face_bbox['x']
-                                                cam_y = face_bbox['y']
-                                                cam_w = face_bbox['width']
-                                                cam_h = face_bbox['height']
-                                                refinement_method = "face-anchor"
-                                    
-                                    # --------------------------------------------------------
-                                    # Fallback: Use Gemini bbox (with validation)
-                                    # --------------------------------------------------------
-                                    if refinement_method is None:
-                                        print(f"  📐 Using Gemini bbox (refinements failed or rejected)")
-                                        cam_x, cam_y, cam_w, cam_h = gemini_x, gemini_y, gemini_w, gemini_h
-                                        refinement_method = "gemini-fallback"
-                                        
-                                        # Try to detect face for validation
-                                        roi_w = int(width * 0.55)
-                                        roi_h = int(height * 0.55)
-                                        
-                                        if position == 'top-left':
-                                            roi_x, roi_y = 0, 0
-                                        elif position == 'top-right':
-                                            roi_x, roi_y = width - roi_w, 0
-                                        elif position == 'bottom-left':
-                                            roi_x, roi_y = 0, height - roi_h
-                                        else:
-                                            roi_x, roi_y = width - roi_w, height - roi_h
-                                        
-                                        detected_face = detect_face_dnn(frame_for_refine, roi_x, roi_y, roi_w, roi_h)
-                                        if detected_face:
-                                            print(f"  👤 Face found: {detected_face.width}x{detected_face.height} at ({detected_face.x},{detected_face.y})")
-                                else:
-                                    print(f"  ⚠️ Could not load frame for refinement!")
-                                    refinement_method = "gemini-norefine"
+                                                roi_x, roi_y = width - roi_w, height - roi_h
+                                            
+                                            detected_face = detect_face_dnn(frame_for_refine, roi_x, roi_y, roi_w, roi_h)
+                                            if detected_face:
+                                                print(f"  👤 Face found: {detected_face.width}x{detected_face.height} at ({detected_face.x},{detected_face.y})")
+                                    else:
+                                        print(f"  ⚠️ Could not load frame for refinement!")
+                                        refinement_method = "gemini-norefine"
                             
                             # ============================================================
                             # HARD CONSTRAINTS ON FINAL BBOX
