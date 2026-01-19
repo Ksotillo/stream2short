@@ -265,8 +265,33 @@ def render_split_layout_video(
     # Calculate ADAPTIVE webcam height based on source size
     # Goal: avoid pixelation by limiting upscale, but ensure visibility
     
-    # Calculate what the webcam height would be at max_upscale
-    ideal_webcam_h = int(webcam_region.height * max_upscale)
+    # Get source dimensions
+    src_width, src_height = get_video_dimensions(input_path)
+    print(f"   Source video: {src_width}x{src_height}")
+    print(f"   Source webcam: {webcam_region.width}x{webcam_region.height}")
+    
+    # Calculate how much we'd need to scale to fill output width
+    width_scale_needed = width / webcam_region.width
+    
+    # Decision: scale or not?
+    # If webcam is already >60% of target width, minimal scaling looks better
+    webcam_width_ratio = webcam_region.width / width
+    
+    if webcam_width_ratio >= 0.6:
+        # Webcam is large - use minimal upscale (1.2x max)
+        effective_max_upscale = 1.2
+        print(f"   📐 Large webcam ({webcam_width_ratio*100:.0f}% of target width) - using minimal upscale")
+    elif webcam_width_ratio >= 0.4:
+        # Medium webcam - moderate upscale (1.5x max)
+        effective_max_upscale = 1.5
+        print(f"   📐 Medium webcam ({webcam_width_ratio*100:.0f}% of target width) - using moderate upscale")
+    else:
+        # Small webcam - allow full upscale
+        effective_max_upscale = max_upscale
+        print(f"   📐 Small webcam ({webcam_width_ratio*100:.0f}% of target width) - using standard upscale")
+    
+    # Calculate what the webcam height would be at effective_max_upscale
+    ideal_webcam_h = int(webcam_region.height * effective_max_upscale)
     
     # Convert to ratio of output height
     ideal_ratio = ideal_webcam_h / height
@@ -279,9 +304,8 @@ def render_split_layout_video(
     # Calculate actual upscale for logging
     actual_upscale = webcam_h / webcam_region.height
     
-    print(f"   Source webcam: {webcam_region.width}x{webcam_region.height}")
     print(f"   Adaptive layout: webcam={webcam_h}px ({webcam_ratio*100:.0f}%), content={content_h}px")
-    print(f"   Upscale factor: {actual_upscale:.1f}x (max allowed: {max_upscale}x)")
+    print(f"   Upscale factor: {actual_upscale:.1f}x (effective max: {effective_max_upscale}x)")
     
     # Get source video dimensions
     src_width, src_height = get_video_dimensions(input_path)
