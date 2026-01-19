@@ -262,23 +262,24 @@ def render_split_layout_video(
     print(f"🎬 Rendering split-layout video: {input_path} -> {output_path}")
     print(f"   Webcam region: {webcam_region}")
     
-    # EXACT FIT MODE: Take the exact webcam, scale to fit width, maintain aspect ratio
-    # No zoom, no padding, no cropping - just the exact webcam scaled to fit
+    # EXACT FIT MODE: Preserve the webcam's exact aspect ratio - NO CROPPING
+    # The webcam section height is calculated from the webcam's actual aspect ratio
     
     # Get source dimensions
     src_width, src_height = get_video_dimensions(input_path)
     print(f"   Source video: {src_width}x{src_height}")
     print(f"   Source webcam: {webcam_region.width}x{webcam_region.height}")
     
-    # Calculate webcam height to maintain EXACT aspect ratio when scaled to output width
-    # Formula: new_height = (original_height / original_width) * new_width
+    # Calculate webcam height that PRESERVES EXACT ASPECT RATIO when scaled to output width
+    # Formula: new_height = original_height * (new_width / original_width)
     webcam_aspect_ratio = webcam_region.height / webcam_region.width
     webcam_h = int(width * webcam_aspect_ratio)
     
-    # Ensure webcam section is within reasonable bounds (15% - 40% of output)
+    # Clamp to reasonable bounds (15% - 40% of output height)
     min_h = int(height * min_webcam_ratio)
     max_h = int(height * max_webcam_ratio)
     
+    original_webcam_h = webcam_h
     if webcam_h < min_h:
         print(f"   ⚠️ Webcam would be too small ({webcam_h}px), using minimum {min_h}px")
         webcam_h = min_h
@@ -288,12 +289,12 @@ def render_split_layout_video(
     
     content_h = height - webcam_h
     
-    # Calculate the actual scale factor
+    # Calculate scale factor
     scale_factor = width / webcam_region.width
     
-    print(f"   📐 EXACT FIT: webcam scaled {webcam_region.width}x{webcam_region.height} → {width}x{webcam_h}")
-    print(f"   Scale factor: {scale_factor:.2f}x (maintains aspect ratio)")
-    print(f"   Layout: webcam={webcam_h}px ({webcam_h/height*100:.0f}%), content={content_h}px ({content_h/height*100:.0f}%)")
+    print(f"   📐 EXACT FIT: {webcam_region.width}x{webcam_region.height} → {width}x{webcam_h}")
+    print(f"   Scale factor: {scale_factor:.2f}x")
+    print(f"   Layout: webcam={webcam_h}px ({webcam_h*100//height}%), content={content_h}px ({content_h*100//height}%)")
     
     # Check if subtitle file exists and has content
     use_subtitles = False
@@ -305,19 +306,19 @@ def render_split_layout_video(
     # Build complex filter graph
     # 
     # Input [0:v] splits into:
-    #   1. Webcam: crop EXACT region, scale to fit width (no additional cropping)
+    #   1. Webcam: crop exact region, scale to fit width (NO additional cropping!)
     #   2. Main content: scale to fill width, center crop for height
     # Then stack vertically
     
-    # Webcam: crop the EXACT detected region, scale to fit width exactly
-    # Using scale with explicit dimensions - no force_original_aspect_ratio to avoid cropping
+    # Webcam: crop the EXACT detected region, scale to EXACTLY fit width
+    # Using explicit dimensions - this preserves the webcam's full content
     webcam_filter = (
         f"[0:v]crop={webcam_region.width}:{webcam_region.height}:{webcam_region.x}:{webcam_region.y},"
         f"scale={width}:{webcam_h}:flags=lanczos[webcam]"
     )
     
-    # Main content: scale the full video to fit width, then center crop for height
-    # This shows the central gameplay area below the webcam
+    # Main content: exclude the webcam corner, scale and center crop
+    # We scale the full video to fit the content area, maintaining aspect ratio
     content_filter = (
         f"[0:v]scale={width}:{content_h}:force_original_aspect_ratio=increase:flags=lanczos,"
         f"crop={width}:{content_h}[content]"
