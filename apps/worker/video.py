@@ -283,7 +283,17 @@ def render_split_layout_video(
     cam_w = min(src_width - cam_x, webcam_region.width + 2 * pad_x)
     cam_h = min(src_height - cam_y, webcam_region.height + 2 * pad_y)
     
-    print(f"   Expanded bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y}) (+{margin*100:.0f}% margin)")
+    # Make all crop dimensions EVEN to prevent implicit padding with yuv420p
+    cam_x = even(cam_x)
+    cam_y = even(cam_y)
+    cam_w = even(cam_w)
+    cam_h = even(cam_h)
+    
+    # Re-clamp to bounds after snapping to even
+    cam_w = min(cam_w, even(src_width - cam_x))
+    cam_h = min(cam_h, even(src_height - cam_y))
+    
+    print(f"   Expanded bbox (even): {cam_w}x{cam_h} at ({cam_x},{cam_y}) (+{margin*100:.0f}% margin)")
     
     # ==========================================================================
     # STEP 2: Calculate native webcam height (preserves exact aspect ratio)
@@ -324,18 +334,23 @@ def render_split_layout_video(
         # ---------------------------------------------------------------------
         # BRANCH A: Native height fits - simple direct scale, no padding needed
         # The webcam aspect ratio matches exactly, so just scale to fill width
+        # Added setsar=1 to force square pixels and prevent pillarboxing
         # ---------------------------------------------------------------------
         webcam_filter = (
             f"[0:v]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},"
-            f"scale={width}:-2:flags=lanczos[webcam]"
+            f"setsar=1,"
+            f"scale={width}:-2:flags=lanczos,"
+            f"setsar=1[webcam]"
         )
         
         content_filter = (
-            f"[0:v]scale={width}:{content_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-            f"crop={width}:{content_h}[content]"
+            f"[0:v]setsar=1,"
+            f"scale={width}:{content_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={width}:{content_h},"
+            f"setsar=1[content]"
         )
         
-        stack_filter = "[webcam][content]vstack=inputs=2[stacked]"
+        stack_filter = "[webcam][content]vstack=inputs=2,setsar=1[stacked]"
         filter_parts = [webcam_filter, content_filter, stack_filter]
         
     else:
@@ -343,28 +358,32 @@ def render_split_layout_video(
         # BRANCH B: Clamped - use dimmed background (NO BLUR) + foreground overlay
         # Background: fills area (may crop) + dim/desaturate
         # Foreground: fits inside (never crops) + centered
+        # Added setsar=1 throughout to force square pixels
         # ---------------------------------------------------------------------
         split_filter = "[0:v]split=2[vw][vg]"
         
         webcam_filter = (
-            f"[vw]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},split=2[wbg][wfg];"
+            # Crop webcam and set square pixels, then split
+            f"[vw]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},setsar=1,split=2[wbg][wfg];"
             # Background: scale to FILL (may crop edges) + dim & desaturate (NO BLUR)
             f"[wbg]scale={width}:{webcam_h}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={width}:{webcam_h},"
-            f"eq=brightness=-0.25:saturation=0.5[bg];"
+            f"eq=brightness=-0.25:saturation=0.5,setsar=1[bg];"
             # Foreground: scale to FIT (never crops) + pad to exact size
             f"[wfg]scale={width}:{webcam_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
-            f"pad={width}:{webcam_h}:(ow-iw)/2:(oh-ih)/2:black[fg];"
+            f"pad={width}:{webcam_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[fg];"
             # Overlay foreground centered on dimmed background
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2[webcam]"
         )
         
         content_filter = (
-            f"[vg]scale={width}:{content_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-            f"crop={width}:{content_h}[content]"
+            f"[vg]setsar=1,"
+            f"scale={width}:{content_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={width}:{content_h},"
+            f"setsar=1[content]"
         )
         
-        stack_filter = "[webcam][content]vstack=inputs=2[stacked]"
+        stack_filter = "[webcam][content]vstack=inputs=2,setsar=1[stacked]"
         filter_parts = [split_filter, webcam_filter, content_filter, stack_filter]
     
     # Add subtitles if available (apply to final stacked output)
