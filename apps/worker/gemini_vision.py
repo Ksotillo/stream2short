@@ -72,23 +72,35 @@ def detect_webcam_with_gemini(frame_path: str, video_width: int, video_height: i
         with open(frame_path, 'rb') as f:
             image_bytes = f.read()
         
-        prompt = f"""Analyze this video game stream screenshot. The image is {video_width}x{video_height} pixels.
+        prompt = f"""You are analyzing a Twitch/YouTube gaming stream screenshot to find the STREAMER'S WEBCAM OVERLAY.
 
-Look for a WEBCAM OVERLAY showing the streamer's face/upper body. This is typically:
-- A rectangular area in a corner (usually top-left or top-right)
-- Shows a person (the streamer) 
-- Has different lighting/background than the game
-- May have a border or frame around it
+IMAGE SIZE: {video_width}x{video_height} pixels
 
-If you find a webcam overlay, respond with ONLY a JSON object like this:
-{{"found": true, "x": 0, "y": 0, "width": 320, "height": 180}}
+WHAT IS A WEBCAM OVERLAY?
+A webcam overlay is a small rectangular video feed showing a REAL HUMAN PERSON (the streamer) overlaid on top of the game. It is NOT part of the game graphics.
 
-Where x,y is the top-left corner position and width,height are the dimensions.
+HOW TO IDENTIFY THE WEBCAM:
+1. It shows a REAL PERSON's face/upper body - NOT a game character, NOT game graphics
+2. It's usually in one of the 4 corners (top-left, top-right, bottom-left, bottom-right)
+3. It has DIFFERENT LIGHTING than the game (real room lighting vs game lighting)
+4. It often has a border, frame, or green screen background
+5. The person is typically looking at camera or at their screen
+6. Common sizes: 200-500 pixels wide, 150-350 pixels tall
+7. It looks like a "picture-in-picture" video of a real human
 
-If there is NO webcam overlay visible, respond with:
-{{"found": false}}
+WHAT IS NOT A WEBCAM:
+- Game UI elements (health bars, minimaps, inventory)
+- Game characters or NPCs
+- In-game cutscenes showing characters
+- Dark/shadowy areas of the game
+- Ceilings, floors, walls from the game
 
-IMPORTANT: Respond with ONLY the JSON, no other text."""
+YOUR TASK:
+Find the rectangular bounding box of the webcam overlay showing the REAL HUMAN STREAMER.
+
+RESPOND WITH ONLY THIS JSON (no other text):
+If webcam found: {{"found": true, "x": <left_edge_pixels>, "y": <top_edge_pixels>, "width": <width_pixels>, "height": <height_pixels>}}
+If NO webcam: {{"found": false, "reason": "<why no webcam detected>"}}"""
 
         # Try models in order of preference (free tier)
         models_to_try = [
@@ -137,13 +149,14 @@ IMPORTANT: Respond with ONLY the JSON, no other text."""
                                     'height': height
                                 }
                             else:
-                                print(f"⚠️ Gemini webcam bounds exceed video dimensions, ignoring")
+                                print(f"⚠️ Gemini webcam bounds invalid: x={x}, y={y}, w={width}, h={height} (video: {video_width}x{video_height})")
                         else:
-                            print(f"⚠️ Gemini webcam too small or invalid position")
+                            print(f"⚠️ Gemini webcam too small: x={x}, y={y}, w={width}, h={height}")
                     else:
-                        print("ℹ️ Gemini: No webcam overlay detected in frame")
+                        reason = result.get('reason', 'unknown')
+                        print(f"ℹ️ Gemini: No webcam found. Reason: {reason}")
                 else:
-                    print(f"⚠️ Could not parse Gemini response: {response_text[:200]}")
+                    print(f"⚠️ Could not parse Gemini response: {response_text[:300]}")
                 
                 return None  # Model worked but no webcam found
                 
