@@ -30,6 +30,24 @@ def get_gemini_client():
     return _client
 
 
+def list_available_models():
+    """List models available for your API key (for debugging)."""
+    client = get_gemini_client()
+    if not client:
+        return []
+    
+    try:
+        models = []
+        for m in client.models.list():
+            if hasattr(m, 'supported_actions') and m.supported_actions:
+                if "generateContent" in m.supported_actions:
+                    models.append(m.name)
+        return models
+    except Exception as e:
+        print(f"⚠️ Could not list models: {e}")
+        return []
+
+
 def detect_webcam_with_gemini(frame_path: str, video_width: int, video_height: int) -> Optional[Dict[str, int]]:
     """
     Use Gemini to detect the webcam overlay in a video frame.
@@ -48,6 +66,8 @@ def detect_webcam_with_gemini(frame_path: str, video_width: int, video_height: i
         return None
     
     try:
+        from google.genai import types
+        
         # Read the image file
         with open(frame_path, 'rb') as f:
             image_bytes = f.read()
@@ -70,54 +90,80 @@ If there is NO webcam overlay visible, respond with:
 
 IMPORTANT: Respond with ONLY the JSON, no other text."""
 
-        # Upload image and generate content
-        from google.genai import types
+        # Try models in order of preference (free tier)
+        models_to_try = [
+            "gemini-2.0-flash-lite",  # Free tier, fast
+            "gemini-1.5-flash",       # Free tier fallback
+        ]
         
-        response = client.models.generate_content(
-            model="gemini-1.5-flash-8b",  # Free tier model
-            contents=[
-                types.Content(
-                    parts=[
+        last_error = None
+        for model_name in models_to_try:
+            try:
+                print(f"  🤖 Trying model: {model_name}")
+                
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
                         types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                         types.Part.from_text(text=prompt),
-                    ]
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                    ),
                 )
-            ]
-        )
-        
-        # Parse response
-        response_text = response.text.strip()
-        
-        # Try to extract JSON from response
-        json_match = re.search(r'\{[^}]+\}', response_text)
-        if json_match:
-            result = json.loads(json_match.group())
-            
-            if result.get('found'):
-                x = int(result.get('x', 0))
-                y = int(result.get('y', 0))
-                width = int(result.get('width', 0))
-                height = int(result.get('height', 0))
                 
-                # Validate bounds
-                if width > 50 and height > 50 and x >= 0 and y >= 0:
-                    if x + width <= video_width and y + height <= video_height:
-                        print(f"✅ Gemini detected webcam: x={x}, y={y}, w={width}, h={height}")
-                        return {
-                            'x': x,
-                            'y': y,
-                            'width': width,
-                            'height': height
-                        }
+                # If we got here, the model worked
+                response_text = response.text.strip()
+                
+                # Try to extract JSON from response
+                json_match = re.search(r'\{[^}]+\}', response_text)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    
+                    if result.get('found'):
+                        x = int(result.get('x', 0))
+                        y = int(result.get('y', 0))
+                        width = int(result.get('width', 0))
+                        height = int(result.get('height', 0))
+                        
+                        # Validate bounds
+                        if width > 50 and height > 50 and x >= 0 and y >= 0:
+                            if x + width <= video_width and y + height <= video_height:
+                                print(f"✅ Gemini detected webcam: x={x}, y={y}, w={width}, h={height}")
+                                return {
+                                    'x': x,
+                                    'y': y,
+                                    'width': width,
+                                    'height': height
+                                }
+                            else:
+                                print(f"⚠️ Gemini webcam bounds exceed video dimensions, ignoring")
+                        else:
+                            print(f"⚠️ Gemini webcam too small or invalid position")
                     else:
-                        print(f"⚠️ Gemini webcam bounds exceed video dimensions, ignoring")
+                        print("ℹ️ Gemini: No webcam overlay detected in frame")
                 else:
-                    print(f"⚠️ Gemini webcam too small or invalid position")
-            else:
-                print("ℹ️ Gemini: No webcam overlay detected in frame")
-        else:
-            print(f"⚠️ Could not parse Gemini response: {response_text[:200]}")
+                    print(f"⚠️ Could not parse Gemini response: {response_text[:200]}")
+                
+                return None  # Model worked but no webcam found
+                
+            except Exception as model_error:
+                last_error = model_error
+                error_str = str(model_error)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    print(f"  ⚠️ {model_name}: Rate limited, trying next model...")
+                    continue
+                elif "404" in error_str or "not found" in error_str.lower():
+                    print(f"  ⚠️ {model_name}: Model not available, trying next...")
+                    continue
+                else:
+                    # Different error, might be worth reporting
+                    print(f"  ⚠️ {model_name} error: {error_str[:100]}")
+                    continue
         
+        # All models failed
+        print(f"⚠️ All Gemini models failed. Last error: {last_error}")
+        print("💡 Check your Google AI Studio project quota at https://ai.google.dev/")
         return None
         
     except Exception as e:
