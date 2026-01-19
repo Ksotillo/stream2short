@@ -269,9 +269,11 @@ def render_split_layout_video(
     # Get source dimensions
     src_width, src_height = get_video_dimensions(input_path)
     print(f"   Source video: {src_width}x{src_height}")
-    print(f"   Source webcam: {webcam_region.width}x{webcam_region.height}")
+    print(f"   Original webcam: {webcam_region.width}x{webcam_region.height} at ({webcam_region.x},{webcam_region.y})")
     
-    # Add padding around detected webcam to avoid tight cropping (8% margin)
+    # ==========================================================================
+    # STEP 1: Expand detected bbox by 8% margin to avoid tight crops
+    # ==========================================================================
     margin = 0.08
     pad_x = int(webcam_region.width * margin)
     pad_y = int(webcam_region.height * margin)
@@ -281,20 +283,31 @@ def render_split_layout_video(
     cam_w = min(src_width - cam_x, webcam_region.width + 2 * pad_x)
     cam_h = min(src_height - cam_y, webcam_region.height + 2 * pad_y)
     
-    print(f"   Padded webcam: {cam_w}x{cam_h} at ({cam_x},{cam_y}) (+{margin*100:.0f}% margin)")
+    print(f"   Expanded bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y}) (+{margin*100:.0f}% margin)")
     
-    # Calculate webcam section height based on aspect ratio
-    webcam_aspect_ratio = cam_h / cam_w
-    ideal_webcam_h = int(width * webcam_aspect_ratio)
+    # ==========================================================================
+    # STEP 2: Calculate native webcam height (preserves exact aspect ratio)
+    # ==========================================================================
+    native_webcam_h = even(round(width * (cam_h / cam_w)))
     
-    # Clamp to reasonable bounds (15% - 40% of output height)
-    min_h = int(height * min_webcam_ratio)
-    max_h = int(height * max_webcam_ratio)
+    # Define bounds
+    min_h = even(int(height * min_webcam_ratio))  # 15% = 288px
+    max_h = even(int(height * max_webcam_ratio))  # 35% = 672px
     
-    webcam_h = even(max(min_h, min(max_h, ideal_webcam_h)))
+    # Check if native height fits within bounds
+    clamped = False
+    if min_h <= native_webcam_h <= max_h:
+        webcam_h = native_webcam_h
+        print(f"   ✅ Native height {native_webcam_h}px fits bounds [{min_h}-{max_h}] - using BRANCH A (direct scale)")
+    else:
+        clamped = True
+        webcam_h = even(max(min_h, min(max_h, native_webcam_h)))
+        print(f"   ⚠️ Native height {native_webcam_h}px outside bounds [{min_h}-{max_h}] - clamped to {webcam_h}px")
+        print(f"   Using BRANCH B (dimmed background fill)")
+    
     content_h = even(height - webcam_h)
     
-    print(f"   Layout: webcam={webcam_h}px ({webcam_h*100//height}%), content={content_h}px")
+    print(f"   Final layout: webcam={webcam_h}px ({webcam_h*100//height}%), content={content_h}px ({content_h*100//height}%)")
     
     # Check if subtitle file exists and has content
     use_subtitles = False
@@ -303,42 +316,56 @@ def render_split_layout_video(
         if file_size > 10:
             use_subtitles = True
     
-    # Build complex filter graph using BLUR BACKGROUND technique:
-    # - Webcam foreground: scale to FIT (decrease) - NEVER crops, preserves full webcam
-    # - Webcam background: scale to FILL (increase) + crop + blur - fills empty space
-    # - This avoids both cropping AND black bars
+    # ==========================================================================
+    # STEP 3: Build filter_complex based on whether we're clamped or not
+    # ==========================================================================
     
-    # Split input for webcam and content
-    split_filter = "[0:v]split=2[vwebcam][vcontent]"
-    
-    # Webcam processing:
-    # 1. Crop the padded webcam region
-    # 2. Split into background and foreground
-    # 3. Background: fill + crop + blur (fills extra space)
-    # 4. Foreground: fit inside (no crop!) 
-    # 5. Overlay foreground on blurred background
-    webcam_filter = (
-        f"[vwebcam]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},split=2[wbg][wfg];"
-        # Background: scale to fill, crop to fit, blur heavily
-        f"[wbg]scale={width}:{webcam_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-        f"crop={width}:{webcam_h},gblur=sigma=25[bg];"
-        # Foreground: scale to fit INSIDE (never crops!), center it
-        f"[wfg]scale={width}:{webcam_h}:force_original_aspect_ratio=decrease:flags=lanczos[fg];"
-        # Overlay foreground centered on blurred background
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[webcam]"
-    )
-    
-    # Main content: scale to fill width, center crop for height
-    content_filter = (
-        f"[vcontent]scale={width}:{content_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-        f"crop={width}:{content_h}[content]"
-    )
-    
-    # Stack vertically: webcam on top, content below
-    stack_filter = "[webcam][content]vstack=inputs=2[stacked]"
-    
-    # Combine all filters
-    filter_parts = [split_filter, webcam_filter, content_filter, stack_filter]
+    if not clamped:
+        # ---------------------------------------------------------------------
+        # BRANCH A: Native height fits - simple direct scale, no padding needed
+        # The webcam aspect ratio matches exactly, so just scale to fill width
+        # ---------------------------------------------------------------------
+        webcam_filter = (
+            f"[0:v]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},"
+            f"scale={width}:-2:flags=lanczos[webcam]"
+        )
+        
+        content_filter = (
+            f"[0:v]scale={width}:{content_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={width}:{content_h}[content]"
+        )
+        
+        stack_filter = "[webcam][content]vstack=inputs=2[stacked]"
+        filter_parts = [webcam_filter, content_filter, stack_filter]
+        
+    else:
+        # ---------------------------------------------------------------------
+        # BRANCH B: Clamped - use dimmed background (NO BLUR) + foreground overlay
+        # Background: fills area (may crop) + dim/desaturate
+        # Foreground: fits inside (never crops) + centered
+        # ---------------------------------------------------------------------
+        split_filter = "[0:v]split=2[vw][vg]"
+        
+        webcam_filter = (
+            f"[vw]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},split=2[wbg][wfg];"
+            # Background: scale to FILL (may crop edges) + dim & desaturate (NO BLUR)
+            f"[wbg]scale={width}:{webcam_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={width}:{webcam_h},"
+            f"eq=brightness=-0.25:saturation=0.5[bg];"
+            # Foreground: scale to FIT (never crops) + pad to exact size
+            f"[wfg]scale={width}:{webcam_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"pad={width}:{webcam_h}:(ow-iw)/2:(oh-ih)/2:black[fg];"
+            # Overlay foreground centered on dimmed background
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[webcam]"
+        )
+        
+        content_filter = (
+            f"[vg]scale={width}:{content_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={width}:{content_h}[content]"
+        )
+        
+        stack_filter = "[webcam][content]vstack=inputs=2[stacked]"
+        filter_parts = [split_filter, webcam_filter, content_filter, stack_filter]
     
     # Add subtitles if available (apply to final stacked output)
     if use_subtitles:
