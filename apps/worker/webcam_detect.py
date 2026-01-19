@@ -280,6 +280,57 @@ def bbox_contains_face(
     )
 
 
+def check_guardrails(
+    bbox: Dict[str, int],
+    corner: str,
+    video_width: int,
+    video_height: int,
+    center_band_ratio: float = 0.45,
+) -> Tuple[bool, str]:
+    """
+    Check if a bbox violates geometric guardrails (extends too far into center).
+    
+    Webcam overlays should stay in their corner and not extend into gameplay area.
+    
+    Args:
+        bbox: Dict with x, y, width, height
+        corner: Which corner the webcam should be in
+        video_width: Video width
+        video_height: Video height
+        center_band_ratio: How far from edge webcam can extend (0.45 = 45% of frame)
+    
+    Returns:
+        Tuple of (passes_guardrail, reason)
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    
+    # Calculate bounds
+    center_x_limit = int(video_width * center_band_ratio)
+    center_y_limit = int(video_height * center_band_ratio)
+    
+    if corner == 'top-right':
+        # Webcam must stay in right portion: x >= center_x_limit
+        if x < center_x_limit:
+            return False, f"extends too far left (x={x} < {center_x_limit})"
+    
+    elif corner == 'top-left':
+        # Webcam must stay in left portion: x + w <= (1 - center_band_ratio) * width
+        max_right = int(video_width * (1 - center_band_ratio))
+        if x + w > max_right:
+            return False, f"extends too far right (x+w={x+w} > {max_right})"
+    
+    elif corner == 'bottom-right':
+        if x < center_x_limit:
+            return False, f"extends too far left (x={x} < {center_x_limit})"
+    
+    elif corner == 'bottom-left':
+        max_right = int(video_width * (1 - center_band_ratio))
+        if x + w > max_right:
+            return False, f"extends too far right (x+w={x+w} > {max_right})"
+    
+    return True, "OK"
+
+
 def refine_webcam_bbox_face_anchor(
     frame_bgr: np.ndarray,
     corner: str,
@@ -342,6 +393,8 @@ def refine_webcam_bbox_face_anchor(
     edges = cv2.Canny(gray, 50, 150)
     
     candidates = []
+    rejected_face = 0
+    rejected_guardrail = 0
     
     for ar in aspect_ratios:
         for scale in scale_factors:
@@ -371,14 +424,26 @@ def refine_webcam_bbox_face_anchor(
             cand_x = max(0, min(cand_x, roi_w - cand_w))
             cand_y = max(0, min(cand_y, roi_h - cand_h))
             
-            # HARD CONSTRAINT: Must contain the face with margin
+            # Full-frame coordinates
+            full_x = roi_x + cand_x
+            full_y = roi_y + cand_y
+            
             temp_bbox = {
-                'x': roi_x + cand_x,
-                'y': roi_y + cand_y,
+                'x': full_x,
+                'y': full_y,
                 'width': cand_w,
                 'height': cand_h
             }
+            
+            # CONSTRAINT 1: Must contain the face with margin
             if not bbox_contains_face(temp_bbox, face, margin_ratio=0.05):
+                rejected_face += 1
+                continue
+            
+            # CONSTRAINT 2: Guardrails - must not extend into center (gameplay area)
+            passes_guardrail, _ = check_guardrails(temp_bbox, corner, video_width, video_height)
+            if not passes_guardrail:
+                rejected_guardrail += 1
                 continue
             
             # Score the candidate
@@ -389,8 +454,8 @@ def refine_webcam_bbox_face_anchor(
             )
             
             candidates.append({
-                'x': roi_x + cand_x,
-                'y': roi_y + cand_y,
+                'x': full_x,
+                'y': full_y,
                 'width': cand_w,
                 'height': cand_h,
                 'ar': ar,
@@ -399,8 +464,10 @@ def refine_webcam_bbox_face_anchor(
                 'corner': corner
             })
     
+    print(f"  📊 Candidates: {len(candidates)} valid, {rejected_face} rejected (no face), {rejected_guardrail} rejected (guardrails)")
+    
     if not candidates:
-        print(f"  ⚠️ No valid webcam candidates contain the face")
+        print(f"  ⚠️ No valid webcam candidates found")
         return None, face
     
     # Sort by score and pick best
@@ -1161,12 +1228,8 @@ def detect_webcam_region(
                 if extract_frame_for_analysis(video_path, frame_path, timestamp=ts):
                     result = detect_webcam_with_gemini(frame_path, width, height)
                     
-                    # Clean up frame
-                    try:
-                        import os
-                        os.remove(frame_path)
-                    except:
-                        pass
+                    # DON'T DELETE FRAME YET - we need it for refinement!
+                    # It will be cleaned up after refinement or at the end
                     
                     if result:
                         if result.get('no_webcam_confirmed'):
@@ -1229,8 +1292,13 @@ def detect_webcam_region(
                             if is_suspicious:
                                 print(f"  ⚠️ Gemini bbox suspicious: {suspicious_reason}")
                             
-                            # Load frame for refinement
-                            frame_for_refine = cv2.imread(frame_path)
+                            # Load frame for refinement - try disk first, then extract from video
+                            frame_for_refine = cv2.imread(frame_path) if frame_path else None
+                            
+                            if frame_for_refine is None:
+                                print(f"  📹 Frame not on disk, extracting from video...")
+                                frame_for_refine = extract_frame(video_path, ts)
+                            
                             detected_face = None
                             refinement_method = None
                             
@@ -1259,12 +1327,21 @@ def detect_webcam_region(
                                         )
                                         
                                         if refined_bbox:
-                                            # HARD CONSTRAINT: If we detected a face earlier,
-                                            # the contour bbox MUST contain it
+                                            # HARD CONSTRAINT 1: If we detected a face, bbox MUST contain it
                                             if detected_face and not bbox_contains_face(refined_bbox, detected_face, margin_ratio=0.05):
                                                 print(f"  ❌ Contour bbox doesn't contain face! Rejecting.")
                                                 refined_bbox = None
-                                            else:
+                                            
+                                            # HARD CONSTRAINT 2: Guardrails - must not extend into gameplay
+                                            if refined_bbox:
+                                                passes_guardrail, guardrail_reason = check_guardrails(
+                                                    refined_bbox, position, width, height
+                                                )
+                                                if not passes_guardrail:
+                                                    print(f"  ❌ Contour bbox fails guardrails: {guardrail_reason}! Rejecting.")
+                                                    refined_bbox = None
+                                            
+                                            if refined_bbox:
                                                 print(f"  ✅ Using CONTOUR-refined bbox")
                                                 cam_x = refined_bbox['x']
                                                 cam_y = refined_bbox['y']
@@ -1284,19 +1361,48 @@ def detect_webcam_region(
                                             cam_h = fallback['height']
                                             refinement_method = "fallback"
                                     else:
-                                        # Gemini bbox looks valid, but let's verify it contains face
-                                        print(f"  ✅ Gemini bbox looks valid")
+                                        # Gemini bbox looks valid, but let's detect face for constraint validation
+                                        print(f"  ✅ Gemini bbox looks valid, checking for face...")
+                                        
+                                        # Detect face in the corner ROI to validate
+                                        roi_w = int(width * 0.55)
+                                        roi_h = int(height * 0.55)
+                                        
+                                        if position == 'top-left':
+                                            roi_x, roi_y = 0, 0
+                                        elif position == 'top-right':
+                                            roi_x, roi_y = width - roi_w, 0
+                                        elif position == 'bottom-left':
+                                            roi_x, roi_y = 0, height - roi_h
+                                        elif position == 'bottom-right':
+                                            roi_x, roi_y = width - roi_w, height - roi_h
+                                        else:
+                                            roi_x, roi_y = 0, 0
+                                        
+                                        detected_face = detect_face_dnn(frame_for_refine, roi_x, roi_y, roi_w, roi_h)
+                                        
+                                        if detected_face:
+                                            print(f"  👤 Face found for validation: {detected_face.width}x{detected_face.height} at ({detected_face.x},{detected_face.y})")
+                                        else:
+                                            print(f"  ⚠️ No face detected - proceeding with Gemini bbox (lower confidence)")
+                                        
                                         refinement_method = "gemini"
+                            else:
+                                print(f"  ⚠️ Could not load frame for refinement!")
+                                refinement_method = "gemini-norefine"
                             
                             # ============================================================
-                            # HARD CONSTRAINT: Final bbox MUST contain detected face
+                            # HARD CONSTRAINTS ON FINAL BBOX
+                            # 1. Must contain detected face (if any)
+                            # 2. Must pass guardrails (not extend into gameplay)
                             # ============================================================
+                            final_bbox_check = {
+                                'x': cam_x, 'y': cam_y,
+                                'width': cam_w, 'height': cam_h
+                            }
+                            
+                            # Constraint 1: Face containment
                             if detected_face:
-                                final_bbox_check = {
-                                    'x': cam_x, 'y': cam_y,
-                                    'width': cam_w, 'height': cam_h
-                                }
-                                
                                 if not bbox_contains_face(final_bbox_check, detected_face, margin_ratio=0.05):
                                     print(f"  ❌ HARD CONSTRAINT FAILED: bbox doesn't contain face!")
                                     print(f"     Face: ({detected_face.x},{detected_face.y}) {detected_face.width}x{detected_face.height}")
@@ -1314,16 +1420,51 @@ def detect_webcam_region(
                                     cam_x = detected_face.center_x - cam_w // 2
                                     cam_y = detected_face.center_y - int(cam_h * 0.35)
                                     
-                                    # Clamp to video bounds
-                                    cam_x = max(0, min(cam_x, width - cam_w))
-                                    cam_y = max(0, min(cam_y, height - cam_h))
-                                    cam_w = min(cam_w, width - cam_x)
-                                    cam_h = min(cam_h, height - cam_y)
-                                    
                                     refinement_method = "face-forced"
-                                    print(f"  ✅ Forced bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
                             
+                            # Constraint 2: Guardrails
+                            final_bbox_check = {
+                                'x': cam_x, 'y': cam_y,
+                                'width': cam_w, 'height': cam_h
+                            }
+                            passes_guardrail, guardrail_reason = check_guardrails(
+                                final_bbox_check, position, width, height
+                            )
+                            
+                            if not passes_guardrail:
+                                print(f"  ⚠️ Final bbox fails guardrails: {guardrail_reason}")
+                                print(f"  🔧 Clamping to corner band...")
+                                
+                                # Clamp to corner band (45% from edge)
+                                center_limit = int(width * 0.45)
+                                
+                                if position in ['top-right', 'bottom-right']:
+                                    # Right side: ensure x >= center_limit
+                                    if cam_x < center_limit:
+                                        old_x = cam_x
+                                        cam_w = cam_x + cam_w - center_limit
+                                        cam_x = center_limit
+                                        print(f"     Clamped: x {old_x} -> {cam_x}, w -> {cam_w}")
+                                else:
+                                    # Left side: ensure x + w <= width - center_limit
+                                    max_right = width - center_limit
+                                    if cam_x + cam_w > max_right:
+                                        cam_w = max_right - cam_x
+                                        print(f"     Clamped: w -> {cam_w}")
+                                
+                                if refinement_method not in ["face-forced"]:
+                                    refinement_method = f"{refinement_method}-clamped"
+                            
+                            # Clamp to video bounds
+                            cam_x = max(0, min(cam_x, width - cam_w))
+                            cam_y = max(0, min(cam_y, height - cam_h))
+                            cam_w = min(cam_w, width - cam_x)
+                            cam_h = min(cam_h, height - cam_y)
+                            
+                            # Log final result
                             print(f"  📋 Refinement method: {refinement_method}")
+                            if detected_face:
+                                print(f"  👤 Face detected: ({detected_face.x},{detected_face.y}) {detected_face.width}x{detected_face.height}")
                             
                             # ============================================================
                             # APPLY PADDING (after refinement/fallback)
@@ -1373,6 +1514,14 @@ def detect_webcam_region(
                                 frame_path, debug_frame_path,
                                 new_x, new_y, new_w, new_h
                             )
+                            
+                            # Clean up the frame file now that we're done
+                            try:
+                                import os
+                                if frame_path and os.path.exists(frame_path):
+                                    os.remove(frame_path)
+                            except:
+                                pass
                             
                             return WebcamRegion(
                                 x=new_x,
