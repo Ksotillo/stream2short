@@ -103,13 +103,20 @@ If you find a webcam, give the EXACT pixel coordinates of its bounding box:
 - width = webcam rectangle width in pixels
 - height = webcam rectangle height in pixels
 
-EXAMPLE: If webcam is in TOP-RIGHT corner of a 1920x1080 video:
-- A 400x300 webcam starting at x=1520, y=0 would be: {{"found": true, "corner": "top-right", "x": 1520, "y": 0, "width": 400, "height": 300}}
+EXAMPLES for a 1920x1080 video:
+- TOP-LEFT webcam (400x300): x=0, y=0 → {{"found": true, "corner": "top-left", "x": 0, "y": 0, "width": 400, "height": 300}}
+- TOP-RIGHT webcam (400x300): x=1520, y=0 → {{"found": true, "corner": "top-right", "x": 1520, "y": 0, "width": 400, "height": 300}}
+  (Note: 1920-400=1520, so x=1520 means it touches the RIGHT edge)
+
+VERIFICATION:
+- For TOP-RIGHT: x + width should equal {video_width} (or be very close)
+- For TOP-LEFT: x should be 0 (or very close)
+- For BOTTOM: y + height should equal {video_height} (or be very close)
 
 RESPOND WITH ONLY JSON:
 {{"found": true, "corner": "<which corner>", "x": <number>, "y": <number>, "width": <number>, "height": <number>}}
 OR
-{{"found": false, "reason": "<what you see instead of a webcam>"}}"""
+{{"found": false, "reason": "<describe what you see in the corners>"}}"""
 
         # Try models in order of preference (free tier)
         models_to_try = [
@@ -153,6 +160,28 @@ OR
                         corner = result.get('corner', 'unknown')
                         
                         print(f"  📍 Webcam at {corner}: x={x}, y={y}, w={width}, h={height}")
+                        
+                        # Sanity check: verify coordinates match the stated corner
+                        if corner == 'top-right':
+                            expected_x = video_width - width
+                            if abs(x - expected_x) > 100:  # More than 100px off
+                                print(f"  ⚠️ WARNING: top-right webcam x={x}, but expected x≈{expected_x}")
+                                print(f"     Adjusting x from {x} to {expected_x}")
+                                x = expected_x
+                        elif corner == 'top-left':
+                            if x > 100:  # Should be near 0
+                                print(f"  ⚠️ WARNING: top-left webcam x={x}, but expected x≈0")
+                                print(f"     Adjusting x from {x} to 0")
+                                x = 0
+                        elif corner == 'bottom-right':
+                            expected_x = video_width - width
+                            if abs(x - expected_x) > 100:
+                                print(f"  ⚠️ WARNING: bottom-right webcam x={x}, adjusting to {expected_x}")
+                                x = expected_x
+                        elif corner == 'bottom-left':
+                            if x > 100:
+                                print(f"  ⚠️ WARNING: bottom-left webcam x={x}, adjusting to 0")
+                                x = 0
                         
                         # Validate bounds
                         if width > 50 and height > 50 and x >= 0 and y >= 0:
