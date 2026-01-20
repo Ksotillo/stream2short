@@ -368,6 +368,119 @@ def compute_iou(box1: BBoxCandidate, box2: BBoxCandidate) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def compute_iou_dict(box1: Dict[str, int], box2: Dict[str, int]) -> float:
+    """
+    Compute Intersection over Union between two dict bounding boxes.
+    
+    Args:
+        box1: Dict with x, y, width, height
+        box2: Dict with x, y, width, height
+        
+    Returns:
+        IoU value (0.0 to 1.0)
+    """
+    x1 = max(box1['x'], box2['x'])
+    y1 = max(box1['y'], box2['y'])
+    x2 = min(box1['x'] + box1['width'], box2['x'] + box2['width'])
+    y2 = min(box1['y'] + box1['height'], box2['y'] + box2['height'])
+    
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    
+    intersection = (x2 - x1) * (y2 - y1)
+    area1 = box1['width'] * box1['height']
+    area2 = box2['width'] * box2['height']
+    union = area1 + area2 - intersection
+    
+    return intersection / union if union > 0 else 0.0
+
+
+def check_corner_proximity(
+    bbox: Dict[str, int],
+    corner: str,
+    video_width: int,
+    video_height: int,
+    max_inset_ratio: float = 0.06,
+) -> Tuple[bool, str]:
+    """
+    Check if a bbox is properly positioned near its expected corner.
+    
+    Webcam overlays should be close to their corner edges. This prevents
+    selecting HUD elements like minimaps that are elsewhere on screen.
+    
+    Args:
+        bbox: Dict with x, y, width, height
+        corner: Expected corner ('top-left', 'top-right', etc.)
+        video_width: Video width
+        video_height: Video height
+        max_inset_ratio: Max distance from edge as ratio (0.06 = 6%)
+        
+    Returns:
+        Tuple of (is_near_corner, reason)
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    
+    # Calculate max inset in pixels (6% of smaller dimension)
+    max_inset = int(max_inset_ratio * min(video_width, video_height))
+    
+    right_edge = x + w
+    bottom_edge = y + h
+    
+    if corner == 'top-left':
+        # Top edge and left edge should be near origin
+        if x > max_inset and y > max_inset:
+            return False, f"top-left: neither edge near corner (x={x}, y={y}, max_inset={max_inset})"
+        if y > max_inset * 3:  # Allow some x offset but y must be near top
+            return False, f"top-left: too far from top (y={y})"
+    
+    elif corner == 'top-right':
+        # Top edge and right edge should be near expected positions
+        if right_edge < (video_width - max_inset) and y > max_inset:
+            return False, f"top-right: neither edge near corner (right={right_edge}, y={y})"
+        if y > max_inset * 3:
+            return False, f"top-right: too far from top (y={y})"
+    
+    elif corner == 'bottom-left':
+        if x > max_inset and bottom_edge < (video_height - max_inset):
+            return False, f"bottom-left: neither edge near corner"
+        if bottom_edge < (video_height - max_inset * 3):
+            return False, f"bottom-left: too far from bottom"
+    
+    elif corner == 'bottom-right':
+        if right_edge < (video_width - max_inset) and bottom_edge < (video_height - max_inset):
+            return False, f"bottom-right: neither edge near corner"
+        if bottom_edge < (video_height - max_inset * 3):
+            return False, f"bottom-right: too far from bottom"
+    
+    return True, "near expected corner"
+
+
+def convert_numpy_to_python(obj):
+    """
+    Recursively convert numpy types to Python native types for JSON serialization.
+    
+    Args:
+        obj: Object to convert (can be dict, list, numpy type, or primitive)
+        
+    Returns:
+        Object with all numpy types converted to Python types
+    """
+    if isinstance(obj, dict):
+        return {k: convert_numpy_to_python(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_to_python(item) for item in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    else:
+        return obj
+
+
 # =============================================================================
 # DNN FACE DETECTION
 # =============================================================================
@@ -1696,6 +1809,12 @@ def detect_webcam_region(
                             # ============================================================
                             # REFINEMENT LOGIC (only if Gemini bbox is NOT good)
                             # ============================================================
+                            # Store Gemini bbox for IoU gate checking later
+                            gemini_bbox_for_iou = {
+                                'x': gemini_x, 'y': gemini_y,
+                                'width': gemini_w, 'height': gemini_h
+                            }
+                            
                             if refinement_method != "gemini-good":
                                 # Only attempt refinement if bbox is SUSPICIOUS
                                 # If not good but also not suspicious, just use Gemini with normal padding
@@ -1712,52 +1831,51 @@ def detect_webcam_region(
                                     
                                     if frame_for_refine is not None:
                                         # --------------------------------------------------------
-                                        # Strategy 1: Try contour/overlay-boundary refinement FIRST
-                                        # (more conservative than face-anchor)
+                                        # Strategy 1: Try FACE-ANCHOR FIRST (for suspicious/square bboxes)
+                                        # Face-anchor is more reliable when Gemini returns a face crop
                                         # --------------------------------------------------------
-                                        print(f"  🔬 Trying contour refinement first...")
+                                        print(f"  👤 Trying face-anchor FIRST (Gemini bbox suspicious: {suspicious_reason})...")
                                         
-                                        contour_bbox = run_multiframe_refinement(
-                                            video_path, position, width, height,
-                                            timestamps=[3.0, 10.0, 15.0],
-                                            top_n_per_frame=5
+                                        face_bbox, detected_face = refine_webcam_bbox_face_anchor(
+                                            frame_for_refine, position, width, height
                                         )
                                         
-                                        if contour_bbox:
-                                            # Validate contour bbox
-                                            passes_guardrail, _ = check_guardrails(contour_bbox, position, width, height)
-                                            if passes_guardrail:
-                                                print(f"  ✅ Using CONTOUR-refined bbox")
-                                                cam_x = contour_bbox['x']
-                                                cam_y = contour_bbox['y']
-                                                cam_w = contour_bbox['width']
-                                                cam_h = contour_bbox['height']
-                                                refinement_method = "contour"
-                                        
-                                        # --------------------------------------------------------
-                                        # Strategy 2: Face-anchor as LAST RESORT (with strict gates)
-                                        # --------------------------------------------------------
-                                        if refinement_method == "gemini":  # Still using default
-                                            print(f"  👤 Trying face-anchor as last resort...")
+                                        if face_bbox:
+                                            face_w = face_bbox['width']
+                                            face_h = face_bbox['height']
+                                            face_area = face_w * face_h
                                             
-                                            face_bbox, detected_face = refine_webcam_bbox_face_anchor(
-                                                frame_for_refine, position, width, height
+                                            # Gate 1: Corner proximity check
+                                            near_corner, corner_reason = check_corner_proximity(
+                                                face_bbox, position, width, height
                                             )
-                                            
-                                            if face_bbox:
-                                                face_w = face_bbox['width']
-                                                face_h = face_bbox['height']
-                                                face_area = face_w * face_h
-                                                
-                                                # STRICT GATE: Face-anchor cannot grow wildly compared to Gemini
-                                                # Reject if: width > gemini_w * 1.25 OR area > gemini_area * 1.4
-                                                if face_w > gemini_w * 1.25:
-                                                    print(f"  ❌ Face-anchor REJECTED: width {face_w} > {gemini_w}*1.25 = {int(gemini_w*1.25)}")
-                                                elif face_area > gemini_area * 1.4:
-                                                    print(f"  ❌ Face-anchor REJECTED: area {face_area} > {gemini_area}*1.4 = {int(gemini_area*1.4)}")
+                                            if not near_corner:
+                                                print(f"  ❌ Face-anchor REJECTED: {corner_reason}")
+                                            else:
+                                                # Gate 2: IoU overlap with Gemini bbox
+                                                iou = compute_iou_dict(face_bbox, gemini_bbox_for_iou)
+                                                if iou < 0.05:
+                                                    # Check if at least some overlap (not necessarily IoU)
+                                                    has_overlap = (
+                                                        face_bbox['x'] < gemini_x + gemini_w and
+                                                        face_bbox['x'] + face_w > gemini_x and
+                                                        face_bbox['y'] < gemini_y + gemini_h and
+                                                        face_bbox['y'] + face_h > gemini_y
+                                                    )
+                                                    if not has_overlap:
+                                                        print(f"  ❌ Face-anchor REJECTED: no overlap with Gemini (IoU={iou:.3f})")
+                                                    else:
+                                                        print(f"  ⚠️ Low IoU ({iou:.3f}) but boxes overlap, allowing...")
+                                                        # Accept with overlap
+                                                        print(f"  ✅ Face-anchor accepted (corner + overlap)")
+                                                        cam_x = face_bbox['x']
+                                                        cam_y = face_bbox['y']
+                                                        cam_w = face_bbox['width']
+                                                        cam_h = face_bbox['height']
+                                                        refinement_method = "face-anchor"
                                                 else:
-                                                    # Face-anchor passed the gate
-                                                    print(f"  ✅ Face-anchor passed gate, using it")
+                                                    # Good IoU
+                                                    print(f"  ✅ Face-anchor accepted (IoU={iou:.3f})")
                                                     cam_x = face_bbox['x']
                                                     cam_y = face_bbox['y']
                                                     cam_w = face_bbox['width']
@@ -1765,10 +1883,56 @@ def detect_webcam_region(
                                                     refinement_method = "face-anchor"
                                         
                                         # --------------------------------------------------------
+                                        # Strategy 2: Try contour refinement if face-anchor failed
+                                        # --------------------------------------------------------
+                                        if refinement_method == "gemini":
+                                            print(f"  🔬 Face-anchor failed, trying contour refinement...")
+                                            
+                                            contour_bbox = run_multiframe_refinement(
+                                                video_path, position, width, height,
+                                                timestamps=[3.0, 10.0, 15.0],
+                                                top_n_per_frame=5
+                                            )
+                                            
+                                            if contour_bbox:
+                                                # Gate 1: Existing guardrails
+                                                passes_guardrail, guardrail_reason = check_guardrails(
+                                                    contour_bbox, position, width, height
+                                                )
+                                                
+                                                # Gate 2: Corner proximity
+                                                near_corner, corner_reason = check_corner_proximity(
+                                                    contour_bbox, position, width, height
+                                                )
+                                                
+                                                # Gate 3: IoU overlap with Gemini
+                                                iou = compute_iou_dict(contour_bbox, gemini_bbox_for_iou)
+                                                has_overlap = iou >= 0.05 or (
+                                                    contour_bbox['x'] < gemini_x + gemini_w and
+                                                    contour_bbox['x'] + contour_bbox['width'] > gemini_x and
+                                                    contour_bbox['y'] < gemini_y + gemini_h and
+                                                    contour_bbox['y'] + contour_bbox['height'] > gemini_y
+                                                )
+                                                
+                                                if not passes_guardrail:
+                                                    print(f"  ❌ Contour REJECTED: guardrail failed ({guardrail_reason})")
+                                                elif not near_corner:
+                                                    print(f"  ❌ Contour REJECTED: {corner_reason}")
+                                                elif not has_overlap:
+                                                    print(f"  ❌ Contour REJECTED: no overlap with Gemini (IoU={iou:.3f})")
+                                                else:
+                                                    print(f"  ✅ Contour accepted (guardrail + corner + IoU={iou:.3f})")
+                                                    cam_x = contour_bbox['x']
+                                                    cam_y = contour_bbox['y']
+                                                    cam_w = contour_bbox['width']
+                                                    cam_h = contour_bbox['height']
+                                                    refinement_method = "contour"
+                                        
+                                        # --------------------------------------------------------
                                         # Fallback: Use Gemini bbox (with validation)
                                         # --------------------------------------------------------
                                         if refinement_method == "gemini":
-                                            print(f"  📐 Using Gemini bbox (refinements failed or rejected)")
+                                            print(f"  📐 Using Gemini bbox (all refinements failed or rejected)")
                                             cam_x, cam_y, cam_w, cam_h = gemini_x, gemini_y, gemini_w, gemini_h
                                             refinement_method = "gemini-fallback"
                                             
@@ -2138,18 +2302,37 @@ def _save_layout_cache(temp_dir: str, layout_info: LayoutInfo) -> None:
     """
     Save layout detection result to cache.
     
+    Uses atomic write (write to temp file, then rename) to avoid corrupted JSON.
+    Converts numpy types to Python types for JSON serialization.
+    
     Args:
         temp_dir: Job temp directory
         layout_info: Detection result to cache
     """
     cache_path = _get_cache_path(temp_dir)
+    temp_path = cache_path + ".tmp"
     
     try:
-        with open(cache_path, 'w') as f:
-            json.dump(layout_info.to_dict(), f, indent=2)
+        # Convert to dict and recursively convert numpy types
+        data = layout_info.to_dict()
+        data = convert_numpy_to_python(data)
+        print(f"  🔄 Converting numpy types for cache serialization...")
+        
+        # Write to temp file first (atomic)
+        with open(temp_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        # Atomic rename
+        os.replace(temp_path, cache_path)
         print(f"  💾 Saved layout cache: {cache_path}")
     except Exception as e:
         print(f"  ⚠️ Failed to save cache: {e}")
+        # Clean up temp file if it exists
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
 
 
 def detect_layout_with_cache(
