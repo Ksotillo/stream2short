@@ -11,9 +11,11 @@ Strategy:
 """
 
 import cv2
+import json
 import numpy as np
+import os
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Literal
 from dataclasses import dataclass
 
 
@@ -56,6 +58,298 @@ class WebcamRegion:
     def to_ffmpeg_crop(self) -> str:
         """Return FFmpeg crop filter string."""
         return f"crop={self.width}:{self.height}:{self.x}:{self.y}"
+    
+    def to_dict(self) -> Dict[str, any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            'x': self.x,
+            'y': self.y,
+            'width': self.width,
+            'height': self.height,
+            'position': self.position
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'WebcamRegion':
+        """Create from dictionary."""
+        return cls(
+            x=data['x'],
+            y=data['y'],
+            width=data['width'],
+            height=data['height'],
+            position=data['position']
+        )
+
+
+@dataclass
+class FaceCenter:
+    """Face center point for face-centered cropping."""
+    x: int
+    y: int
+    width: int
+    height: int
+    
+    @property
+    def center_x(self) -> int:
+        return self.x + self.width // 2
+    
+    @property
+    def center_y(self) -> int:
+        return self.y + self.height // 2
+    
+    def to_dict(self) -> Dict:
+        return {'x': self.x, 'y': self.y, 'width': self.width, 'height': self.height}
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'FaceCenter':
+        return cls(x=data['x'], y=data['y'], width=data['width'], height=data['height'])
+
+
+@dataclass
+class LayoutInfo:
+    """
+    Layout classification result with all detection info.
+    
+    Layouts:
+    - FULL_CAM: Entire clip is webcam (no gameplay). Use full-frame crop.
+    - SPLIT: Traditional webcam + gameplay split layout.
+    - NO_WEBCAM: No webcam detected. Use simple center crop.
+    """
+    layout: str  # 'FULL_CAM', 'SPLIT', 'NO_WEBCAM'
+    webcam_region: Optional[WebcamRegion]
+    face_center: Optional[FaceCenter]
+    reason: str
+    bbox_area_ratio: float = 0.0
+    
+    def to_dict(self) -> Dict:
+        return {
+            'layout': self.layout,
+            'webcam_region': self.webcam_region.to_dict() if self.webcam_region else None,
+            'face_center': self.face_center.to_dict() if self.face_center else None,
+            'reason': self.reason,
+            'bbox_area_ratio': self.bbox_area_ratio,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'LayoutInfo':
+        return cls(
+            layout=data['layout'],
+            webcam_region=WebcamRegion.from_dict(data['webcam_region']) if data.get('webcam_region') else None,
+            face_center=FaceCenter.from_dict(data['face_center']) if data.get('face_center') else None,
+            reason=data['reason'],
+            bbox_area_ratio=data.get('bbox_area_ratio', 0.0),
+        )
+
+
+def classify_layout(
+    frame_bgr: np.ndarray,
+    webcam_bbox: Optional[Dict[str, int]],
+    corner: Optional[str],
+    video_width: int,
+    video_height: int,
+) -> Tuple[str, str, float]:
+    """
+    Classify the video layout based on webcam bbox and frame analysis.
+    
+    Args:
+        frame_bgr: BGR frame from video
+        webcam_bbox: Detected webcam bbox {'x', 'y', 'width', 'height'} or None
+        corner: Detected corner ('top-left', 'top-right', etc.) or None
+        video_width: Full frame width
+        video_height: Full frame height
+    
+    Returns:
+        Tuple of (layout, reason, bbox_area_ratio)
+        layout: 'FULL_CAM', 'SPLIT', or 'NO_WEBCAM'
+    """
+    if webcam_bbox is None:
+        return 'NO_WEBCAM', 'No webcam detected', 0.0
+    
+    # Extract bbox dimensions
+    bx = webcam_bbox.get('x', 0)
+    by = webcam_bbox.get('y', 0)
+    bw = webcam_bbox.get('width', 0)
+    bh = webcam_bbox.get('height', 0)
+    
+    if bw <= 0 or bh <= 0:
+        return 'NO_WEBCAM', 'Invalid webcam dimensions', 0.0
+    
+    frame_area = video_width * video_height
+    bbox_area = bw * bh
+    bbox_area_ratio = bbox_area / frame_area
+    outside_area_ratio = 1.0 - bbox_area_ratio
+    
+    # Edge touching tolerance
+    tol_x = int(video_width * 0.03)  # 3% of width
+    tol_y = int(video_height * 0.03)  # 3% of height
+    
+    # Check if bbox touches 2 adjacent edges (corner behavior)
+    touches_top = by <= tol_y
+    touches_bottom = (by + bh) >= (video_height - tol_y)
+    touches_left = bx <= tol_x
+    touches_right = (bx + bw) >= (video_width - tol_x)
+    
+    bbox_touches_edges = (
+        (touches_top and touches_left) or
+        (touches_top and touches_right) or
+        (touches_bottom and touches_left) or
+        (touches_bottom and touches_right)
+    )
+    
+    print(f"  📊 Layout classifier:")
+    print(f"     bbox_area_ratio: {bbox_area_ratio:.2%}")
+    print(f"     outside_area_ratio: {outside_area_ratio:.2%}")
+    print(f"     touches_edges: {bbox_touches_edges} (top={touches_top}, bottom={touches_bottom}, left={touches_left}, right={touches_right})")
+    
+    # ==========================================================================
+    # HEURISTIC 1: Webcam dominates frame (>= 72%)
+    # ==========================================================================
+    if bbox_area_ratio >= 0.72:
+        reason = f"FULL_CAM because bbox_area_ratio={bbox_area_ratio:.2%} >= 72%"
+        print(f"     ✅ {reason}")
+        return 'FULL_CAM', reason, bbox_area_ratio
+    
+    # ==========================================================================
+    # HEURISTIC 2: Large webcam (>= 60%) with edge touching and little outside content
+    # ==========================================================================
+    if bbox_area_ratio >= 0.60 and outside_area_ratio <= 0.40 and bbox_touches_edges:
+        # Additional check: verify outside area has low complexity (no game UI)
+        edge_density_outside = _compute_edge_density_outside(
+            frame_bgr, bx, by, bw, bh, video_width, video_height
+        )
+        print(f"     edge_density_outside: {edge_density_outside:.4f}")
+        
+        # Low complexity threshold (tunable)
+        if edge_density_outside < 0.08:  # Less than 8% edge density
+            reason = f"FULL_CAM because bbox_area_ratio={bbox_area_ratio:.2%}, outside_area low complexity ({edge_density_outside:.4f})"
+            print(f"     ✅ {reason}")
+            return 'FULL_CAM', reason, bbox_area_ratio
+    
+    # ==========================================================================
+    # HEURISTIC 3: Additional check for very high area ratio with moderate outside complexity
+    # ==========================================================================
+    if bbox_area_ratio >= 0.55:
+        edge_density_outside = _compute_edge_density_outside(
+            frame_bgr, bx, by, bw, bh, video_width, video_height
+        )
+        print(f"     edge_density_outside: {edge_density_outside:.4f}")
+        
+        # Very low complexity suggests full cam even at 55-60%
+        if edge_density_outside < 0.04:  # Less than 4% edge density
+            reason = f"FULL_CAM because bbox_area_ratio={bbox_area_ratio:.2%}, outside_area very low complexity ({edge_density_outside:.4f})"
+            print(f"     ✅ {reason}")
+            return 'FULL_CAM', reason, bbox_area_ratio
+    
+    # Default: SPLIT layout
+    reason = f"SPLIT layout (bbox_area_ratio={bbox_area_ratio:.2%})"
+    print(f"     📐 {reason}")
+    return 'SPLIT', reason, bbox_area_ratio
+
+
+def _compute_edge_density_outside(
+    frame_bgr: np.ndarray,
+    bx: int, by: int, bw: int, bh: int,
+    video_width: int, video_height: int,
+) -> float:
+    """
+    Compute edge density in the area OUTSIDE the webcam bbox.
+    
+    Low edge density suggests the outside area is empty/simple (supports FULL_CAM).
+    High edge density suggests game UI/content exists (supports SPLIT).
+    
+    Returns:
+        Edge density as a ratio (0.0 to 1.0)
+    """
+    # Convert to grayscale
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Apply Canny edge detection
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # Create mask for OUTSIDE the bbox
+    mask = np.ones_like(edges, dtype=np.uint8) * 255
+    # Zero out the webcam bbox area
+    mask[by:by+bh, bx:bx+bw] = 0
+    
+    # Count edge pixels outside bbox
+    edges_outside = cv2.bitwise_and(edges, edges, mask=mask)
+    edge_count = np.count_nonzero(edges_outside)
+    
+    # Count total pixels outside bbox
+    outside_pixels = (video_width * video_height) - (bw * bh)
+    
+    if outside_pixels <= 0:
+        return 0.0
+    
+    return edge_count / outside_pixels
+
+
+def detect_face_in_frame(
+    frame_bgr: np.ndarray,
+    roi_x: int = 0,
+    roi_y: int = 0,
+    roi_w: int = 0,
+    roi_h: int = 0,
+) -> Optional[FaceCenter]:
+    """
+    Detect face in frame (or ROI) and return center point.
+    
+    Used for face-centered cropping in FULL_CAM mode.
+    
+    Args:
+        frame_bgr: BGR frame
+        roi_x, roi_y, roi_w, roi_h: Region of interest (0 = full frame)
+    
+    Returns:
+        FaceCenter or None if no face detected
+    """
+    if roi_w == 0 or roi_h == 0:
+        roi_w = frame_bgr.shape[1]
+        roi_h = frame_bgr.shape[0]
+    
+    # Try DNN face detection first (more accurate)
+    face = detect_face_dnn(frame_bgr, roi_x, roi_y, roi_w, roi_h)
+    if face:
+        return FaceCenter(
+            x=face.x,
+            y=face.y,
+            width=face.width,
+            height=face.height
+        )
+    
+    # Fallback to Haar Cascade
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    
+    cascade_paths = [
+        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml',
+        '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
+    ]
+    
+    face_cascade = None
+    for path in cascade_paths:
+        if Path(path).exists():
+            face_cascade = cv2.CascadeClassifier(path)
+            break
+    
+    if face_cascade is None or face_cascade.empty():
+        return None
+    
+    # Detect faces
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(50, 50)
+    )
+    
+    if len(faces) == 0:
+        return None
+    
+    # Return largest face
+    largest = max(faces, key=lambda f: f[2] * f[3])
+    x, y, w, h = largest
+    
+    return FaceCenter(x=x, y=y, width=w, height=h)
 
 
 def compute_iou(box1: BBoxCandidate, box2: BBoxCandidate) -> float:
@@ -1799,6 +2093,203 @@ def get_video_dimensions(video_path: str) -> Tuple[int, int]:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
     return width, height
+
+
+# =============================================================================
+# LAYOUT DETECTION WITH CACHING
+# =============================================================================
+
+_CACHE_FILENAME = "layout_detection_cache.json"
+
+
+def _get_cache_path(temp_dir: str) -> str:
+    """Get the path to the cache file in the temp directory."""
+    return os.path.join(temp_dir, _CACHE_FILENAME)
+
+
+def _load_cached_layout(temp_dir: str) -> Optional[LayoutInfo]:
+    """
+    Load cached layout detection result if available.
+    
+    Args:
+        temp_dir: Job temp directory
+        
+    Returns:
+        LayoutInfo if cache exists and valid, None otherwise
+    """
+    cache_path = _get_cache_path(temp_dir)
+    
+    if not os.path.exists(cache_path):
+        return None
+    
+    try:
+        with open(cache_path, 'r') as f:
+            data = json.load(f)
+        
+        layout_info = LayoutInfo.from_dict(data)
+        print(f"  📦 Loaded cached layout: {layout_info.layout}")
+        return layout_info
+    except Exception as e:
+        print(f"  ⚠️ Failed to load cache: {e}")
+        return None
+
+
+def _save_layout_cache(temp_dir: str, layout_info: LayoutInfo) -> None:
+    """
+    Save layout detection result to cache.
+    
+    Args:
+        temp_dir: Job temp directory
+        layout_info: Detection result to cache
+    """
+    cache_path = _get_cache_path(temp_dir)
+    
+    try:
+        with open(cache_path, 'w') as f:
+            json.dump(layout_info.to_dict(), f, indent=2)
+        print(f"  💾 Saved layout cache: {cache_path}")
+    except Exception as e:
+        print(f"  ⚠️ Failed to save cache: {e}")
+
+
+def detect_layout_with_cache(
+    video_path: str,
+    temp_dir: str,
+    sample_times: list[float] = [3.0, 10.0, 15.0],
+    force_refresh: bool = False,
+) -> LayoutInfo:
+    """
+    Detect video layout with caching support.
+    
+    This is the main entry point for layout detection. It:
+    1. Checks for cached result (for performance when rendering both versions)
+    2. Runs webcam detection if no cache
+    3. Classifies layout (FULL_CAM, SPLIT, NO_WEBCAM)
+    4. Caches the result
+    
+    Args:
+        video_path: Path to video file
+        temp_dir: Job temp directory for caching
+        sample_times: Frame sampling times
+        force_refresh: If True, ignore cache and re-detect
+        
+    Returns:
+        LayoutInfo with layout classification and webcam/face info
+    """
+    print(f"\n🎯 Detecting layout for: {video_path}")
+    
+    # Check cache first (unless force refresh)
+    if not force_refresh:
+        cached = _load_cached_layout(temp_dir)
+        if cached:
+            return cached
+    
+    # Get video dimensions
+    width, height = get_video_dimensions(video_path)
+    
+    # Run webcam detection
+    webcam_region = detect_webcam_region(video_path, sample_times, temp_dir)
+    
+    # If no webcam, return early
+    if webcam_region is None:
+        layout_info = LayoutInfo(
+            layout='NO_WEBCAM',
+            webcam_region=None,
+            face_center=None,
+            reason='No webcam detected by Gemini or OpenCV',
+            bbox_area_ratio=0.0,
+        )
+        _save_layout_cache(temp_dir, layout_info)
+        print(f"  📹 Layout: NO_WEBCAM")
+        return layout_info
+    
+    # Extract a frame for layout classification
+    frame = extract_frame(video_path, 5.0)  # Use 5s mark for classification
+    
+    if frame is None:
+        # Fallback: assume SPLIT if we can't extract frame
+        layout_info = LayoutInfo(
+            layout='SPLIT',
+            webcam_region=webcam_region,
+            face_center=None,
+            reason='Frame extraction failed, defaulting to SPLIT',
+            bbox_area_ratio=0.0,
+        )
+        _save_layout_cache(temp_dir, layout_info)
+        return layout_info
+    
+    # Create bbox dict for classifier
+    webcam_bbox = {
+        'x': webcam_region.x,
+        'y': webcam_region.y,
+        'width': webcam_region.width,
+        'height': webcam_region.height,
+    }
+    
+    # Classify layout
+    layout, reason, bbox_area_ratio = classify_layout(
+        frame_bgr=frame,
+        webcam_bbox=webcam_bbox,
+        corner=webcam_region.position,
+        video_width=width,
+        video_height=height,
+    )
+    
+    # Detect face for face-centered cropping (especially for FULL_CAM)
+    face_center = None
+    if layout == 'FULL_CAM':
+        # For FULL_CAM, detect face in full frame for face-centered crop
+        face_center = detect_face_in_frame(frame)
+        if face_center:
+            print(f"  👤 Face detected for FULL_CAM crop: center at ({face_center.center_x}, {face_center.center_y})")
+        
+        # For FULL_CAM, set webcam_region to full frame (or slightly inset)
+        # This ensures the render uses the full frame, not just the detected bbox
+        inset = int(min(width, height) * 0.02)  # 2% inset to avoid edge artifacts
+        webcam_region = WebcamRegion(
+            x=inset,
+            y=inset,
+            width=width - 2 * inset,
+            height=height - 2 * inset,
+            position='full'
+        )
+        print(f"  📐 FULL_CAM effective region: {webcam_region}")
+    else:
+        # For SPLIT, detect face in webcam region for validation
+        face_center = detect_face_in_frame(
+            frame,
+            webcam_region.x,
+            webcam_region.y,
+            webcam_region.width,
+            webcam_region.height,
+        )
+    
+    # Build result
+    layout_info = LayoutInfo(
+        layout=layout,
+        webcam_region=webcam_region,
+        face_center=face_center,
+        reason=reason,
+        bbox_area_ratio=bbox_area_ratio,
+    )
+    
+    # Cache result
+    _save_layout_cache(temp_dir, layout_info)
+    
+    # Log summary
+    print(f"\n  ═══════════════════════════════════════")
+    print(f"  📊 LAYOUT DETECTION SUMMARY")
+    print(f"  ═══════════════════════════════════════")
+    print(f"  Layout: {layout}")
+    print(f"  Reason: {reason}")
+    print(f"  bbox_area_ratio: {bbox_area_ratio:.2%}")
+    print(f"  Webcam region: {webcam_region}")
+    print(f"  Face center: {face_center}")
+    if layout == 'FULL_CAM' and face_center:
+        print(f"  Face-centered crop: YES (face at {face_center.center_x}, {face_center.center_y})")
+    print(f"  ═══════════════════════════════════════\n")
+    
+    return layout_info
 
 
 if __name__ == "__main__":

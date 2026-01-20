@@ -6,7 +6,14 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from webcam_detect import detect_webcam_region, WebcamRegion, get_video_dimensions
+from webcam_detect import (
+    detect_webcam_region,
+    detect_layout_with_cache,
+    WebcamRegion,
+    LayoutInfo,
+    FaceCenter,
+    get_video_dimensions,
+)
 
 
 class VideoProcessingError(Exception):
@@ -493,6 +500,182 @@ def render_split_layout_video(
         raise VideoProcessingError(error_msg)
 
 
+def render_full_cam_video(
+    input_path: str,
+    output_path: str,
+    face_center: Optional[FaceCenter] = None,
+    subtitle_path: str | None = None,
+    width: int = 1080,
+    height: int = 1920,
+) -> str:
+    """
+    Render a FULL_CAM layout video - entire clip is webcam/streamer face.
+    
+    Uses face-centered cropping if face is detected, otherwise center-crops.
+    The face is positioned at ~45% from top (slightly above center) for
+    a natural, portrait-friendly composition.
+    
+    Args:
+        input_path: Path to input video
+        output_path: Path to output video
+        face_center: Optional FaceCenter for face-centered crop
+        subtitle_path: Optional path to subtitle file
+        width: Output width (default 1080)
+        height: Output height (default 1920)
+        
+    Returns:
+        Path to output video
+        
+    Raises:
+        VideoProcessingError: If FFmpeg fails
+    """
+    print(f"🎬 Rendering FULL_CAM video: {input_path} -> {output_path}")
+    
+    # Get source dimensions
+    src_width, src_height = get_video_dimensions(input_path)
+    print(f"   Source: {src_width}x{src_height}")
+    
+    # Check subtitle file
+    use_subtitles = False
+    if subtitle_path and os.path.exists(subtitle_path):
+        file_size = os.path.getsize(subtitle_path)
+        if file_size > 10:
+            use_subtitles = True
+    
+    # ==========================================================================
+    # Calculate crop region for 9:16 output
+    # ==========================================================================
+    # Target aspect ratio: 9:16 = 0.5625
+    target_ar = width / height  # 0.5625
+    src_ar = src_width / src_height
+    
+    if src_ar > target_ar:
+        # Source is wider - crop sides
+        crop_h = src_height
+        crop_w = int(src_height * target_ar)
+    else:
+        # Source is taller - crop top/bottom
+        crop_w = src_width
+        crop_h = int(src_width / target_ar)
+    
+    # Ensure even dimensions
+    crop_w = crop_w - (crop_w % 2)
+    crop_h = crop_h - (crop_h % 2)
+    
+    # ==========================================================================
+    # Face-centered positioning
+    # ==========================================================================
+    if face_center:
+        print(f"   👤 Face-centered crop: face at ({face_center.center_x}, {face_center.center_y})")
+        
+        # Position face at 45% from top (slightly above center for portrait)
+        target_face_y = int(crop_h * 0.45)
+        
+        # Calculate crop position to place face at target position
+        crop_y = face_center.center_y - target_face_y
+        
+        # Center horizontally on face
+        crop_x = face_center.center_x - crop_w // 2
+        
+        # Clamp to valid bounds
+        crop_x = max(0, min(crop_x, src_width - crop_w))
+        crop_y = max(0, min(crop_y, src_height - crop_h))
+        
+        print(f"   📐 Face-centered crop: {crop_w}x{crop_h} at ({crop_x},{crop_y})")
+    else:
+        # Center crop (no face detected)
+        crop_x = (src_width - crop_w) // 2
+        crop_y = (src_height - crop_h) // 2
+        print(f"   📐 Center crop: {crop_w}x{crop_h} at ({crop_x},{crop_y})")
+    
+    # ==========================================================================
+    # Build FFmpeg filter chain
+    # ==========================================================================
+    filters = []
+    
+    # Crop to 9:16 region
+    filters.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+    
+    # Scale to output size
+    filters.append(f"scale={width}:{height}:flags=lanczos")
+    
+    # Force square pixels
+    filters.append("setsar=1")
+    
+    # Add subtitles if available
+    if use_subtitles:
+        escaped_path = escape_ffmpeg_path(subtitle_path)
+        
+        if subtitle_path.endswith(".ass"):
+            filters.append(f"ass='{escaped_path}'")
+        else:
+            filters.append(
+                f"subtitles=filename='{escaped_path}'"
+                ":force_style='"
+                "FontName=Montserrat ExtraBold,"
+                "FontSize=75,"
+                "PrimaryColour=&H00FFFFFF,"
+                "OutlineColour=&H00000000,"
+                "Bold=1,"
+                "BorderStyle=1,"
+                "Outline=4,"
+                "Shadow=0,"
+                "Alignment=2,"
+                "MarginL=50,"
+                "MarginR=50,"
+                "MarginV=280"
+                "'"
+            )
+    
+    filter_complex = ",".join(filters)
+    
+    # Build FFmpeg command
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-vf", filter_complex,
+        "-c:v", "libx264",
+        "-preset", "veryslow",
+        "-crf", "16",
+        "-profile:v", "high",
+        "-level", "4.2",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "256k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    
+    print(f"🔧 Running FULL_CAM render...")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        print("✅ FULL_CAM video rendering complete")
+        return output_path
+        
+    except subprocess.CalledProcessError as e:
+        if use_subtitles and "Unable to open" in e.stderr:
+            print("⚠️ Subtitle rendering failed, trying without subtitles...")
+            return render_full_cam_video(
+                input_path=input_path,
+                output_path=output_path,
+                face_center=face_center,
+                subtitle_path=None,
+                width=width,
+                height=height,
+            )
+        
+        error_msg = f"FFmpeg failed: {e.stderr}"
+        print(f"❌ {error_msg}")
+        raise VideoProcessingError(error_msg)
+
+
 def render_video_auto(
     input_path: str,
     output_path: str,
@@ -503,10 +686,15 @@ def render_video_auto(
     temp_dir: str = "/tmp",
 ) -> str:
     """
-    Automatically render the best layout based on webcam detection.
+    Automatically render the best layout based on layout classification.
     
-    If a webcam/face is detected in a corner, uses split layout.
-    Otherwise, falls back to simple center crop.
+    Uses cached layout detection to avoid running detection twice (for
+    with-subs and without-subs versions).
+    
+    Layouts:
+    - FULL_CAM: Entire clip is webcam. Use face-centered full-frame crop.
+    - SPLIT: Webcam + gameplay. Use split layout with webcam on top.
+    - NO_WEBCAM: No webcam detected. Use simple center crop.
     
     Args:
         input_path: Path to input video
@@ -515,34 +703,71 @@ def render_video_auto(
         width: Output width (default 1080)
         height: Output height (default 1920)
         enable_webcam_detection: Whether to try detecting webcam (default True)
-        temp_dir: Temporary directory for frame extraction
+        temp_dir: Temporary directory for caching and frame extraction
         
     Returns:
         Path to output video
     """
-    webcam_region = None
-    
-    if enable_webcam_detection:
-        try:
-            webcam_region = detect_webcam_region(input_path, temp_dir=temp_dir)
-        except Exception as e:
-            print(f"⚠️ Webcam detection failed: {e}")
-            webcam_region = None
-    
-    if webcam_region:
-        # Use split layout with webcam on top
-        print("🎥 Using split layout (webcam + content)")
-        return render_split_layout_video(
+    if not enable_webcam_detection:
+        # Webcam detection disabled - use simple center crop
+        print("📹 Webcam detection disabled, using simple center crop")
+        return render_vertical_video(
             input_path=input_path,
             output_path=output_path,
-            webcam_region=webcam_region,
             subtitle_path=subtitle_path,
             width=width,
             height=height,
         )
-    else:
+    
+    # Use cached layout detection (runs detection only once per job)
+    try:
+        layout_info = detect_layout_with_cache(
+            video_path=input_path,
+            temp_dir=temp_dir,
+        )
+    except Exception as e:
+        print(f"⚠️ Layout detection failed: {e}")
         # Fall back to simple center crop
-        print("📹 Using simple center crop (no webcam detected)")
+        return render_vertical_video(
+            input_path=input_path,
+            output_path=output_path,
+            subtitle_path=subtitle_path,
+            width=width,
+            height=height,
+        )
+    
+    # ==========================================================================
+    # Choose render function based on layout
+    # ==========================================================================
+    layout = layout_info.layout
+    
+    if layout == 'FULL_CAM':
+        # Entire clip is webcam - use face-centered full-frame crop
+        print(f"🎥 Using FULL_CAM layout: {layout_info.reason}")
+        return render_full_cam_video(
+            input_path=input_path,
+            output_path=output_path,
+            face_center=layout_info.face_center,
+            subtitle_path=subtitle_path,
+            width=width,
+            height=height,
+        )
+    
+    elif layout == 'SPLIT' and layout_info.webcam_region:
+        # Webcam + gameplay split layout
+        print(f"🎥 Using SPLIT layout: {layout_info.reason}")
+        return render_split_layout_video(
+            input_path=input_path,
+            output_path=output_path,
+            webcam_region=layout_info.webcam_region,
+            subtitle_path=subtitle_path,
+            width=width,
+            height=height,
+        )
+    
+    else:
+        # NO_WEBCAM or fallback - simple center crop
+        print(f"📹 Using simple center crop: {layout_info.reason}")
         return render_vertical_video(
             input_path=input_path,
             output_path=output_path,
