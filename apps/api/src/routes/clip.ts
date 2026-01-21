@@ -99,8 +99,8 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
       if (!cooldownResult.allowed) {
         fastify.log.info(`Clip request blocked: ${cooldownResult.reason} (channel: ${channelRecord.twitch_login}, user: ${user})`);
         
-        // Return user-friendly message for chat
-        return reply.send(`⏳ ${cooldownResult.reason}`);
+        // Return empty string to chat - don't spam chat with error messages
+        return reply.send('');
       }
       
       // Get valid access token for the channel
