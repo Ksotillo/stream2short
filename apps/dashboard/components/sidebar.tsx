@@ -41,7 +41,7 @@ export function Sidebar({ user }: SidebarProps) {
   const pathname = usePathname()
   
   return (
-    <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:border-r border-border bg-card/50">
+    <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:border-r border-border bg-card/50 h-screen sticky top-0 shrink-0">
       {/* Logo */}
       <div className="flex h-16 items-center gap-2 px-6 border-b border-border">
         <Link href="/">
