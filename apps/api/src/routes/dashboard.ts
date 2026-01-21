@@ -8,6 +8,7 @@ import {
   reviewJob,
   resetJobForRetry,
   updateJobPreset,
+  getGamesForChannel,
   JobFilters,
   JobStatus,
   ReviewStatus,
@@ -67,6 +68,8 @@ export async function dashboardRoutes(fastify: FastifyInstance): Promise<void> {
         channel_id?: string;
         status?: string;
         review_status?: string;
+        game_id?: string;
+        game_name?: string;
         date_from?: string;
         date_to?: string;
         limit?: string;
@@ -75,7 +78,7 @@ export async function dashboardRoutes(fastify: FastifyInstance): Promise<void> {
     }>,
     reply
   ) => {
-    const { channel, channel_id, status, review_status, date_from, date_to, limit, cursor } = request.query;
+    const { channel, channel_id, status, review_status, game_id, game_name, date_from, date_to, limit, cursor } = request.query;
     
     const filters: JobFilters = {};
     
@@ -100,6 +103,10 @@ export async function dashboardRoutes(fastify: FastifyInstance): Promise<void> {
       filters.reviewStatus = reviewStatuses.length === 1 ? reviewStatuses[0] : reviewStatuses;
     }
     
+    // Game filter
+    if (game_id) filters.gameId = game_id;
+    if (game_name) filters.gameName = game_name;
+    
     // Date range
     if (date_from) filters.dateFrom = date_from;
     if (date_to) filters.dateTo = date_to;
@@ -117,6 +124,28 @@ export async function dashboardRoutes(fastify: FastifyInstance): Promise<void> {
         has_more: !!nextCursor,
       },
     });
+  });
+  
+  // ============================================================================
+  // GET /api/games - Get unique games for a channel (for filter UI)
+  // ============================================================================
+  fastify.get('/api/games', async (
+    request: FastifyRequest<{
+      Querystring: {
+        channel_id: string;
+      };
+    }>,
+    reply
+  ) => {
+    const { channel_id } = request.query;
+    
+    if (!channel_id) {
+      return reply.status(400).send({ error: 'channel_id is required' });
+    }
+    
+    const games = await getGamesForChannel(channel_id);
+    
+    return reply.send({ games });
   });
   
   // ============================================================================

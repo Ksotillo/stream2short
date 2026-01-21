@@ -113,18 +113,35 @@ export function Sidebar({ user }: SidebarProps) {
 // Mobile header for small screens
 export function MobileHeader({ user }: SidebarProps) {
   return (
-    <header className="lg:hidden flex items-center justify-between h-16 px-4 border-b border-border bg-card/50">
-      <Link href="/">
-        <LogoWithText />
-      </Link>
-      <Avatar className="h-8 w-8">
+    <header className="lg:hidden flex items-center justify-between h-14 px-4 bg-black/80 backdrop-blur-xl border-b border-white/5 sticky top-0 z-50">
+      <Avatar className="h-9 w-9 ring-2 ring-violet-500/50">
         {user.profile_image_url && (
           <AvatarImage src={user.profile_image_url} alt={user.display_name} />
         )}
-        <AvatarFallback className="bg-primary/20 text-primary text-sm">
+        <AvatarFallback className="bg-violet-500/20 text-violet-300 text-sm font-semibold">
           {user.display_name[0].toUpperCase()}
         </AvatarFallback>
       </Avatar>
+      
+      <Link href="/">
+        <LogoWithText />
+      </Link>
+      
+      <div className="w-9 h-9 rounded-full bg-white/5 flex items-center justify-center">
+        <svg
+          className="w-5 h-5 text-white/70"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={2}
+            d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"
+          />
+        </svg>
+      </div>
     </header>
   )
 }

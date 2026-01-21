@@ -195,6 +195,8 @@ export interface JobFilters {
   channelId?: string;
   status?: JobStatus | JobStatus[];
   reviewStatus?: ReviewStatus | ReviewStatus[];
+  gameId?: string;
+  gameName?: string;
   dateFrom?: string;
   dateTo?: string;
   limit?: number;
@@ -233,6 +235,14 @@ export async function getJobsWithFilters(filters: JobFilters): Promise<{ jobs: C
     }
   }
   
+  // Game filter
+  if (filters.gameId) {
+    query = query.eq('game_id', filters.gameId);
+  }
+  if (filters.gameName) {
+    query = query.ilike('game_name', `%${filters.gameName}%`);
+  }
+  
   // Date range filters
   if (filters.dateFrom) {
     query = query.gte('created_at', filters.dateFrom);
@@ -267,6 +277,42 @@ export async function getJobsWithFilters(filters: JobFilters): Promise<{ jobs: C
   }
   
   return { jobs, nextCursor };
+}
+
+/**
+ * Get unique games for a channel (for filter UI)
+ */
+export async function getGamesForChannel(channelId: string): Promise<Array<{ game_id: string; game_name: string; count: number }>> {
+  // Get all games with counts
+  const { data, error } = await supabase
+    .from('clip_jobs')
+    .select('game_id, game_name')
+    .eq('channel_id', channelId)
+    .not('game_id', 'is', null)
+    .not('game_name', 'is', null);
+  
+  if (error || !data) return [];
+  
+  // Aggregate by game
+  const gameMap = new Map<string, { game_id: string; game_name: string; count: number }>();
+  
+  for (const job of data) {
+    const key = job.game_id;
+    if (!key) continue;
+    
+    if (gameMap.has(key)) {
+      gameMap.get(key)!.count++;
+    } else {
+      gameMap.set(key, {
+        game_id: job.game_id,
+        game_name: job.game_name || 'Unknown Game',
+        count: 1,
+      });
+    }
+  }
+  
+  // Sort by count (most clips first)
+  return Array.from(gameMap.values()).sort((a, b) => b.count - a.count);
 }
 
 /**

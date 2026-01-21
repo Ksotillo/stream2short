@@ -42,8 +42,17 @@ export interface Job {
   reviewed_at: string | null
   render_preset: string
   last_stage: string | null
+  game_id: string | null
+  game_name: string | null
+  thumbnail_url: string | null
   created_at: string
   updated_at: string
+}
+
+export interface Game {
+  game_id: string
+  game_name: string
+  count: number
 }
 
 export interface JobEvent {
@@ -73,6 +82,7 @@ export async function getJobs(params: {
   channel_id?: string
   status?: string
   review_status?: string
+  game_id?: string
   limit?: number
   cursor?: string
 } = {}): Promise<{ 
@@ -83,11 +93,16 @@ export async function getJobs(params: {
   if (params.channel_id) searchParams.set('channel_id', params.channel_id)
   if (params.status) searchParams.set('status', params.status)
   if (params.review_status) searchParams.set('review_status', params.review_status)
+  if (params.game_id) searchParams.set('game_id', params.game_id)
   if (params.limit) searchParams.set('limit', params.limit.toString())
   if (params.cursor) searchParams.set('cursor', params.cursor)
   
   const query = searchParams.toString()
   return fetchAPI(`/api/jobs${query ? `?${query}` : ''}`)
+}
+
+export async function getGames(channelId: string): Promise<{ games: Game[] }> {
+  return fetchAPI(`/api/games?channel_id=${channelId}`)
 }
 
 export async function getJob(id: string, includeEvents = false): Promise<{ 

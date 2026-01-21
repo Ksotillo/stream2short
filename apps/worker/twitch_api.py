@@ -286,6 +286,41 @@ def download_clip_with_ytdlp(clip_url: str, output_path: str) -> None:
         raise TwitchAPIError("yt-dlp not found. Please install it.")
 
 
+def get_game_info(game_id: str, access_token: str) -> Optional[dict]:
+    """
+    Get game/category info by ID.
+    
+    Args:
+        game_id: Twitch game/category ID
+        access_token: Valid access token
+        
+    Returns:
+        Game data dict with 'id', 'name', 'box_art_url' or None if not found
+    """
+    if not game_id:
+        return None
+    
+    with httpx.Client() as client:
+        response = client.get(
+            f"{TWITCH_API_URL}/games",
+            params={"id": game_id},
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Client-Id": config.TWITCH_CLIENT_ID,
+            },
+        )
+        
+        if not response.is_success:
+            return None
+        
+        data = response.json()
+        
+        if not data.get("data"):
+            return None
+        
+        return data["data"][0]
+
+
 def download_clip(clip_url_or_thumbnail: str, output_path: str, clip_page_url: str = None) -> None:
     """
     Download a clip to a local file.

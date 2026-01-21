@@ -154,7 +154,26 @@ def _process_job_stages(
         
         clip_info = wait_for_clip(clip_id, access_token)
         
-        update_job(job_id, twitch_clip_url=clip_info.get("url"))
+        # Save clip info including game and thumbnail
+        clip_updates = {
+            "twitch_clip_url": clip_info.get("url"),
+            "thumbnail_url": clip_info.get("thumbnail_url"),
+        }
+        
+        # Fetch game info if available
+        game_id = clip_info.get("game_id")
+        if game_id:
+            clip_updates["game_id"] = game_id
+            try:
+                from twitch_api import get_game_info
+                game_info = get_game_info(game_id, access_token)
+                if game_info:
+                    clip_updates["game_name"] = game_info.get("name")
+                    print(f"🎮 Game: {game_info.get('name')} (ID: {game_id})")
+            except Exception as e:
+                print(f"⚠️ Failed to fetch game info: {e}")
+        
+        update_job(job_id, **clip_updates)
         print(f"✅ Clip available: {clip_info.get('url')}")
         
         # Stage 3: Download clip
