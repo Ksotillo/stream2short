@@ -171,15 +171,21 @@ ALTER TABLE clip_jobs ADD COLUMN thumbnail_url TEXT;
 **Store:** `channels.settings.subtitle_preset`
 
 ### 2.2 Smart Chunking
-- **Status:** Not Started
+- **Status:** ✅ Complete
 - **Effort:** ~2 hours
 
-Replace fixed "3-word chunks" with intelligent rules:
-- Break on punctuation (. , ! ?)
-- Max characters per line (~30)
-- Max 2 lines per subtitle
-- Duration: 0.8–2.2 seconds per chunk
-- Emphasis: highlight 1 keyword per caption (optional)
+Replaced fixed "3-word chunks" with intelligent rules in `smart_chunker.py`:
+- ✅ Break on punctuation (. , ! ? ; :) - respects sentence/clause boundaries
+- ✅ Max characters per line (~30) - with automatic line breaking
+- ✅ Max 2 lines per subtitle
+- ✅ Duration: 0.8–2.2 seconds per chunk - natural reading pace
+- ✅ Emphasis: highlight keywords per caption (optional, configurable)
+
+**Files:**
+- `apps/worker/smart_chunker.py` - Core chunking logic
+- `apps/worker/groq_transcribe.py` - Groq integration
+- `apps/worker/transcribe.py` - Local Whisper integration
+- `apps/worker/ass_writer.py` - Emphasis rendering support
 
 ### 2.3 Platform Safe Zones
 - **Status:** Not Started
@@ -198,7 +204,7 @@ Replace fixed "3-word chunks" with intelligent rules:
 ### Phase 2 Acceptance Criteria
 - [ ] Changing `subtitle_preset` changes rendering without code changes
 - [ ] Captions never overlap platform UI elements
-- [ ] Chunking looks natural (phrases, punctuation) vs mechanical
+- [x] Chunking looks natural (phrases, punctuation) vs mechanical
 
 ---
 

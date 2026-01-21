@@ -7,6 +7,8 @@ Features:
 - Large, TikTok/Reels style text (75pt)
 - Zoom-in animation effect on text appearance
 - Multi-color speaker support (primary=white, others=varied colors)
+- Optional keyword emphasis (highlights important words in yellow)
+- Smart line breaking for readability
 
 Color palette (ASS BGR format):
 - Primary speaker: White (&H00FFFFFF)
@@ -15,9 +17,14 @@ Color palette (ASS BGR format):
 - Speaker 4: Yellow (&H0000FFFF)
 - Speaker 5: Lime (&H0000FF00)
 - Speaker 6: Orange (&H000099FF)
+- Emphasis: Yellow (&H0000FFFF)
 """
 
 from typing import Optional
+
+
+# Maximum characters per line for readability (used for line breaking)
+MAX_CHARS_PER_LINE = 30
 
 
 # Animation settings
@@ -217,6 +224,84 @@ def get_speaker_style(
         return f"Neutral{style_index}"
 
 
+def format_text_with_line_breaks(
+    text: str,
+    max_chars_per_line: int = MAX_CHARS_PER_LINE,
+    max_lines: int = 2,
+) -> str:
+    """
+    Format text with ASS line breaks (\\N) for readability.
+    
+    Splits text into lines of max_chars_per_line, breaking at word boundaries.
+    Limited to max_lines to avoid cluttering the screen.
+    
+    Args:
+        text: Original text
+        max_chars_per_line: Maximum characters per line
+        max_lines: Maximum number of lines
+        
+    Returns:
+        Text with \\N line breaks
+    """
+    words = text.split()
+    
+    if not words:
+        return ''
+    
+    lines = []
+    current_line = []
+    current_length = 0
+    
+    for word in words:
+        word_len = len(word)
+        space_len = 1 if current_line else 0
+        
+        if current_length + space_len + word_len > max_chars_per_line and current_line:
+            lines.append(' '.join(current_line))
+            current_line = [word]
+            current_length = word_len
+        else:
+            current_line.append(word)
+            current_length += space_len + word_len
+    
+    if current_line:
+        lines.append(' '.join(current_line))
+    
+    # Limit to max_lines
+    lines = lines[:max_lines]
+    
+    return '\\N'.join(lines)
+
+
+def apply_emphasis_to_text(
+    text: str,
+    emphasis_indices: list[int],
+    emphasis_color: str = "&H0000FFFF",  # Yellow in ASS BGR
+) -> str:
+    """
+    Apply color emphasis to specific words in the text.
+    
+    Args:
+        text: Original text
+        emphasis_indices: Word indices (0-based) to emphasize
+        emphasis_color: ASS BGR color code for emphasis
+        
+    Returns:
+        Text with ASS color tags for emphasized words
+    """
+    if not emphasis_indices:
+        return text
+    
+    words = text.split()
+    
+    for i in emphasis_indices:
+        if 0 <= i < len(words):
+            # Wrap word in color tags (change color, then reset)
+            words[i] = f"{{\\c{emphasis_color}}}{words[i]}{{\\c}}"
+    
+    return ' '.join(words)
+
+
 def generate_ass_dialogue(
     start: float,
     end: float,
@@ -227,9 +312,11 @@ def generate_ass_dialogue(
     speaker_info: dict = None,
     layer: int = 0,
     enable_zoom_animation: bool = True,
+    emphasis_indices: list[int] = None,
+    enable_line_breaks: bool = True,
 ) -> str:
     """
-    Generate a single ASS dialogue line with optional zoom-in animation.
+    Generate a single ASS dialogue line with optional zoom-in animation and emphasis.
     
     Args:
         start: Start time in seconds
@@ -241,6 +328,8 @@ def generate_ass_dialogue(
         speaker_info: Dict mapping speaker IDs to SpeakerInfo (for gender-based colors)
         layer: Layer number (default 0)
         enable_zoom_animation: Add zoom-in effect on text appearance
+        emphasis_indices: Word indices to highlight (optional)
+        enable_line_breaks: Add line breaks for readability (default True)
         
     Returns:
         ASS dialogue line
@@ -249,9 +338,16 @@ def generate_ass_dialogue(
     start_str = format_ass_time(start)
     end_str = format_ass_time(end)
     
-    # Escape special ASS characters
-    # Newlines use \N, literal backslash uses \\
-    text_escaped = text.replace("\\", "\\\\").replace("\n", "\\N")
+    # Apply emphasis to specific words if provided
+    if emphasis_indices:
+        text = apply_emphasis_to_text(text, emphasis_indices)
+    
+    # Format with line breaks for readability
+    if enable_line_breaks:
+        text_formatted = format_text_with_line_breaks(text)
+    else:
+        # Just escape special characters
+        text_formatted = text.replace("\\", "\\\\").replace("\n", "\\N")
     
     # Add zoom-in animation effect
     # \fscx = font scale X, \fscy = font scale Y
@@ -263,9 +359,9 @@ def generate_ass_dialogue(
             f"\\t(0,{ZOOM_ANIMATION_DURATION_MS},"
             f"\\fscx{ZOOM_END_SCALE}\\fscy{ZOOM_END_SCALE})}}"
         )
-        text_with_effect = animation_tag + text_escaped
+        text_with_effect = animation_tag + text_formatted
     else:
-        text_with_effect = text_escaped
+        text_with_effect = text_formatted
     
     return f"Dialogue: {layer},{start_str},{end_str},{style},,0,0,0,,{text_with_effect}"
 
@@ -348,6 +444,7 @@ def segments_to_ass(
         is_primary = seg.get('is_primary', True)
         speaker = seg.get('speaker', '')
         speaker_index = speaker_indices.get(speaker, 0)
+        emphasis_indices = seg.get('emphasis_indices')  # From smart chunking
         
         if text:  # Skip empty segments
             dialogue = generate_ass_dialogue(
@@ -359,6 +456,8 @@ def segments_to_ass(
                 speaker_index=speaker_index,
                 speaker_info=speaker_info,
                 enable_zoom_animation=enable_zoom_animation,
+                emphasis_indices=emphasis_indices,
+                enable_line_breaks=True,  # Smart line breaking
             )
             ass_content += dialogue + "\n"
     

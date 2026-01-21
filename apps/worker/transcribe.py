@@ -1,10 +1,15 @@
-"""Transcription using faster-whisper for Stream2Short Worker."""
+"""Transcription using faster-whisper for Stream2Short Worker.
+
+Local fallback transcription when Groq is not configured.
+Now uses smart chunking for natural subtitle breaks.
+"""
 
 import os
 from pathlib import Path
 from typing import Optional
 from faster_whisper import WhisperModel
 from config import config
+from smart_chunker import smart_chunk_transcript
 
 # Global model instance (loaded lazily)
 _model: Optional[WhisperModel] = None
@@ -73,17 +78,21 @@ def transcribe_video(video_path: str, output_srt_path: str) -> str:
 
 def transcribe_video_with_segments(
     video_path: str,
-    words_per_subtitle: int = 3,
     audio_path: str = None,
+    enable_smart_chunking: bool = True,
+    enable_emphasis: bool = False,
 ) -> tuple[list[dict], str]:
     """
     Transcribe video/audio and return segment data for diarization processing.
     
+    Uses smart chunking by default for natural subtitle breaks that respect
+    punctuation, character limits, and duration constraints.
+    
     Args:
         video_path: Path to input video file (used if audio_path not provided)
-        words_per_subtitle: Max words per subtitle chunk
         audio_path: Optional path to preprocessed audio file (16kHz mono WAV)
-                   If provided, uses this instead of extracting from video
+        enable_smart_chunking: Use intelligent chunking (default True)
+        enable_emphasis: Highlight keywords (default False)
         
     Returns:
         Tuple of (segments list, transcript text)
@@ -108,53 +117,87 @@ def transcribe_video_with_segments(
     segments_list = list(segments)
     print(f"📝 Found {len(segments_list)} speech segments")
     
-    # Convert to dict format with word-level chunking
-    result_segments = []
+    # Collect all words with timestamps
+    all_words = []
     full_text_parts = []
     
     for segment in segments_list:
         if hasattr(segment, 'words') and segment.words:
             words = list(segment.words)
             
-            for i in range(0, len(words), words_per_subtitle):
-                chunk = words[i:i + words_per_subtitle]
-                if not chunk:
-                    continue
-                
-                text = " ".join(w.word.strip() for w in chunk).strip()
-                if text:
-                    result_segments.append({
-                        'start': chunk[0].start,
-                        'end': chunk[-1].end,
-                        'text': text,
+            for w in words:
+                word_text = w.word.strip()
+                if word_text:
+                    all_words.append({
+                        'word': word_text,
+                        'start': float(w.start),
+                        'end': float(w.end),
                     })
-                    full_text_parts.append(text)
+                    full_text_parts.append(word_text)
         else:
-            # Fallback for segments without word timestamps
+            # Fallback for segments without word timestamps - synthesize timing
             text = segment.text.strip()
             if text:
                 words = text.split()
                 duration = segment.end - segment.start
                 time_per_word = duration / len(words) if words else duration
                 
-                for i in range(0, len(words), words_per_subtitle):
-                    chunk_words = words[i:i + words_per_subtitle]
-                    chunk_start = segment.start + (i * time_per_word)
-                    chunk_end = min(segment.start + ((i + len(chunk_words)) * time_per_word), segment.end)
-                    chunk_text = " ".join(chunk_words)
+                for i, word_text in enumerate(words):
+                    word_start = segment.start + (i * time_per_word)
+                    word_end = segment.start + ((i + 1) * time_per_word)
                     
-                    if chunk_text:
-                        result_segments.append({
-                            'start': chunk_start,
-                            'end': chunk_end,
-                            'text': chunk_text,
-                        })
-                        full_text_parts.append(chunk_text)
+                    all_words.append({
+                        'word': word_text,
+                        'start': float(word_start),
+                        'end': float(word_end),
+                    })
+                    full_text_parts.append(word_text)
+    
+    # Apply smart chunking or legacy chunking
+    if enable_smart_chunking and all_words:
+        result_segments = smart_chunk_transcript(
+            words=all_words,
+            enable_emphasis=enable_emphasis,
+        )
+        print(f"✅ Smart chunking: {len(all_words)} words → {len(result_segments)} chunks")
+    else:
+        # Legacy 3-word chunking fallback
+        result_segments = _legacy_chunk_words(all_words, words_per_chunk=3)
+        print(f"✅ Legacy chunking: {len(all_words)} words → {len(result_segments)} chunks")
     
     full_text = " ".join(full_text_parts)
-    print(f"📝 Created {len(result_segments)} subtitle segments")
     
     return result_segments, full_text
+
+
+def _legacy_chunk_words(words: list[dict], words_per_chunk: int = 3) -> list[dict]:
+    """
+    Legacy fixed-word-count chunking (for backwards compatibility).
+    
+    Args:
+        words: List of word dicts with 'word', 'start', 'end'
+        words_per_chunk: Number of words per subtitle
+        
+    Returns:
+        List of segment dicts
+    """
+    result_segments = []
+    
+    for i in range(0, len(words), words_per_chunk):
+        chunk = words[i:i + words_per_chunk]
+        if not chunk:
+            continue
+        
+        text = " ".join(w.get('word', '') for w in chunk).strip()
+        
+        if text:
+            result_segments.append({
+                'start': chunk[0].get('start', 0),
+                'end': chunk[-1].get('end', chunk[0].get('start', 0) + 0.5),
+                'text': text,
+            })
+    
+    return result_segments
 
 
 def segments_to_srt(segments: list, words_per_subtitle: int = 3) -> str:
