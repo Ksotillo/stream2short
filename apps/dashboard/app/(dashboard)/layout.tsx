@@ -15,7 +15,7 @@ export default async function DashboardLayout({
   }
   
   return (
-    <div className="flex flex-col lg:flex-row h-screen overflow-hidden bg-black">
+    <div className="flex flex-col lg:flex-row h-screen overflow-hidden bg-black lg:bg-background">
       {/* Mobile header */}
       <MobileHeader user={session} />
       
@@ -24,7 +24,10 @@ export default async function DashboardLayout({
       
       {/* Main content */}
       <main className="flex-1 overflow-y-auto pb-20 lg:pb-0">
-        {children}
+        {/* Mobile: no container padding, Desktop: normal container */}
+        <div className="lg:container lg:py-6 lg:px-8">
+          {children}
+        </div>
       </main>
       
       {/* Mobile bottom navigation */}
