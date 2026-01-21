@@ -17,7 +17,7 @@
 - [x] StreamElements `!clip` command support
 - [x] Clip creation via Twitch API
 - [x] Video download via yt-dlp
-- [x] AI transcription (faster-whisper)
+- [x] AI transcription (~~faster-whisper~~ → **Groq API**)
 - [x] Vertical video rendering (FFmpeg)
 - [x] Google Drive upload (Shared Drives)
 - [x] Multi-streamer support
@@ -33,6 +33,9 @@
 - [x] Webcam detection and split layout
 - [x] Face-tight cropping
 - [x] Two output versions (with/without subtitles)
+- [x] **NEW:** Gemini Vision AI webcam detection
+- [x] **NEW:** FULL_CAM layout mode (when clip is just webcam)
+- [x] **NEW:** Layout caching (skip re-detection on re-renders)
 
 ### Infrastructure
 - [x] Anti-spam cooldowns
@@ -45,12 +48,15 @@
 - [x] `GET /se/clip` - StreamElements trigger
 - [x] `POST /api/clip` - Direct clip creation (requires LIVE)
 - [x] `POST /api/process-clip` - Process existing clip (offline)
-- [x] `GET /jobs` - List jobs for channel
-- [x] `GET /jobs/:id` - Get job details
+- [x] `GET /api/jobs` - List jobs for channel
+- [x] `GET /api/jobs/:id` - Get job details
+- [x] **NEW:** `GET /api/games` - Get games for channel (filtering)
 
 ---
 
-## 🎯 Phase 1 — "Usable Daily": Dashboard + Notifications + Re-renders
+## ✅ Phase 1 — "Usable Daily": Dashboard + Notifications + Re-renders
+
+**Status:** ✅ COMPLETE (except Discord notifications - skipped)
 
 **Why:** Turn the pipeline into a workflow creators/editors can actually use.
 
@@ -61,86 +67,65 @@
 **Pages:**
 | Route | Description |
 |-------|-------------|
-| `/` | Channel selection (or default if only one) |
-| `/jobs` | Job list with filters: channel, status, date range |
-| `/jobs/[id]` | Job detail with video preview, transcript, actions |
+| `/` | Home with stats + recent clips |
+| `/clips` | Clip list with filters: status, game, date |
+| `/clips/[id]` | Clip detail with video preview, transcript, actions |
+| `/clips/create` | Manual clip processing form |
+| `/settings` | Channel settings + StreamElements setup |
+| `/profile` | Mobile-only profile page |
 
 **Features:**
-- Video preview (WITH_SUBTITLES + WITHOUT_SUBTITLES side by side)
-- Transcript preview with speaker labels
-- Actions: Approve / Reject / Retry / Re-render
-- Filter by channel (multi-streamer support)
-
-**Auth Options:**
-- **Option A (fastest):** Shared password via `DASHBOARD_PASSWORD` env var
-- **Option B (proper):** Supabase Auth + RLS (can defer to Phase 2)
+- ✅ Video preview (WITH_SUBTITLES + WITHOUT_SUBTITLES)
+- ✅ Transcript preview
+- ✅ Actions: Approve / Reject / Retry / Re-render
+- ✅ Filter by status and game
+- ✅ **NEW:** Twitch OAuth authentication (Option B implemented!)
+- ✅ **NEW:** Mobile-first responsive design (TikTok/Instagram style)
+- ✅ **NEW:** Game category filtering with thumbnails
 
 ### 1.2 New API Endpoints
 - **Status:** ✅ Complete
-- **Effort:** ~2 hours
 
 ```
 GET  /api/channels              → List connected channels
-GET  /api/jobs?channel=&status= → Paginated job list
-GET  /api/jobs/:id              → Job details (exists, enhance)
+GET  /api/jobs?channel=&status=&game_id= → Paginated job list
+GET  /api/jobs/:id              → Job details with events
+GET  /api/games?channel_id=     → Games for filtering
 POST /api/jobs/:id/review       → { decision: "approved"|"rejected", notes? }
 POST /api/jobs/:id/retry        → { from_stage?: "download"|"transcribe"|"render"|"upload" }
 POST /api/jobs/:id/rerender     → { preset: "clean"|"boxed"|... }
 ```
 
-**Security:** Add `DASHBOARD_API_KEY` header requirement for dashboard endpoints.
+**Security:** ✅ `DASHBOARD_API_KEY` header + Twitch OAuth
 
 ### 1.3 Database Schema Updates
 - **Status:** ✅ Complete
-- **Effort:** ~30 min
 
-**Add to `clip_jobs`:**
+**Added to `clip_jobs`:**
 ```sql
-ALTER TABLE clip_jobs ADD COLUMN review_status TEXT;      -- pending|approved|rejected
+-- Phase 1 original
+ALTER TABLE clip_jobs ADD COLUMN review_status TEXT;
 ALTER TABLE clip_jobs ADD COLUMN review_notes TEXT;
 ALTER TABLE clip_jobs ADD COLUMN reviewed_at TIMESTAMPTZ;
-ALTER TABLE clip_jobs ADD COLUMN last_stage TEXT;         -- for retry hints
+ALTER TABLE clip_jobs ADD COLUMN last_stage TEXT;
 ALTER TABLE clip_jobs ADD COLUMN render_preset TEXT DEFAULT 'default';
+ALTER TABLE clip_jobs ADD COLUMN transcript_text TEXT;
+ALTER TABLE clip_jobs ADD COLUMN no_subtitles_url TEXT;
+
+-- NEW: Game info (004_game_info.sql)
+ALTER TABLE clip_jobs ADD COLUMN game_id TEXT;
+ALTER TABLE clip_jobs ADD COLUMN game_name TEXT;
+ALTER TABLE clip_jobs ADD COLUMN thumbnail_url TEXT;
 ```
 
-**Optional `job_events` table (for debugging/progress):**
-```sql
-CREATE TABLE job_events (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  job_id UUID REFERENCES clip_jobs(id),
-  created_at TIMESTAMPTZ DEFAULT now(),
-  level TEXT,      -- info|warn|error
-  stage TEXT,
-  message TEXT,
-  data JSONB
-);
-```
+**`job_events` table:** ✅ Implemented for debugging/progress
 
 ### 1.4 Discord Notifications
 - **Status:** ⏭️ Skipped (for later)
 - **Effort:** ~1 hour
 
-**Features:**
-- Webhook notification on job `ready`
-- Include: streamer name, clip URL, Google Drive link, dashboard link
-- Thumbnail preview in embed
-
-**Env vars:**
-```
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-PUBLIC_DASHBOARD_URL=https://your-domain.com/dashboard
-```
-
 ### 1.5 Retry + Re-render Mechanics
 - **Status:** ✅ Complete
-- **Effort:** ~2 hours
-
-**Retry:** Re-queue same job, worker resumes from failed stage.
-
-**Re-render:** Skip download/transcribe, only re-render with new preset:
-- `clean` - White text, outline, subtle shadow
-- `boxed` - Rounded rectangle background
-- `minimal` - Small, unobtrusive
 
 ### Phase 1 Acceptance Criteria
 - [x] Dashboard shows jobs for multiple streamers
@@ -148,11 +133,16 @@ PUBLIC_DASHBOARD_URL=https://your-domain.com/dashboard
 - [x] Can approve/reject with notes
 - [x] Can retry a failed job from specific stage
 - [x] Can re-render with different preset without re-downloading
-- [ ] ~~Discord notification fires on job completion~~ (skipped for later)
+- [x] **BONUS:** Twitch OAuth login (streamers see only their clips)
+- [x] **BONUS:** Mobile-friendly UI with bottom navigation
+- [x] **BONUS:** Game category filtering
+- [ ] ~~Discord notification fires on job completion~~ (skipped)
 
 ---
 
 ## 🎨 Phase 2 — "Quality + Consistency": Caption Presets + Smart Chunking
+
+**Status:** Not Started
 
 **Why:** Most perceived quality comes from captions. Make it consistent and configurable.
 
@@ -214,179 +204,143 @@ Replace fixed "3-word chunks" with intelligent rules:
 
 ## 🎬 Phase 3 — "Better Vertical Framing": Templates + Face Tracking
 
+**Status:** 🟡 Partially Complete
+
 **Why:** Cropping/layout is the next quality jump. Make it deterministic and configurable.
 
 ### 3.1 Template System
-- **Status:** Not Started
+- **Status:** 🟡 Partially Complete
 - **Effort:** ~4 hours
 
 **Templates:**
-| Template | Description |
-|----------|-------------|
-| `center_crop` | Simple center crop (existing) |
-| `split_webcam` | Webcam top, game bottom (existing) |
-| `blur_bg` | Blurred full frame as background, sharp crop overlay |
-| `face_track` | Dynamic crop following speaker's face |
-| `pip` | Picture-in-picture (small webcam corner) |
+| Template | Description | Status |
+|----------|-------------|--------|
+| `center_crop` | Simple center crop | ✅ Done |
+| `split_webcam` | Webcam top, game bottom | ✅ Done |
+| `full_cam` | Full-camera vertical crop | ✅ **NEW** |
+| `blur_bg` | Blurred full frame as background | ❌ Not done |
+| `face_track` | Dynamic crop following speaker's face | ❌ Not done |
+| `pip` | Picture-in-picture (small webcam corner) | ❌ Not done |
 
 **Store:** `channels.settings.render_template`
 
-**Auto-detection:** If webcam detected and template is `auto`, choose `split_webcam`.
+**Auto-detection:** ✅ Implemented - automatically detects webcam and chooses layout:
+- `FULL_CAM` - when webcam covers >70% of frame
+- `SPLIT` - when webcam detected in corner
+- `NO_WEBCAM` - simple center crop
 
 ### 3.2 Face Tracking (MediaPipe)
-- **Status:** Not Started
+- **Status:** 🟡 Partially Complete (using OpenCV DNN + Gemini Vision instead)
 - **Effort:** ~4-6 hours
 
-**Implementation:**
-- Use MediaPipe face detection
-- Sample frames at 5-10 fps
-- Compute crop window center, smooth with EMA
-- Generate dynamic FFmpeg crop parameters
-
-**Env:** `ENABLE_FACE_TRACKING=true`
+**What we have:**
+- ✅ OpenCV DNN face detection
+- ✅ Gemini Vision AI webcam rectangle detection
+- ✅ Face-anchored cropping
+- ❌ Dynamic per-frame tracking (static detection only)
 
 ### 3.3 Blur Background Template
 - **Status:** Not Started
 - **Effort:** ~2 hours
 
-**Implementation:**
-- Scale source to fill 1080x1920
-- Apply gaussian blur (radius ~30)
-- Overlay sharp cropped content centered
-
 ### Phase 3 Acceptance Criteria
-- [ ] Each template produces stable, readable 9:16 output
+- [x] Split webcam template produces stable 9:16 output
+- [x] FULL_CAM mode handles webcam-only clips
+- [x] Auto-detection chooses appropriate layout
+- [ ] Blur BG template available
 - [ ] Face tracking keeps speaker centered without jitter
-- [ ] Blur BG looks good for gameplay-heavy clips
 
 ---
 
 ## 📦 Phase 4 — "Scale + Reliability": Observability + Storage Abstraction
 
+**Status:** 🟡 Partially Complete
+
 **Why:** Prepare for multiple streamers, higher volume, different storage needs.
 
 ### 4.1 Enhanced Observability
-- **Status:** Not Started
+- **Status:** 🟡 Partially Complete
 - **Effort:** ~2 hours
 
-**Metrics to track:**
-- Step timings (download, transcribe, render, upload)
-- FFmpeg stderr captured
-- Model versions used
-- Upload durations
-- Error rates by stage
-
-**Store in:** `job_events` table or `clip_jobs.metrics` JSONB
-
-**Dashboard shows:**
-- Failures by stage (pie chart)
-- Average stage time (bar chart)
-- Success rate over time
+**What we have:**
+- ✅ `job_events` table for logging
+- ✅ Stage tracking (`last_stage`)
+- ✅ Error capture in database
+- ❌ Dashboard charts (failures by stage, timing)
+- ❌ FFmpeg stderr captured
 
 ### 4.2 Storage Provider Abstraction
 - **Status:** Not Started
 - **Effort:** ~3 hours
 
 **Providers:**
-- `gdrive` (existing)
-- `s3` (AWS/MinIO)
-- `azure_blob`
-- `local` (for dev/testing)
-
-**Store in DB:**
-```sql
-ALTER TABLE clip_jobs ADD COLUMN storage_provider TEXT DEFAULT 'gdrive';
-ALTER TABLE clip_jobs ADD COLUMN storage_id TEXT;      -- fileId/object key
-ALTER TABLE clip_jobs ADD COLUMN storage_url TEXT;     -- derived URL
-```
+- ✅ `gdrive` (implemented)
+- ❌ `s3` (AWS/MinIO)
+- ❌ `azure_blob`
+- ❌ `local` (for dev/testing)
 
 ### 4.3 Enhanced Rate Limiting
-- **Status:** Not Started
+- **Status:** ✅ Complete
 - **Effort:** ~1 hour
 
-**Add:**
-- Per-channel max jobs/hour
-- Per-channel max jobs/day
-- Configurable via `channels.settings`
+**Implemented:**
+- ✅ Per-channel cooldown
+- ✅ Per-user cooldown
+- ✅ Block on active job
+- ✅ Duplicate clip prevention
+- ✅ Human-readable error messages
 
 ### Phase 4 Acceptance Criteria
+- [x] Basic event logging to database
+- [x] Rate limits prevent abuse
 - [ ] Can diagnose failures from dashboard without Docker logs
 - [ ] Switching storage provider requires only env var change
-- [ ] Rate limits prevent abuse without blocking legitimate use
 
 ---
 
 ## 🚀 Phase 5 — "Content Engine": VOD Extraction + Auto-Titles + Quality Gate
 
-**Why:** Go beyond clips to full content creation workflow.
+**Status:** 🟡 Partially Complete
 
 ### 5.1 VOD Segment Extraction
 - **Status:** Not Started
 - **Effort:** ~3 hours
 
-**Endpoint:** `POST /api/extract-vod`
-```json
-{
-  "vod_id": "1234567890",
-  "start_time": "01:23:45",
-  "duration": 90,
-  "channel": "streamer_login"
-}
-```
-
-**Features:**
-- Extract any segment from VODs (up to 5 minutes)
-- Works when streamer is offline
-- Same processing pipeline
-
 ### 5.2 Quality Gate
 - **Status:** Not Started
 - **Effort:** ~2 hours
 
-**Before full render, detect:**
-- Too quiet (low audio levels)
-- Too short (< 5 seconds)
-- Too much silence (> 50%)
-- No speech detected
-
-**Mark jobs as:** `discarded` with reason
-
 ### 5.3 Auto-Generated Metadata
-- **Status:** Not Started
+- **Status:** 🟡 Partially Complete
 - **Effort:** ~2 hours
 
-**Generate:**
-- Suggested filename (from transcript)
-- Suggested title
-- Suggested caption/hashtags
-- Keywords for searchability
-
-**Store:**
-```sql
-ALTER TABLE clip_jobs ADD COLUMN suggested_title TEXT;
-ALTER TABLE clip_jobs ADD COLUMN suggested_caption TEXT;
-ALTER TABLE clip_jobs ADD COLUMN suggested_tags TEXT[];
-```
+**What we have:**
+- ✅ Filename generated from transcript words
+- ✅ `transcript_text` stored for preview/search
+- ❌ Suggested title generation
+- ❌ Suggested caption/hashtags
+- ❌ Keywords extraction
 
 ### 5.4 Thumbnail Generation
-- **Status:** Not Started
+- **Status:** 🟡 Partially Complete
 - **Effort:** ~1 hour
 
-**Features:**
-- Extract best frame (peak audio/action)
-- Save alongside video in storage
-- Multiple sizes: 1080x1920, 720x1280, 360x640
+**What we have:**
+- ✅ Twitch thumbnail URL stored (`thumbnail_url`)
+- ❌ Custom thumbnail generation
+- ❌ Multiple sizes
 
 ### Phase 5 Acceptance Criteria
 - [ ] Can extract VOD segments without Twitch clip limitations
 - [ ] Low-quality clips auto-discarded with clear reason
-- [ ] Generated titles/captions are usable starting points
+- [x] Filename generated from transcript
+- [x] Thumbnail available for preview
 
 ---
 
 ## 🌟 Phase 6 — "Full Automation": Auto-Upload + Learning Loop
 
-**Why:** Eliminate manual steps entirely.
+**Status:** Not Started
 
 ### 6.1 Auto-Upload to Platforms
 - **Status:** Not Started
@@ -399,29 +353,13 @@ ALTER TABLE clip_jobs ADD COLUMN suggested_tags TEXT[];
 | YouTube Shorts | YouTube Data API v3 | OAuth required |
 | Instagram Reels | Instagram Graph API | Business account only |
 
-**Features:**
-- Draft mode (upload but don't publish)
-- Scheduled publishing
-- Per-channel platform configuration
-
 ### 6.2 Learning Loop
 - **Status:** Not Started
 - **Effort:** ~3 hours
 
-**Use review outcomes to:**
-- Track which presets get approved most
-- Suggest default preset per channel
-- Identify common rejection reasons
-
 ### 6.3 Background Music
 - **Status:** Not Started
 - **Effort:** ~3 hours
-
-**Features:**
-- Library of royalty-free tracks
-- Auto-duck music during speech
-- Configurable volume levels
-- Per-channel music preferences
 
 ### Phase 6 Acceptance Criteria
 - [ ] Clips auto-upload to configured platforms
@@ -430,27 +368,46 @@ ALTER TABLE clip_jobs ADD COLUMN suggested_tags TEXT[];
 
 ---
 
-## 📋 Implementation Order
+## 🆕 Unplanned Features (Added Since Roadmap)
 
-### Quick Wins (Do First)
-1. Discord Notifications (Phase 1.4) - ~1 hour
-2. Schema updates (Phase 1.3) - ~30 min
-3. Retry mechanics (Phase 1.5) - ~2 hours
+These features were implemented outside the original roadmap:
 
-### Core Value (Phase 1 Complete)
-4. Dashboard API endpoints (Phase 1.2) - ~2 hours
-5. Next.js Dashboard (Phase 1.1) - ~4-6 hours
+| Feature | Description | Status |
+|---------|-------------|--------|
+| **Groq Transcription** | Cloud-based Whisper API (faster than local) | ✅ Done |
+| **Gemini Vision** | AI webcam detection with frame analysis | ✅ Done |
+| **FULL_CAM Mode** | Layout for webcam-only clips | ✅ Done |
+| **Game Categories** | Track and filter by game/category | ✅ Done |
+| **Twitch OAuth Dashboard** | Proper auth instead of shared password | ✅ Done |
+| **Mobile UI Redesign** | TikTok/Instagram-style mobile experience | ✅ Done |
+| **Layout Caching** | Skip re-detection on re-renders | ✅ Done |
+| **Force Reprocess** | Bypass duplicate detection for testing | ✅ Done |
 
-### Quality Polish (Phase 2-3)
-6. Caption presets (Phase 2.1) - ~3 hours
-7. Smart chunking (Phase 2.2) - ~2 hours
-8. Safe zones (Phase 2.3) - ~1 hour
-9. Template system (Phase 3.1) - ~4 hours
+---
 
-### Scale & Features (Phase 4-6)
-10. Observability (Phase 4.1) - ~2 hours
-11. VOD extraction (Phase 5.1) - ~3 hours
-12. Auto-upload (Phase 6.1) - ~6-8 hours
+## 📋 Updated Implementation Order
+
+### ✅ Completed
+1. ~~Discord Notifications (Phase 1.4)~~ - Skipped
+2. ✅ Schema updates (Phase 1.3)
+3. ✅ Retry mechanics (Phase 1.5)
+4. ✅ Dashboard API endpoints (Phase 1.2)
+5. ✅ Next.js Dashboard (Phase 1.1)
+6. ✅ Partial template system (Phase 3.1)
+7. ✅ Basic observability (Phase 4.1)
+8. ✅ Rate limiting (Phase 4.3)
+
+### Next Up (Suggested)
+1. Caption presets (Phase 2.1) - ~3 hours
+2. Smart chunking (Phase 2.2) - ~2 hours
+3. Safe zones (Phase 2.3) - ~1 hour
+4. Blur background template (Phase 3.3) - ~2 hours
+5. Discord notifications (Phase 1.4) - ~1 hour
+
+### Future
+6. VOD extraction (Phase 5.1) - ~3 hours
+7. Storage abstraction (Phase 4.2) - ~3 hours
+8. Auto-upload (Phase 6.1) - ~6-8 hours
 
 ---
 
@@ -458,7 +415,7 @@ ALTER TABLE clip_jobs ADD COLUMN suggested_tags TEXT[];
 
 | Topic | Notes |
 |-------|-------|
-| **GPU Support** | Would 10x speed up Whisper and FFmpeg |
+| **GPU Support** | Would 10x speed up FFmpeg (Whisper now uses Groq cloud) |
 | **Horizontal Scaling** | Multiple workers for parallel processing |
 | **CDN Integration** | Faster delivery than Google Drive links |
 | **Database** | Consider direct PostgreSQL for high volume |
