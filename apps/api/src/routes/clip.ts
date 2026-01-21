@@ -99,14 +99,7 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
       if (!cooldownResult.allowed) {
         fastify.log.info(`Clip request blocked: ${cooldownResult.reason} (channel: ${channelRecord.twitch_login}, user: ${user})`);
         
-        if (cooldownResult.waitSeconds) {
-          return reply.send(`⏳ Please wait ${cooldownResult.waitSeconds}s before creating another clip.`);
-        }
-        
-        if (cooldownResult.reason?.includes('already being processed')) {
-          return reply.send(`⏳ A clip is already being processed. Please wait.`);
-        }
-        
+        // Return user-friendly message for chat
         return reply.send(`⏳ ${cooldownResult.reason}`);
       }
       
@@ -200,8 +193,8 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
       
       if (!cooldownResult.allowed) {
         return reply.status(429).send({
-          error: 'Rate limited',
-          reason: cooldownResult.reason,
+          error: cooldownResult.reason,
+          message: cooldownResult.reason,
           wait_seconds: cooldownResult.waitSeconds,
         });
       }
@@ -365,19 +358,21 @@ export async function clipRoutes(fastify: FastifyInstance): Promise<void> {
       );
       
       if (!cooldownResult.allowed) {
-        // For duplicate clips, return the existing job info
+        // For duplicate clips, return the existing job info with helpful message
         if (cooldownResult.existingJob && cooldownResult.reason?.includes('already been processed')) {
           return reply.status(409).send({
             error: cooldownResult.reason,
+            message: cooldownResult.reason,
             existing_job_id: cooldownResult.existingJob.id,
             existing_job_status: cooldownResult.existingJob.status,
             clip_id: clipInfo.id,
+            hint: 'Use force=true to reprocess this clip',
           });
         }
         
         return reply.status(429).send({
-          error: 'Rate limited',
-          reason: cooldownResult.reason,
+          error: cooldownResult.reason,
+          message: cooldownResult.reason,
         });
       }
       

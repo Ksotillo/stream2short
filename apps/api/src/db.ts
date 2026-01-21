@@ -534,9 +534,12 @@ export async function checkCooldowns(
   if (options.blockDuplicateClips && twitchClipId) {
     const existingJob = await getJobByClipId(twitchClipId);
     if (existingJob) {
+      const statusMsg = existingJob.status === 'ready' 
+        ? 'Check your clips list to find it!' 
+        : `Current status: ${existingJob.status}`;
       return {
         allowed: false,
-        reason: 'This clip has already been processed',
+        reason: `This clip has already been processed. ${statusMsg}`,
         existingJob,
       };
     }
@@ -548,7 +551,7 @@ export async function checkCooldowns(
     if (activeJob) {
       return {
         allowed: false,
-        reason: 'A clip is already being processed for this channel',
+        reason: 'Another clip is currently being processed for this channel. Please wait for it to finish before creating a new one.',
         existingJob: activeJob,
       };
     }
@@ -562,7 +565,7 @@ export async function checkCooldowns(
       const waitSeconds = Math.ceil(options.channelCooldownSeconds - jobAge);
       return {
         allowed: false,
-        reason: `Channel cooldown active`,
+        reason: `This channel just created a clip. Please wait ${waitSeconds} seconds before creating another one.`,
         waitSeconds,
         existingJob: recentJob,
       };
@@ -577,7 +580,7 @@ export async function checkCooldowns(
       const waitSeconds = Math.ceil(options.userCooldownSeconds - jobAge);
       return {
         allowed: false,
-        reason: `User cooldown active`,
+        reason: `You just created a clip. Please wait ${waitSeconds} seconds before creating another one.`,
         waitSeconds,
         existingJob: recentUserJob,
       };
