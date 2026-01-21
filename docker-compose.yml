@@ -48,6 +48,11 @@ services:
       # Dashboard auth
       - DASHBOARD_API_KEY=${DASHBOARD_API_KEY}
       - PUBLIC_DASHBOARD_URL=${PUBLIC_DASHBOARD_URL}
+      # Anti-spam / Cooldown settings
+      - BLOCK_ON_ACTIVE_JOB=${BLOCK_ON_ACTIVE_JOB:-true}
+      - CHANNEL_COOLDOWN_SECONDS=${CHANNEL_COOLDOWN_SECONDS:-30}
+      - USER_COOLDOWN_SECONDS=${USER_COOLDOWN_SECONDS:-60}
+      - BLOCK_DUPLICATE_CLIPS=${BLOCK_DUPLICATE_CLIPS:-true}
     depends_on:
       redis:
         condition: service_healthy
