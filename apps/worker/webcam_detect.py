@@ -653,6 +653,106 @@ def detect_face_dnn(
     return best_face
 
 
+def _score_face_for_fullcam(face: FaceDetection, frame_w: int, frame_h: int) -> float:
+    """
+    Score a face for FULL_CAM streamer selection.
+    
+    Streamers typically:
+    - Are in the LOWER portion of the frame (seated at desk)
+    - Are relatively CENTERED horizontally
+    - Have LARGER faces (closer to camera than background people)
+    """
+    face_area = face.width * face.height
+    frame_area = frame_w * frame_h
+    
+    # Factor 1: Size - larger faces are likely the main subject
+    size_score = min(1.0, (face_area / frame_area) / 0.25)
+    
+    # Factor 2: Vertical position - prefer faces in LOWER half
+    y_ratio = face.center_y / frame_h
+    if y_ratio < 0.25:
+        position_score = 0.3  # Upper area - likely background person
+    elif y_ratio > 0.85:
+        position_score = 0.7  # Very bottom - might be cut off
+    else:
+        # Sweet spot: 0.4-0.8 from top
+        position_score = 0.4 + 0.6 * min(1.0, (y_ratio - 0.25) / 0.5)
+    
+    # Factor 3: Horizontal centering
+    x_ratio = face.center_x / frame_w
+    center_score = 1.0 - abs(x_ratio - 0.5) * 1.5
+    center_score = max(0.2, center_score)
+    
+    # Combined score: position matters most for distinguishing streamer from background
+    return (size_score * 0.35) + (position_score * 0.45) + (center_score * 0.20)
+
+
+def _detect_best_face_for_fullcam(frame_bgr: np.ndarray) -> Optional[FaceDetection]:
+    """
+    Detect the best face for FULL_CAM mode (the main streamer, not background people).
+    
+    Uses scoring that prefers:
+    - Larger faces (closer to camera)
+    - Faces in lower portion of frame (streamers sit at desk level)
+    - More centered faces
+    """
+    detector = get_dnn_face_detector()
+    if detector is None:
+        return None
+    
+    h, w = frame_bgr.shape[:2]
+    faces = []
+    
+    if isinstance(detector, cv2.CascadeClassifier):
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        detections = detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(40, 40),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+        
+        for (fx, fy, fw, fh) in detections:
+            faces.append(FaceDetection(
+                x=fx, y=fy, width=fw, height=fh, confidence=0.8
+            ))
+    
+    elif hasattr(cv2, 'FaceDetectorYN') and isinstance(detector, cv2.FaceDetectorYN):
+        detector.setInputSize((w, h))
+        _, detections = detector.detect(frame_bgr)
+        
+        if detections is not None:
+            for det in detections:
+                fx, fy, fw, fh = int(det[0]), int(det[1]), int(det[2]), int(det[3])
+                conf = float(det[-1])
+                if conf >= 0.5:
+                    faces.append(FaceDetection(
+                        x=fx, y=fy, width=fw, height=fh, confidence=conf
+                    ))
+    
+    if not faces:
+        return None
+    
+    # Filter small faces
+    valid_faces = [f for f in faces if f.width >= 40 and f.height >= 40]
+    if not valid_faces:
+        return None
+    
+    # Score each face and pick the best for FULL_CAM
+    scored_faces = [(f, _score_face_for_fullcam(f, w, h)) for f in valid_faces]
+    
+    # Log face candidates for debugging
+    print(f"  📊 Face candidates ({len(scored_faces)}):")
+    for face, score in sorted(scored_faces, key=lambda x: -x[1]):
+        y_ratio = face.center_y / h
+        print(f"     - {face.width}x{face.height} at ({face.center_x},{face.center_y}) "
+              f"y_ratio={y_ratio:.2f} score={score:.3f}")
+    
+    best_face, best_score = max(scored_faces, key=lambda x: x[1])
+    return best_face
+
+
 def bbox_contains_face(
     bbox: Dict[str, int],
     face: FaceDetection,
@@ -2175,38 +2275,37 @@ def detect_webcam_region(
         if frame is not None:
             height, width = frame.shape[:2]
             
-            # Detect face in full frame
-            face = detect_face_dnn(frame)
+            # Detect ALL faces and pick the best one for FULL_CAM
+            # (prefer faces in lower portion - streamers sit at desk level)
+            face = _detect_best_face_for_fullcam(frame)
             
             if face:
                 # Calculate how much of the frame the face occupies
-                # A prominent face (FULL_CAM) typically means the face is reasonably large
                 face_area = face.width * face.height
                 frame_area = width * height
                 face_ratio = face_area / frame_area
                 
-                # Also check if face is reasonably centered (not in a small corner)
                 face_center_x = face.center_x
                 face_center_y = face.center_y
                 
-                # Face should be somewhat centered (within middle 70% of frame)
-                is_centered_x = 0.15 * width < face_center_x < 0.85 * width
-                is_centered_y = 0.10 * height < face_center_y < 0.90 * height
+                # For FULL_CAM, we just need a reasonably visible face
+                # The scoring already prefers the main subject
+                is_centered_x = 0.10 * width < face_center_x < 0.90 * width
+                is_in_frame = 0.05 * height < face_center_y < 0.95 * height
                 
-                print(f"  👤 Face detected in full frame:")
+                print(f"  👤 Best face detected for FULL_CAM:")
                 print(f"     Face size: {face.width}x{face.height} ({face_ratio:.1%} of frame)")
                 print(f"     Face center: ({face_center_x}, {face_center_y})")
-                print(f"     Centered: X={is_centered_x}, Y={is_centered_y}")
+                print(f"     In-frame: X={is_centered_x}, Y={is_in_frame}")
                 
                 # FULL_CAM criteria:
-                # - Face detected (DNN is reliable)
-                # - Face is at least 2% of frame (not tiny background face)
-                # - Face is reasonably centered (not a corner overlay)
-                if face_ratio >= 0.02 and is_centered_x and is_centered_y:
+                # - Face detected
+                # - Face is at least 1.5% of frame (not tiny background face)
+                # - Face is reasonably within frame bounds
+                if face_ratio >= 0.015 and is_centered_x and is_in_frame:
                     print(f"  ✅ FULL_CAM detected: person in full frame (no overlay)")
                     
                     # Return a full-frame WebcamRegion to trigger FULL_CAM layout
-                    # Small inset to avoid edge artifacts
                     inset = int(min(width, height) * 0.01)
                     return WebcamRegion(
                         x=inset,

@@ -92,9 +92,64 @@ def extract_frame_at_time(video_path: str, timestamp: float, temp_dir: str) -> O
     return None
 
 
+def _score_face_for_fullcam(x: int, y: int, w: int, h: int, frame_w: int, frame_h: int) -> float:
+    """
+    Score a face for FULL_CAM selection (streamer detection).
+    
+    Streamers typically:
+    - Are in the LOWER portion of the frame (seated at desk)
+    - Are relatively CENTERED horizontally
+    - Have LARGER faces (closer to camera than background people)
+    
+    Args:
+        x, y, w, h: Face bounding box
+        frame_w, frame_h: Frame dimensions
+    
+    Returns:
+        Score (higher = more likely to be the streamer)
+    """
+    face_center_x = x + w // 2
+    face_center_y = y + h // 2
+    face_area = w * h
+    frame_area = frame_w * frame_h
+    
+    # Factor 1: Size - larger faces are likely the main subject (closer to camera)
+    # Normalize to 0-1 range (max expected face area ~30% of frame)
+    size_score = min(1.0, (face_area / frame_area) / 0.30)
+    
+    # Factor 2: Vertical position - prefer faces in LOWER half of frame
+    # Streamers sit at desk level, background people are often standing
+    # y_ratio = 0 at top, 1 at bottom
+    y_ratio = face_center_y / frame_h
+    # Score: 0.3 at top, 1.0 at 70% down, 0.8 at bottom
+    if y_ratio < 0.3:
+        position_score = 0.3  # Upper area - likely background
+    elif y_ratio > 0.85:
+        position_score = 0.8  # Very bottom - might be cut off
+    else:
+        # Sweet spot: 0.3-0.85 from top, peaking around 0.6-0.7
+        position_score = 0.5 + 0.5 * min(1.0, (y_ratio - 0.3) / 0.4)
+    
+    # Factor 3: Horizontal centering - streamers are usually centered
+    x_ratio = face_center_x / frame_w
+    # Score peaks at center (0.5), drops toward edges
+    center_score = 1.0 - abs(x_ratio - 0.5) * 1.5  # 1.0 at center, 0.25 at edges
+    center_score = max(0.2, center_score)
+    
+    # Combined score: size matters most, then position, then centering
+    total_score = (size_score * 0.5) + (position_score * 0.35) + (center_score * 0.15)
+    
+    return total_score
+
+
 def detect_face_dnn(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
     """
     Detect face using OpenCV DNN (Caffe model).
+    
+    For FULL_CAM scenarios, prefers faces that are:
+    - Larger (closer to camera)
+    - In the lower portion of frame (streamer at desk)
+    - More centered horizontally
     
     Returns:
         Tuple of (x, y, width, height, confidence) or None
@@ -119,13 +174,13 @@ def detect_face_dnn(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int,
     net.setInput(blob)
     detections = net.forward()
     
-    best_detection = None
-    best_confidence = 0.5  # Minimum confidence threshold
+    # Collect all valid faces
+    candidates = []
     
     for i in range(detections.shape[2]):
         confidence = detections[0, 0, i, 2]
         
-        if confidence > best_confidence:
+        if confidence > 0.5:  # Minimum confidence
             box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
             x1, y1, x2, y2 = box.astype("int")
             
@@ -136,19 +191,32 @@ def detect_face_dnn(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int,
             y2 = min(h, y2)
             
             if x2 > x1 and y2 > y1:
-                best_detection = (x1, y1, x2 - x1, y2 - y1, confidence)
-                best_confidence = confidence
+                fw, fh = x2 - x1, y2 - y1
+                # Score for streamer detection
+                score = _score_face_for_fullcam(x1, y1, fw, fh, w, h)
+                candidates.append((x1, y1, fw, fh, confidence, score))
     
-    return best_detection
+    if not candidates:
+        return None
+    
+    # Pick face with highest streamer score
+    best = max(candidates, key=lambda c: c[5])
+    return (best[0], best[1], best[2], best[3], best[4])
 
 
 def detect_face_haar(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
     """
     Fallback face detection using Haar Cascade.
     
+    For FULL_CAM scenarios, prefers faces that are:
+    - Larger (closer to camera)
+    - In the lower portion of frame (streamer at desk)
+    - More centered horizontally
+    
     Returns:
         Tuple of (x, y, width, height, confidence) or None
     """
+    h, w = frame_bgr.shape[:2]
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     
     cascade_paths = [
@@ -175,11 +243,16 @@ def detect_face_haar(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int
     if len(faces) == 0:
         return None
     
-    # Return largest face
-    largest = max(faces, key=lambda f: f[2] * f[3])
-    x, y, w, h = largest
+    # Score each face for streamer detection
+    candidates = []
+    for (fx, fy, fw, fh) in faces:
+        score = _score_face_for_fullcam(fx, fy, fw, fh, w, h)
+        candidates.append((fx, fy, fw, fh, 0.8, score))  # Haar confidence = 0.8
     
-    return (x, y, w, h, 0.8)  # Haar doesn't give confidence, use 0.8
+    # Pick face with highest streamer score
+    best = max(candidates, key=lambda c: c[5])
+    
+    return (best[0], best[1], best[2], best[3], 0.8)  # Haar doesn't give confidence, use 0.8
 
 
 def track_faces(
