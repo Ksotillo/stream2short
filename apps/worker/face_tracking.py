@@ -43,30 +43,52 @@ def _get_dnn_net():
     global _DNN_NET, _DNN_NET_LOADED
     
     if _DNN_NET_LOADED:
+        if _DNN_NET is not None:
+            print(f"   🔄 DNN net already loaded (cached)")
         return _DNN_NET
     
     _DNN_NET_LOADED = True
     
+    # HARD DIAGNOSTIC: Log exact paths being checked
     model_base = Path(__file__).parent / "models"
     prototxt = model_base / "deploy.prototxt"
     caffemodel = model_base / "res10_300x300_ssd_iter_140000.caffemodel"
     
+    print(f"   🔍 DNN MODEL PATHS:")
+    print(f"      __file__: {__file__}")
+    print(f"      model_base: {model_base}")
+    print(f"      model_base.resolve(): {model_base.resolve()}")
+    print(f"      prototxt: {prototxt}")
+    print(f"      prototxt.exists(): {prototxt.exists()}")
+    print(f"      caffemodel: {caffemodel}")
+    print(f"      caffemodel.exists(): {caffemodel.exists()}")
+    
     if not prototxt.exists() or not caffemodel.exists():
-        print(f"   ⚠️ DNN models not found at {model_base}")
-        print(f"      Prototxt exists: {prototxt.exists()}")
-        print(f"      Caffemodel exists: {caffemodel.exists()}")
+        print(f"   ❌ DNN MODELS NOT FOUND!")
+        # Try to list what IS in the models directory
+        if model_base.exists():
+            print(f"      Contents of {model_base}:")
+            for f in model_base.iterdir():
+                print(f"         - {f.name}")
+        else:
+            print(f"      Directory {model_base} does NOT exist!")
         return None
     
     try:
+        print(f"   🚀 Loading DNN model with cv2.dnn.readNetFromCaffe...")
         net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
         # Set optimal backend/target for CPU
         net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
         net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         _DNN_NET = net
-        print("   ✅ DNN face detector loaded successfully")
+        print("   ✅ DNN face detector loaded successfully!")
         return _DNN_NET
     except Exception as e:
-        print(f"   ❌ Failed to load DNN model: {e}")
+        import traceback
+        print(f"   ❌ EXCEPTION loading DNN model:")
+        print(f"      Exception type: {type(e).__name__}")
+        print(f"      Exception message: {e}")
+        print(f"      Traceback: {traceback.format_exc()}")
         return None
 
 
@@ -288,9 +310,14 @@ def detect_face_dnn(
     Returns:
         Tuple of (x, y, width, height, confidence) or None
     """
+    print(f"   🔍 detect_face_dnn() ENTER - threshold={confidence_threshold}")
+    
     net = _get_dnn_net()
     if net is None:
+        print(f"   ❌ detect_face_dnn(): DNN net is None, cannot proceed")
         return None
+    
+    print(f"   ✅ detect_face_dnn(): DNN net loaded, running detection...")
     
     h, w = frame_bgr.shape[:2]
     
@@ -359,19 +386,23 @@ def detect_face_dnn(
                 candidates.append(ec)
     
     if not candidates:
+        print(f"   ❌ detect_face_dnn(): No candidates found above threshold {confidence_threshold}")
         return None
     
-    # Debug logging
-    if DEBUG_FACE_TRACKING:
-        candidates_sorted = sorted(candidates, key=lambda c: c['score'], reverse=True)
-        print(f"   🔍 DNN candidates ({len(candidates_sorted)}):")
-        for i, c in enumerate(candidates_sorted[:3]):
-            x, y, fw, fh = c['bbox']
-            print(f"      #{i+1}: ({x},{y}) {fw}x{fh} conf={c['confidence']:.2f} score={c['score']:.3f} y={c['y_ratio']:.2f} x={c['x_ratio']:.2f}")
+    # ALWAYS log candidates for diagnostics
+    candidates_sorted = sorted(candidates, key=lambda c: c['score'], reverse=True)
+    print(f"   📊 detect_face_dnn(): Found {len(candidates_sorted)} candidates:")
+    for i, c in enumerate(candidates_sorted[:3]):
+        x, y, fw, fh = c['bbox']
+        print(f"      #{i+1}: ({x},{y}) {fw}x{fh} conf={c['confidence']:.2f} score={c['score']:.3f} y={c['y_ratio']:.2f} x={c['x_ratio']:.2f}")
+    if len(candidates_sorted) > 3:
+        print(f"      ... and {len(candidates_sorted) - 3} more")
     
     # Pick face with highest streamer score
     best = max(candidates, key=lambda c: c['score'])
     x, y, fw, fh = best['bbox']
+    
+    print(f"   ✅ detect_face_dnn(): Returning best face at ({x},{y}) {fw}x{fh} conf={best['confidence']:.2f}")
     
     return (x, y, fw, fh, best['confidence'])
 
@@ -727,3 +758,366 @@ def get_static_face_center(face_track: FaceTrack) -> Optional[Tuple[int, int]]:
         return None
     
     return (int(weighted_x / total_weight), int(weighted_y / total_weight))
+
+
+# =============================================================================
+# GEMINI ANCHOR + OPENCV TRACKER (for when face detection picks background)
+# =============================================================================
+
+def _is_face_track_likely_background(face_track: FaceTrack) -> bool:
+    """
+    Check if the detected face track is likely a background person, not the streamer.
+    
+    Background indicators:
+    - Faces consistently in upper portion (y_ratio < 0.45)
+    - Faces consistently on far right (x_ratio > 0.55)
+    - Very stable position (background people are usually stationary)
+    """
+    if not face_track or len(face_track.keyframes) < 3:
+        return False
+    
+    # Calculate average position ratios
+    avg_y_ratio = sum(kf.center_y for kf in face_track.keyframes) / len(face_track.keyframes) / face_track.video_height
+    avg_x_ratio = sum(kf.center_x for kf in face_track.keyframes) / len(face_track.keyframes) / face_track.video_width
+    
+    # Check for background indicators
+    in_upper = avg_y_ratio < 0.45
+    on_far_right = avg_x_ratio > 0.55
+    
+    if in_upper or on_far_right:
+        print(f"   ⚠️ Face track appears to be background: y_ratio={avg_y_ratio:.2f}, x_ratio={avg_x_ratio:.2f}")
+        return True
+    
+    return False
+
+
+def _get_opencv_tracker():
+    """
+    Get the best available OpenCV tracker.
+    
+    Preference order: CSRT > KCF > MOSSE
+    CSRT is most accurate but slowest.
+    """
+    # Try CSRT first (most accurate)
+    if hasattr(cv2, 'TrackerCSRT_create'):
+        return cv2.TrackerCSRT_create()
+    
+    # Try legacy API
+    if hasattr(cv2, 'legacy') and hasattr(cv2.legacy, 'TrackerCSRT_create'):
+        return cv2.legacy.TrackerCSRT_create()
+    
+    # Fallback to KCF
+    if hasattr(cv2, 'TrackerKCF_create'):
+        return cv2.TrackerKCF_create()
+    
+    if hasattr(cv2, 'legacy') and hasattr(cv2.legacy, 'TrackerKCF_create'):
+        return cv2.legacy.TrackerKCF_create()
+    
+    # Last resort: MOSSE (fastest but least accurate)
+    if hasattr(cv2, 'TrackerMOSSE_create'):
+        return cv2.TrackerMOSSE_create()
+    
+    if hasattr(cv2, 'legacy') and hasattr(cv2.legacy, 'TrackerMOSSE_create'):
+        return cv2.legacy.TrackerMOSSE_create()
+    
+    print("   ⚠️ No OpenCV tracker available")
+    return None
+
+
+def track_with_gemini_anchor(
+    video_path: str,
+    temp_dir: str,
+    sample_interval: float = 1.5,
+    ema_alpha: float = 0.4,
+    max_keyframes: int = 20,
+) -> Optional[FaceTrack]:
+    """
+    Track using Gemini anchor + OpenCV tracker.
+    
+    This is used when face detection picks the wrong person (background).
+    
+    Flow:
+    1. Extract a frame at ~3s (middle of clip)
+    2. Ask Gemini to identify the main streamer's bbox
+    3. Initialize OpenCV tracker with that bbox
+    4. Track across sampled frames
+    5. Build keyframes from tracker results
+    
+    Args:
+        video_path: Path to input video
+        temp_dir: Temporary directory
+        sample_interval: Time between samples
+        ema_alpha: EMA smoothing factor
+        max_keyframes: Maximum keyframes
+    
+    Returns:
+        FaceTrack or None if tracking fails
+    """
+    print(f"🎯 Starting Gemini anchor + OpenCV tracker for: {video_path}")
+    
+    # Get video info
+    info = get_video_info(video_path)
+    duration = info["duration"]
+    width = info["width"]
+    height = info["height"]
+    
+    print(f"   📹 Video: {width}x{height}, {duration:.2f}s")
+    
+    # ==========================================================================
+    # STEP 1: Extract anchor frame and get Gemini bbox
+    # ==========================================================================
+    anchor_time = min(3.0, duration / 2)  # 3 seconds or middle of clip
+    anchor_frame_path = Path(temp_dir) / "gemini_anchor_frame.jpg"
+    
+    # Extract frame
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(anchor_time),
+        "-i", video_path,
+        "-vframes", "1",
+        "-q:v", "2",
+        str(anchor_frame_path),
+    ]
+    subprocess.run(cmd, capture_output=True, text=True)
+    
+    if not anchor_frame_path.exists():
+        print("   ❌ Failed to extract anchor frame")
+        return None
+    
+    # Get Gemini anchor
+    try:
+        from gemini_vision import get_fullcam_anchor_bbox_with_gemini
+        
+        gemini_bbox = get_fullcam_anchor_bbox_with_gemini(
+            str(anchor_frame_path), width, height
+        )
+        
+        if gemini_bbox is None:
+            print("   ❌ Gemini could not identify streamer")
+            # Clean up
+            anchor_frame_path.unlink(missing_ok=True)
+            return None
+        
+        anchor_x = gemini_bbox['x']
+        anchor_y = gemini_bbox['y']
+        anchor_w = gemini_bbox['w']
+        anchor_h = gemini_bbox['h']
+        
+        print(f"   ✅ Gemini anchor: ({anchor_x},{anchor_y}) {anchor_w}x{anchor_h}")
+        
+    except ImportError as e:
+        print(f"   ❌ gemini_vision not available: {e}")
+        anchor_frame_path.unlink(missing_ok=True)
+        return None
+    except Exception as e:
+        print(f"   ❌ Gemini error: {e}")
+        anchor_frame_path.unlink(missing_ok=True)
+        return None
+    
+    # Clean up anchor frame
+    anchor_frame_path.unlink(missing_ok=True)
+    
+    # ==========================================================================
+    # STEP 2: Initialize OpenCV tracker and track across frames
+    # ==========================================================================
+    
+    # Calculate sample timestamps
+    timestamps = []
+    t = 0.0
+    while t < duration:
+        timestamps.append(t)
+        t += sample_interval
+    
+    if timestamps[-1] < duration - 0.5:
+        timestamps.append(duration - 0.5)
+    
+    if len(timestamps) > max_keyframes:
+        step = len(timestamps) / max_keyframes
+        timestamps = [timestamps[int(i * step)] for i in range(max_keyframes)]
+        timestamps.append(duration - 0.5)
+    
+    print(f"   🎯 Tracking across {len(timestamps)} frames...")
+    
+    # Open video for tracking
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("   ❌ Could not open video for tracking")
+        return None
+    
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    
+    # Get tracker
+    tracker = _get_opencv_tracker()
+    tracker_initialized = False
+    
+    keyframes: List[FaceKeyframe] = []
+    track_successes = 0
+    track_failures = 0
+    
+    # Smoothed values for EMA
+    smoothed_cx = anchor_x + anchor_w // 2
+    smoothed_cy = anchor_y + anchor_h // 2
+    smoothed_w = anchor_w
+    smoothed_h = anchor_h
+    
+    for ts in timestamps:
+        frame_num = int(ts * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, frame = cap.read()
+        
+        if not ret or frame is None:
+            continue
+        
+        bbox = None
+        
+        if tracker is not None:
+            if not tracker_initialized:
+                # Initialize tracker at anchor time
+                if abs(ts - anchor_time) < sample_interval:
+                    init_bbox = (anchor_x, anchor_y, anchor_w, anchor_h)
+                    try:
+                        tracker.init(frame, init_bbox)
+                        tracker_initialized = True
+                        bbox = init_bbox
+                        print(f"   🎯 Tracker initialized at t={ts:.1f}s")
+                    except Exception as e:
+                        print(f"   ⚠️ Tracker init failed: {e}")
+            else:
+                # Update tracker
+                try:
+                    success, tracked_bbox = tracker.update(frame)
+                    if success:
+                        bbox = tuple(int(v) for v in tracked_bbox)
+                        track_successes += 1
+                    else:
+                        track_failures += 1
+                except Exception as e:
+                    track_failures += 1
+        
+        # If tracker failed or unavailable, use last known position
+        if bbox is None:
+            bbox = (
+                smoothed_cx - smoothed_w // 2,
+                smoothed_cy - smoothed_h // 2,
+                smoothed_w,
+                smoothed_h
+            )
+        
+        # Extract center
+        bx, by, bw, bh = bbox
+        cx = bx + bw // 2
+        cy = by + bh // 2
+        
+        # Apply EMA smoothing
+        smoothed_cx = int(ema_alpha * cx + (1 - ema_alpha) * smoothed_cx)
+        smoothed_cy = int(ema_alpha * cy + (1 - ema_alpha) * smoothed_cy)
+        smoothed_w = int(ema_alpha * bw + (1 - ema_alpha) * smoothed_w)
+        smoothed_h = int(ema_alpha * bh + (1 - ema_alpha) * smoothed_h)
+        
+        keyframes.append(FaceKeyframe(
+            timestamp=ts,
+            center_x=smoothed_cx,
+            center_y=smoothed_cy,
+            width=smoothed_w,
+            height=smoothed_h,
+            confidence=0.9 if tracker_initialized else 0.7,
+        ))
+    
+    cap.release()
+    
+    # Log tracking stats
+    total_attempts = track_successes + track_failures
+    if total_attempts > 0:
+        success_rate = track_successes / total_attempts * 100
+        print(f"   📊 Tracker success rate: {track_successes}/{total_attempts} ({success_rate:.0f}%)")
+    
+    if len(keyframes) == 0:
+        print("   ❌ No keyframes generated")
+        return None
+    
+    # Log final avg x_ratio
+    avg_x_ratio = sum(kf.center_x for kf in keyframes) / len(keyframes) / width
+    print(f"   📍 Final avg x_ratio: {avg_x_ratio:.2f}")
+    
+    print(f"   ✅ Gemini+Tracker: {len(keyframes)} keyframes")
+    
+    return FaceTrack(
+        keyframes=keyframes,
+        duration=duration,
+        video_width=width,
+        video_height=height,
+        sample_interval=sample_interval,
+    )
+
+
+def track_faces_with_fallback(
+    video_path: str,
+    temp_dir: str,
+    sample_interval: float = 1.5,
+    ema_alpha: float = 0.4,
+    max_keyframes: int = 20,
+) -> Optional[FaceTrack]:
+    """
+    Track faces with automatic fallback to Gemini anchor if face detection picks background.
+    
+    Flow:
+    1. Try standard face tracking (DNN + Haar)
+    2. If NO faces found OR detected faces appear to be background → try Gemini anchor + tracker
+    3. Return the best result, or None to trigger left-biased fallback
+    
+    Args:
+        video_path: Path to input video
+        temp_dir: Temporary directory
+        sample_interval: Time between samples
+        ema_alpha: EMA smoothing factor
+        max_keyframes: Maximum keyframes
+    
+    Returns:
+        FaceTrack or None
+    """
+    print(f"🔍 track_faces_with_fallback() START")
+    
+    # First try standard face tracking
+    face_track = track_faces(
+        video_path=video_path,
+        temp_dir=temp_dir,
+        sample_interval=sample_interval,
+        ema_alpha=ema_alpha,
+        max_keyframes=max_keyframes,
+    )
+    
+    # Determine if we need to use Gemini anchor fallback
+    need_gemini_fallback = False
+    fallback_reason = ""
+    
+    if face_track is None:
+        need_gemini_fallback = True
+        fallback_reason = "No faces detected by DNN/Haar"
+    elif len(face_track.keyframes) == 0:
+        need_gemini_fallback = True
+        fallback_reason = "Face track has no keyframes"
+    elif _is_face_track_likely_background(face_track):
+        need_gemini_fallback = True
+        fallback_reason = "Face track appears to be background person"
+    
+    if need_gemini_fallback:
+        print(f"   🔄 {fallback_reason} → trying Gemini anchor...")
+        
+        gemini_track = track_with_gemini_anchor(
+            video_path=video_path,
+            temp_dir=temp_dir,
+            sample_interval=sample_interval,
+            ema_alpha=ema_alpha,
+            max_keyframes=max_keyframes,
+        )
+        
+        if gemini_track is not None:
+            print(f"   ✅ Gemini anchor tracking succeeded")
+            return gemini_track
+        else:
+            print(f"   ⚠️ Gemini anchor failed → will use left-biased fallback crop")
+            # Return None to trigger left-biased fallback in generate_ffmpeg_crop_expr
+            return None
+    
+    print(f"   ✅ Standard face tracking succeeded")
+    return face_track

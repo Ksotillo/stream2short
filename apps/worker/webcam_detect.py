@@ -746,65 +746,115 @@ def _detect_best_face_for_fullcam(frame_bgr: np.ndarray) -> Optional[FaceDetecti
     """
     Detect the best face for FULL_CAM mode (the main streamer, not background people).
     
-    Uses scoring that prefers:
-    - Larger faces (closer to camera)
-    - Faces in lower portion of frame (streamers sit at desk level)
-    - More centered faces
-    """
-    detector = get_dnn_face_detector()
-    if detector is None:
-        return None
+    Uses DNN detector (ResNet SSD) first for better accuracy, falls back to Haar.
     
+    Uses scoring that prefers:
+    - Faces in lower portion of frame (streamers sit at desk level)
+    - Faces on left/center (typical desk setup)
+    - Larger faces (closer to camera than background people)
+    """
     h, w = frame_bgr.shape[:2]
     faces = []
+    dnn_attempted = False
+    dnn_succeeded = False
     
-    if isinstance(detector, cv2.CascadeClassifier):
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        detections = detector.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(40, 40),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
+    print(f"  🔍 _detect_best_face_for_fullcam() ENTER - frame {w}x{h}")
+    
+    # ==========================================================================
+    # TRY DNN DETECTOR FIRST (more robust, handles profile/angled faces)
+    # ==========================================================================
+    print(f"  🚀 Trying DNN detector first...")
+    try:
+        from face_tracking import detect_face_dnn
+        dnn_attempted = True
+        print(f"  📦 face_tracking.detect_face_dnn imported successfully")
         
-        for (fx, fy, fw, fh) in detections:
+        dnn_result = detect_face_dnn(frame_bgr, confidence_threshold=0.35, try_preprocessing=True)
+        
+        if dnn_result is not None:
+            fx, fy, fw, fh, conf = dnn_result
+            dnn_succeeded = True
+            print(f"  ✅ DNN RETURNED FACE: ({fx},{fy}) {fw}x{fh} conf={conf:.2f}")
             faces.append(FaceDetection(
-                x=fx, y=fy, width=fw, height=fh, confidence=0.8
+                x=fx, y=fy, width=fw, height=fh, confidence=conf
             ))
+        else:
+            print(f"  ⚠️ DNN returned None (no faces detected)")
+    except ImportError as e:
+        print(f"  ❌ ImportError: face_tracking module not available: {e}")
+    except Exception as e:
+        import traceback
+        print(f"  ❌ DNN detection EXCEPTION: {type(e).__name__}: {e}")
+        print(f"     Traceback: {traceback.format_exc()}")
     
-    elif hasattr(cv2, 'FaceDetectorYN') and isinstance(detector, cv2.FaceDetectorYN):
-        detector.setInputSize((w, h))
-        _, detections = detector.detect(frame_bgr)
+    # ==========================================================================
+    # FALLBACK TO HAAR CASCADE only if DNN didn't find anything
+    # ==========================================================================
+    if not faces:
+        if dnn_attempted:
+            print(f"  🔄 DNN attempted but found no faces, trying Haar Cascade fallback...")
+        else:
+            print(f"  🔄 DNN not available, trying Haar Cascade...")
         
-        if detections is not None:
-            for det in detections:
-                fx, fy, fw, fh = int(det[0]), int(det[1]), int(det[2]), int(det[3])
-                conf = float(det[-1])
-                if conf >= 0.5:
-                    faces.append(FaceDetection(
-                        x=fx, y=fy, width=fw, height=fh, confidence=conf
-                    ))
+        detector = get_dnn_face_detector()
+        
+        if detector is not None and isinstance(detector, cv2.CascadeClassifier):
+            print(f"  ✅ Haar Cascade loaded, running detectMultiScale...")
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            detections = detector.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(40, 40),
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            print(f"  📊 Haar found {len(detections)} raw detections")
+            
+            for (fx, fy, fw, fh) in detections:
+                faces.append(FaceDetection(
+                    x=fx, y=fy, width=fw, height=fh, confidence=0.8
+                ))
+        
+        elif detector is not None and hasattr(cv2, 'FaceDetectorYN') and isinstance(detector, cv2.FaceDetectorYN):
+            print(f"  ✅ FaceDetectorYN loaded, running detection...")
+            detector.setInputSize((w, h))
+            _, detections = detector.detect(frame_bgr)
+            
+            if detections is not None:
+                print(f"  📊 FaceDetectorYN found {len(detections)} raw detections")
+                for det in detections:
+                    fx, fy, fw, fh = int(det[0]), int(det[1]), int(det[2]), int(det[3])
+                    conf = float(det[-1])
+                    if conf >= 0.5:
+                        faces.append(FaceDetection(
+                            x=fx, y=fy, width=fw, height=fh, confidence=conf
+                        ))
+        else:
+            print(f"  ❌ No face detector available (detector={type(detector).__name__ if detector else None})")
     
     if not faces:
+        print(f"  ❌ _detect_best_face_for_fullcam(): No faces found by any detector")
         return None
     
     # Filter small faces
     valid_faces = [f for f in faces if f.width >= 40 and f.height >= 40]
     if not valid_faces:
+        print(f"  ❌ All {len(faces)} faces were too small (< 40x40)")
         return None
     
     # Score each face and pick the best for FULL_CAM
     scored_faces = [(f, _score_face_for_fullcam(f, w, h)) for f in valid_faces]
     
     # Log face candidates for debugging
-    print(f"  📊 Face candidates ({len(scored_faces)}):")
+    print(f"  📊 FULLCAM face candidates ({len(scored_faces)}) after scoring:")
     for face, score in sorted(scored_faces, key=lambda x: -x[1]):
         y_ratio = face.center_y / h
+        x_ratio = face.center_x / w
         print(f"     - {face.width}x{face.height} at ({face.center_x},{face.center_y}) "
-              f"y_ratio={y_ratio:.2f} score={score:.3f}")
+              f"y={y_ratio:.2f} x={x_ratio:.2f} score={score:.3f}")
     
     best_face, best_score = max(scored_faces, key=lambda x: x[1])
+    print(f"  ✅ _detect_best_face_for_fullcam(): Returning best face at ({best_face.center_x},{best_face.center_y}) score={best_score:.3f}")
     return best_face
 
 
@@ -2317,10 +2367,12 @@ def detect_webcam_region(
     except Exception as e:
         print(f"  ⚠️ Gemini detection failed: {e}")
     
-    # If Gemini explicitly said "no webcam overlay", check if this is a FULL_CAM scenario
+    # If Gemini explicitly said "no webcam overlay", TREAT AS FULL_CAM by default
     # (The entire frame might BE the webcam/camera - no overlay, just the person)
+    # This is the key insight: if there's no game overlay, it's FULL_CAM even if face is small/angled
     if gemini_explicitly_no_webcam:
-        print("  🔍 Gemini found no webcam overlay - checking for FULL_CAM scenario...")
+        print("  🔍 Gemini says no webcam overlay → checking for FULL_CAM...")
+        print("  💡 IMPORTANT: If no overlay, treat as FULL_CAM unless we detect a game")
         
         # Extract a frame to check for face in full frame
         frame = extract_frame(video_path, 5.0)
@@ -2334,8 +2386,14 @@ def detect_webcam_region(
             # (prefer faces in lower portion - streamers sit at desk level)
             face = _detect_best_face_for_fullcam(frame)
             
+            # Calculate face metrics for logging
+            face_ratio = 0.0
+            face_center_x = 0
+            face_center_y = 0
+            is_centered_x = False
+            is_in_frame = False
+            
             if face:
-                # Calculate how much of the frame the face occupies
                 face_area = face.width * face.height
                 frame_area = width * height
                 face_ratio = face_area / frame_area
@@ -2343,39 +2401,64 @@ def detect_webcam_region(
                 face_center_x = face.center_x
                 face_center_y = face.center_y
                 
-                # For FULL_CAM, we just need a reasonably visible face
-                # The scoring already prefers the main subject
                 is_centered_x = 0.10 * width < face_center_x < 0.90 * width
                 is_in_frame = 0.05 * height < face_center_y < 0.95 * height
                 
-                print(f"  👤 Best face detected for FULL_CAM:")
+                print(f"  👤 Face detected for FULL_CAM:")
                 print(f"     Face size: {face.width}x{face.height} ({face_ratio:.1%} of frame)")
                 print(f"     Face center: ({face_center_x}, {face_center_y})")
                 print(f"     In-frame: X={is_centered_x}, Y={is_in_frame}")
-                
-                # FULL_CAM criteria:
-                # - Face detected
-                # - Face is at least 1.5% of frame (not tiny background face)
-                # - Face is reasonably within frame bounds
-                if face_ratio >= 0.015 and is_centered_x and is_in_frame:
-                    print(f"  ✅ FULL_CAM detected: person in full frame (no overlay)")
-                    
-                    # Return a full-frame WebcamRegion to trigger FULL_CAM layout
-                    inset = int(min(width, height) * 0.01)
-                    return WebcamRegion(
-                        x=inset,
-                        y=inset,
-                        width=width - 2 * inset,
-                        height=height - 2 * inset,
-                        position='full'  # Special marker for FULL_CAM
-                    )
-                else:
-                    print(f"  ❌ Face found but doesn't meet FULL_CAM criteria")
+            
+            # ==========================================================================
+            # CRITICAL FIX: If Gemini says "no webcam overlay", classify as FULL_CAM
+            # even if face is small/angled - we'll use Gemini anchor for tracking
+            # ==========================================================================
+            # FULL_CAM criteria (RELAXED):
+            # Option A: Face detected AND meets basic criteria
+            # Option B: No face but Gemini confirmed no overlay → still FULL_CAM
+            #           (Gemini anchor + tracker will handle this later)
+            
+            classify_as_fullcam = False
+            fullcam_reason = ""
+            
+            if face and is_centered_x and is_in_frame:
+                # Face detected and in frame - FULL_CAM regardless of size
+                # (we removed the face_ratio >= 0.015 requirement because angled faces can be small)
+                classify_as_fullcam = True
+                fullcam_reason = f"Face detected at ({face_center_x},{face_center_y}), size {face_ratio:.1%}"
+            elif face:
+                # Face detected but maybe at edge - still FULL_CAM, face tracking will handle
+                classify_as_fullcam = True
+                fullcam_reason = f"Face at edge ({face_center_x},{face_center_y}), will use tracking"
             else:
-                print(f"  ❌ No face detected in full frame")
-        
-        print("  📹 Confirmed NO_WEBCAM → using simple center crop")
-        return None
+                # No face detected but Gemini says no overlay
+                # This is still FULL_CAM - Gemini anchor will find the person
+                classify_as_fullcam = True
+                fullcam_reason = "No face by OpenCV, but Gemini confirms no overlay - using Gemini anchor"
+            
+            if classify_as_fullcam:
+                print(f"  ✅ FULL_CAM detected: {fullcam_reason}")
+                
+                # Return a full-frame WebcamRegion to trigger FULL_CAM layout
+                inset = int(min(width, height) * 0.01)
+                return WebcamRegion(
+                    x=inset,
+                    y=inset,
+                    width=width - 2 * inset,
+                    height=height - 2 * inset,
+                    position='full'  # Special marker for FULL_CAM
+                )
+        else:
+            # Could not extract frame - still treat as FULL_CAM since Gemini says no overlay
+            # Face tracking with Gemini anchor will handle finding the person
+            print(f"  ⚠️ Could not extract frame, but Gemini says no overlay → FULL_CAM")
+            return WebcamRegion(
+                x=0,
+                y=0,
+                width=1920,  # Will be resized anyway
+                height=1080,
+                position='full'
+            )
     
     # =========================================================================
     # Strategy 2: Fall back to OpenCV face detection

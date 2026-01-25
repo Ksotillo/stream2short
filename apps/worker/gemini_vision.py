@@ -318,3 +318,154 @@ def save_debug_frame_with_box(frame_path: str, output_path: str, x: int, y: int,
             print(f"  🖼️ Debug frame saved: {output_path}")
     except Exception as e:
         print(f"  ⚠️ Could not save debug frame: {e}")
+
+
+def get_fullcam_anchor_bbox_with_gemini(
+    frame_path: str,
+    video_width: int,
+    video_height: int
+) -> Optional[Dict]:
+    """
+    Use Gemini to identify the MAIN STREAMER's bounding box for FULL_CAM mode.
+    
+    This is used as an anchor when face detection picks the wrong person
+    (e.g., a background person instead of the streamer).
+    
+    Args:
+        frame_path: Path to a frame image from the video
+        video_width: Width of the source video
+        video_height: Height of the source video
+    
+    Returns:
+        Dict with {x, y, w, h, confidence} or None if not detected
+    """
+    client = get_gemini_client()
+    if client is None:
+        print("⚠️ Gemini not configured, skipping anchor detection")
+        return None
+    
+    try:
+        from google.genai import types
+        
+        # Read the image file
+        with open(frame_path, 'rb') as f:
+            image_bytes = f.read()
+        
+        prompt = f"""TASK: Find the MAIN STREAMER's face/head bounding box in this livestream frame.
+
+IMAGE SIZE: {video_width} × {video_height} pixels
+COORDINATES: x=0 is LEFT edge, y=0 is TOP edge
+
+CRITICAL RULES - FOLLOW EXACTLY:
+1. The MAIN STREAMER is the person SEATED at a desk/setup
+2. The MAIN STREAMER is usually in the LOWER-LEFT or CENTER-LEFT area
+3. The MAIN STREAMER often wears headphones/headset and may have glasses
+4. IGNORE any person STANDING in the background (they are NOT the streamer)
+5. IGNORE any person on the far RIGHT side of the frame (likely background)
+
+WHAT TO RETURN:
+- x, y: TOP-LEFT corner of face/head bounding box
+- w, h: Width and height of face/head region (include some padding)
+- confidence: How sure you are this is the main streamer (0.0 to 1.0)
+
+TYPICAL STREAMER POSITION:
+- X position: 15% to 50% from left edge ({int(video_width * 0.15)} to {int(video_width * 0.50)})
+- Y position: 40% to 80% from top ({int(video_height * 0.40)} to {int(video_height * 0.80)})
+- Face size: Usually 150-400 pixels wide
+
+RESPOND WITH ONLY JSON (no markdown, no explanation):
+{{"x": <int>, "y": <int>, "w": <int>, "h": <int>, "confidence": <float>}}
+
+If you cannot find the main streamer or are unsure, respond:
+{{"error": "reason"}}"""
+
+        # Try models in order of preference
+        models_to_try = [
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
+        ]
+        
+        last_error = None
+        for model_name in models_to_try:
+            try:
+                print(f"  🤖 Gemini anchor detection using: {model_name}")
+                
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                        types.Part.from_text(text=prompt),
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                    ),
+                )
+                
+                response_text = response.text.strip()
+                print(f"  📝 Gemini anchor response: {response_text[:300]}")
+                
+                # Parse JSON
+                json_match = re.search(r'\{[^}]+\}', response_text)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    
+                    if 'error' in result:
+                        print(f"  ⚠️ Gemini could not find streamer: {result['error']}")
+                        return None
+                    
+                    x = int(result.get('x', 0))
+                    y = int(result.get('y', 0))
+                    w = int(result.get('w', 0))
+                    h = int(result.get('h', 0))
+                    confidence = float(result.get('confidence', 0.5))
+                    
+                    # Validate bounds
+                    if w > 50 and h > 50 and x >= 0 and y >= 0:
+                        # Clamp to frame
+                        x = max(0, min(x, video_width - w))
+                        y = max(0, min(y, video_height - h))
+                        w = min(w, video_width - x)
+                        h = min(h, video_height - y)
+                        
+                        # Calculate ratios for logging
+                        center_x = x + w // 2
+                        center_y = y + h // 2
+                        x_ratio = center_x / video_width
+                        y_ratio = center_y / video_height
+                        
+                        print(f"  ✅ Gemini anchor bbox: ({x},{y}) {w}x{h} conf={confidence:.2f}")
+                        print(f"     Center: ({center_x},{center_y}) x_ratio={x_ratio:.2f} y_ratio={y_ratio:.2f}")
+                        
+                        return {
+                            'x': x,
+                            'y': y,
+                            'w': w,
+                            'h': h,
+                            'confidence': confidence,
+                            'center_x': center_x,
+                            'center_y': center_y,
+                        }
+                    else:
+                        print(f"  ⚠️ Invalid bbox from Gemini: ({x},{y}) {w}x{h}")
+                
+                return None
+                
+            except Exception as model_error:
+                last_error = model_error
+                error_str = str(model_error)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    print(f"  ⚠️ {model_name}: Rate limited, trying next...")
+                    continue
+                elif "404" in error_str or "not found" in error_str.lower():
+                    print(f"  ⚠️ {model_name}: Not available, trying next...")
+                    continue
+                else:
+                    print(f"  ⚠️ {model_name} error: {error_str[:100]}")
+                    continue
+        
+        print(f"⚠️ All Gemini models failed for anchor detection. Last error: {last_error}")
+        return None
+        
+    except Exception as e:
+        print(f"⚠️ Gemini anchor detection error: {e}")
+        return None

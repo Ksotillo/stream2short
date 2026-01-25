@@ -16,6 +16,7 @@ from webcam_detect import (
 )
 from face_tracking import (
     track_faces,
+    track_faces_with_fallback,
     generate_ffmpeg_crop_expr,
     FaceTrack,
 )
@@ -571,19 +572,22 @@ def render_full_cam_video(
     crop_h = crop_h - (crop_h % 2)
     
     # ==========================================================================
-    # DYNAMIC FACE TRACKING
+    # DYNAMIC FACE TRACKING (with Gemini anchor fallback for background faces)
     # ==========================================================================
     face_track: Optional[FaceTrack] = None
     use_dynamic_tracking = False
     
     if enable_face_tracking:
-        print("   🔍 Running face tracking...")
+        print("   🔍 Running face tracking (with Gemini fallback if needed)...")
         try:
-            face_track = track_faces(
+            # Use the new fallback-aware tracking function
+            # This will try standard face tracking first, then Gemini anchor if
+            # the detected faces appear to be background people
+            face_track = track_faces_with_fallback(
                 video_path=input_path,
                 temp_dir=temp_dir,
-                sample_interval=0.5,  # Sample every 0.5 seconds
-                ema_alpha=0.3,  # Smooth but responsive
+                sample_interval=1.5,  # Sample every 1.5 seconds for better coverage
+                ema_alpha=0.4,  # Smooth but responsive
             )
             
             if face_track and len(face_track.keyframes) > 1:
@@ -592,7 +596,7 @@ def render_full_cam_video(
             elif face_track and len(face_track.keyframes) == 1:
                 print("   📍 Single face position detected, using static crop")
             else:
-                print("   ⚠️ No faces tracked, falling back to static crop")
+                print("   ⚠️ No faces tracked, falling back to left-biased static crop")
                 
         except Exception as e:
             print(f"   ⚠️ Face tracking failed: {e}, using static crop")
