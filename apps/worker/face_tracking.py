@@ -785,28 +785,41 @@ def generate_ffmpeg_crop_expr(
     avg_y = sum(y_positions) // len(y_positions)
     
     # =========================================================================
-    # BACKGROUND DETECTION: Check if detected faces are background people
+    # BACKGROUND DETECTION (Task 4): Use FACE SIZE, not position
+    # Posters/background people have tiny faces
     # =========================================================================
-    avg_face_y = sum(kf.center_y for kf in face_track.keyframes) / len(face_track.keyframes)
-    avg_face_x = sum(kf.center_x for kf in face_track.keyframes) / len(face_track.keyframes)
+    frame_area = face_track.video_width * face_track.video_height
     
-    avg_face_y_ratio = avg_face_y / face_track.video_height
-    avg_face_x_ratio = avg_face_x / face_track.video_width
+    # Calculate area_ratio and width_ratio for each keyframe
+    area_ratios = []
+    width_ratios = []
+    for kf in face_track.keyframes:
+        area = kf.width * kf.height
+        area_ratios.append(area / frame_area)
+        width_ratios.append(kf.width / face_track.video_width)
     
-    # Background indicators:
-    # - Faces in upper portion (y_ratio < 0.45) = standing person
-    # - Faces on far right (x_ratio > 0.55) = walking behind streamer
-    faces_in_upper = avg_face_y_ratio < 0.45
-    faces_on_far_right = avg_face_x_ratio > 0.55
+    # Use median to be robust to outliers
+    area_ratios_sorted = sorted(area_ratios)
+    width_ratios_sorted = sorted(width_ratios)
+    median_idx = len(area_ratios_sorted) // 2
     
-    if faces_in_upper or faces_on_far_right:
-        # Detected faces are likely background people, NOT the streamer!
-        # Use TRUE LEFT BIAS: streamer is typically on the LEFT side at their desk
-        print(f"   ⚠️ Background faces detected: y_ratio={avg_face_y_ratio:.2f}, x_ratio={avg_face_x_ratio:.2f}")
+    median_area_ratio = area_ratios_sorted[median_idx]
+    median_width_ratio = width_ratios_sorted[median_idx]
+    
+    print(f"   📊 Face sizes: median_area={median_area_ratio:.4f}, median_width={median_width_ratio:.3f}")
+    
+    # Background/poster indicators based on SIZE:
+    # - median area_ratio < 0.008 (0.8% of frame) = tiny/poster face
+    # - median width_ratio < 0.06 (6% of frame width) = tiny face
+    is_likely_background = (median_area_ratio < 0.008) or (median_width_ratio < 0.06)
+    
+    if is_likely_background:
+        # Detected faces are too small - likely poster/background
+        # Use Gemini anchor or left-biased fallback
+        print(f"   ⚠️ Tiny faces detected (poster/background): area={median_area_ratio:.4f} width={median_width_ratio:.3f}")
         print(f"   🎯 Using LEFT-BIASED crop (typical streamer position)")
         
         # TRUE LEFT BIAS: Position crop at 10% from left edge
-        # This ensures the streamer on the left side is captured
         default_x = int((face_track.video_width - crop_width) * 0.10)
         default_y = max(0, (face_track.video_height - crop_height) // 2)
         
@@ -867,26 +880,38 @@ def get_static_face_center(face_track: FaceTrack) -> Optional[Tuple[int, int]]:
 
 def _is_face_track_likely_background(face_track: FaceTrack) -> bool:
     """
-    Check if the detected face track is likely a background person, not the streamer.
+    Check if the detected face track is likely a background person/poster, not the streamer.
     
-    Background indicators:
-    - Faces consistently in upper portion (y_ratio < 0.45)
-    - Faces consistently on far right (x_ratio > 0.55)
-    - Very stable position (background people are usually stationary)
+    Background indicators (SIZE-BASED, not position):
+    - median area_ratio < 0.008 (0.8% of frame) = tiny/poster face
+    - median width_ratio < 0.06 (6% of frame width) = tiny face
     """
     if not face_track or len(face_track.keyframes) < 3:
         return False
     
-    # Calculate average position ratios
-    avg_y_ratio = sum(kf.center_y for kf in face_track.keyframes) / len(face_track.keyframes) / face_track.video_height
-    avg_x_ratio = sum(kf.center_x for kf in face_track.keyframes) / len(face_track.keyframes) / face_track.video_width
+    frame_area = face_track.video_width * face_track.video_height
     
-    # Check for background indicators
-    in_upper = avg_y_ratio < 0.45
-    on_far_right = avg_x_ratio > 0.55
+    # Calculate area and width ratios for each keyframe
+    area_ratios = []
+    width_ratios = []
+    for kf in face_track.keyframes:
+        area = kf.width * kf.height
+        area_ratios.append(area / frame_area)
+        width_ratios.append(kf.width / face_track.video_width)
     
-    if in_upper or on_far_right:
-        print(f"   ⚠️ Face track appears to be background: y_ratio={avg_y_ratio:.2f}, x_ratio={avg_x_ratio:.2f}")
+    # Use median to be robust to outliers
+    area_ratios_sorted = sorted(area_ratios)
+    width_ratios_sorted = sorted(width_ratios)
+    median_idx = len(area_ratios_sorted) // 2
+    
+    median_area_ratio = area_ratios_sorted[median_idx]
+    median_width_ratio = width_ratios_sorted[median_idx]
+    
+    # Tiny faces = poster or background person far away
+    is_tiny = (median_area_ratio < 0.008) or (median_width_ratio < 0.06)
+    
+    if is_tiny:
+        print(f"   ⚠️ Face track is TINY (poster/background): area={median_area_ratio:.4f}, width={median_width_ratio:.3f}")
         return True
     
     return False
@@ -1050,16 +1075,28 @@ def track_with_gemini_anchor(
     # Get tracker
     tracker = _get_opencv_tracker()
     tracker_initialized = False
+    use_redetection = (tracker is None)
+    
+    if use_redetection:
+        print(f"   ⚠️ No tracker available - using anchor-guided re-detection fallback")
+    else:
+        print(f"   ✅ OpenCV tracker available")
     
     keyframes: List[FaceKeyframe] = []
     track_successes = 0
     track_failures = 0
+    redetection_count = 0
     
     # Smoothed values for EMA
     smoothed_cx = anchor_x + anchor_w // 2
     smoothed_cy = anchor_y + anchor_h // 2
     smoothed_w = anchor_w
     smoothed_h = anchor_h
+    
+    # Previous center for re-detection continuity
+    prev_cx = smoothed_cx
+    prev_cy = smoothed_cy
+    max_jump_px = int(width * 0.18)  # Max allowed jump
     
     for ts in timestamps:
         frame_num = int(ts * fps)
@@ -1070,8 +1107,12 @@ def track_with_gemini_anchor(
             continue
         
         bbox = None
+        detection_method = "hold"
         
-        if tracker is not None:
+        # =====================================================================
+        # METHOD 1: Use OpenCV tracker if available
+        # =====================================================================
+        if tracker is not None and not use_redetection:
             if not tracker_initialized:
                 # Initialize tracker at anchor time
                 if abs(ts - anchor_time) < sample_interval:
@@ -1080,9 +1121,11 @@ def track_with_gemini_anchor(
                         tracker.init(frame, init_bbox)
                         tracker_initialized = True
                         bbox = init_bbox
+                        detection_method = "tracker_init"
                         print(f"   🎯 Tracker initialized at t={ts:.1f}s")
                     except Exception as e:
-                        print(f"   ⚠️ Tracker init failed: {e}")
+                        print(f"   ⚠️ Tracker init failed: {e}, switching to re-detection")
+                        use_redetection = True
             else:
                 # Update tracker
                 try:
@@ -1090,12 +1133,67 @@ def track_with_gemini_anchor(
                     if success:
                         bbox = tuple(int(v) for v in tracked_bbox)
                         track_successes += 1
+                        detection_method = "tracker"
                     else:
                         track_failures += 1
                 except Exception as e:
                     track_failures += 1
         
-        # If tracker failed or unavailable, use last known position
+        # =====================================================================
+        # METHOD 2: Anchor-guided re-detection (fallback when no tracker)
+        # =====================================================================
+        if bbox is None and use_redetection:
+            # Define ROI around last known center (padded by 35% of frame dims)
+            roi_pad_x = int(width * 0.35)
+            roi_pad_y = int(height * 0.35)
+            
+            roi_x1 = max(0, prev_cx - roi_pad_x)
+            roi_y1 = max(0, prev_cy - roi_pad_y)
+            roi_x2 = min(width, prev_cx + roi_pad_x)
+            roi_y2 = min(height, prev_cy + roi_pad_y)
+            
+            roi_w = roi_x2 - roi_x1
+            roi_h = roi_y2 - roi_y1
+            
+            if roi_w > 50 and roi_h > 50:
+                # Crop ROI and run detection
+                roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                
+                # Try DNN first
+                detection = detect_face_dnn(
+                    roi_frame,
+                    confidence_threshold=0.50,
+                    try_preprocessing=False,  # Skip preprocessing for speed
+                    prev_center=None,  # No temporal filtering in ROI
+                )
+                
+                # Fallback to Haar
+                if detection is None:
+                    detection = detect_face_haar(roi_frame)
+                
+                if detection is not None:
+                    fx, fy, fw, fh, conf = detection
+                    
+                    # Translate back to full frame coords
+                    fx += roi_x1
+                    fy += roi_y1
+                    
+                    # Check jump distance
+                    det_cx = fx + fw // 2
+                    det_cy = fy + fh // 2
+                    jump_dist = ((det_cx - prev_cx) ** 2 + (det_cy - prev_cy) ** 2) ** 0.5
+                    
+                    if jump_dist <= max_jump_px:
+                        bbox = (fx, fy, fw, fh)
+                        detection_method = "redetect"
+                        redetection_count += 1
+                    else:
+                        # Jump too large - reject and hold
+                        detection_method = "hold_jump"
+        
+        # =====================================================================
+        # FALLBACK: Hold last known position
+        # =====================================================================
         if bbox is None:
             bbox = (
                 smoothed_cx - smoothed_w // 2,
@@ -1103,11 +1201,17 @@ def track_with_gemini_anchor(
                 smoothed_w,
                 smoothed_h
             )
+            if detection_method == "hold":
+                detection_method = "hold_no_detect"
         
         # Extract center
         bx, by, bw, bh = bbox
         cx = bx + bw // 2
         cy = by + bh // 2
+        
+        # Update prev_center for next frame's re-detection
+        prev_cx = cx
+        prev_cy = cy
         
         # Apply EMA smoothing
         smoothed_cx = int(ema_alpha * cx + (1 - ema_alpha) * smoothed_cx)
@@ -1121,7 +1225,7 @@ def track_with_gemini_anchor(
             center_y=smoothed_cy,
             width=smoothed_w,
             height=smoothed_h,
-            confidence=0.9 if tracker_initialized else 0.7,
+            confidence=0.9 if detection_method in ["tracker", "redetect"] else 0.7,
         ))
     
     cap.release()
@@ -1132,12 +1236,46 @@ def track_with_gemini_anchor(
         success_rate = track_successes / total_attempts * 100
         print(f"   📊 Tracker success rate: {track_successes}/{total_attempts} ({success_rate:.0f}%)")
     
+    if redetection_count > 0:
+        print(f"   📊 Re-detection successes: {redetection_count}")
+    
     if len(keyframes) == 0:
         print("   ❌ No keyframes generated")
         return None
     
-    # Log final avg x_ratio
-    avg_x_ratio = sum(kf.center_x for kf in keyframes) / len(keyframes) / width
+    # =========================================================================
+    # PANNING DEBUG (Task 5): Log keyframe positions and verify variation
+    # =========================================================================
+    print(f"   📊 Keyframe positions (verifying panning):")
+    center_xs = [kf.center_x for kf in keyframes]
+    
+    for i, kf in enumerate(keyframes[:5]):  # Show first 5
+        print(f"      t={kf.timestamp:.1f}s: center_x={kf.center_x}, center_y={kf.center_y}")
+    if len(keyframes) > 5:
+        print(f"      ... and {len(keyframes) - 5} more keyframes")
+    
+    # Calculate variation
+    min_cx = min(center_xs)
+    max_cx = max(center_xs)
+    cx_range = max_cx - min_cx
+    avg_cx = sum(center_xs) / len(center_xs)
+    
+    # Compute crop_x values for stability check (assuming typical 9:16 crop)
+    typical_crop_width = int(height * (9/16))  # ~607 for 1080p
+    crop_xs = [max(0, min(cx - typical_crop_width // 2, width - typical_crop_width)) for cx in center_xs]
+    
+    if len(crop_xs) >= 2:
+        deltas = [abs(crop_xs[i] - crop_xs[i-1]) for i in range(1, len(crop_xs))]
+        max_delta = max(deltas)
+        crop_range = max(crop_xs) - min(crop_xs)
+        avg_crop_x = sum(crop_xs) / len(crop_xs)
+        print(f"   📊 PANNING STATS: center_x range={cx_range}px, crop_x range={crop_range}px")
+        print(f"   📊 PANNING STATS: avg_crop_x={avg_crop_x:.0f}, max_delta={max_delta}px")
+        
+        if crop_range < 20:
+            print(f"   ⚠️ LOW VARIATION: crop_x barely changes (range={crop_range}px)")
+    
+    avg_x_ratio = avg_cx / width
     print(f"   📍 Final avg x_ratio: {avg_x_ratio:.2f}")
     
     print(f"   ✅ Gemini+Tracker: {len(keyframes)} keyframes")

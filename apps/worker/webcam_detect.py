@@ -836,25 +836,61 @@ def _detect_best_face_for_fullcam(frame_bgr: np.ndarray) -> Optional[FaceDetecti
         print(f"  ❌ _detect_best_face_for_fullcam(): No faces found by any detector")
         return None
     
-    # Filter small faces
-    valid_faces = [f for f in faces if f.width >= 40 and f.height >= 40]
+    # ===========================================================================
+    # MIN SIZE FILTER (Task 1): Reject poster/false faces that are too small
+    # - area_ratio >= 0.01 (1% of frame)
+    # - width_ratio >= 0.08 (8% of frame width)
+    # ===========================================================================
+    frame_area = w * h
+    valid_faces = []
+    
+    for f in faces:
+        area_ratio = (f.width * f.height) / frame_area
+        width_ratio = f.width / w
+        
+        if area_ratio < 0.01:
+            print(f"     [REJECT] {f.width}x{f.height} area_ratio={area_ratio:.4f} < 0.01 (poster/tiny)")
+            continue
+        if width_ratio < 0.08:
+            print(f"     [REJECT] {f.width}x{f.height} width_ratio={width_ratio:.3f} < 0.08 (too narrow)")
+            continue
+        
+        valid_faces.append(f)
+    
     if not valid_faces:
-        print(f"  ❌ All {len(faces)} faces were too small (< 40x40)")
+        print(f"  ❌ All {len(faces)} faces rejected by MIN SIZE filter (area<1% or width<8%)")
         return None
     
-    # Score each face and pick the best for FULL_CAM
-    scored_faces = [(f, _score_face_for_fullcam(f, w, h)) for f in valid_faces]
+    # ===========================================================================
+    # SCORING: Primarily by SIZE (area_ratio), with center proximity bonus
+    # ===========================================================================
+    scored_faces = []
+    for f in valid_faces:
+        area_ratio = (f.width * f.height) / frame_area
+        
+        # Size score (primary): larger faces = more likely the streamer
+        size_score = min(area_ratio * 20, 1.0)  # 5% area = score 1.0
+        
+        # Center proximity bonus (secondary): prefer faces near center
+        cx_ratio = f.center_x / w
+        cy_ratio = f.center_y / h
+        center_dist = ((cx_ratio - 0.5) ** 2 + (cy_ratio - 0.5) ** 2) ** 0.5
+        center_score = max(0, 1.0 - center_dist * 1.5)  # Soft penalty for edge faces
+        
+        # Combined score: 70% size, 30% center proximity
+        total_score = size_score * 0.70 + center_score * 0.30
+        scored_faces.append((f, total_score, area_ratio))
     
     # Log face candidates for debugging
-    print(f"  📊 FULLCAM face candidates ({len(scored_faces)}) after scoring:")
-    for face, score in sorted(scored_faces, key=lambda x: -x[1]):
+    print(f"  📊 FULLCAM face candidates ({len(scored_faces)}) after MIN SIZE filter:")
+    for face, score, ar in sorted(scored_faces, key=lambda x: -x[1]):
         y_ratio = face.center_y / h
         x_ratio = face.center_x / w
-        print(f"     - {face.width}x{face.height} at ({face.center_x},{face.center_y}) "
+        print(f"     - {face.width}x{face.height} area={ar:.3%} at ({face.center_x},{face.center_y}) "
               f"y={y_ratio:.2f} x={x_ratio:.2f} score={score:.3f}")
     
-    best_face, best_score = max(scored_faces, key=lambda x: x[1])
-    print(f"  ✅ _detect_best_face_for_fullcam(): Returning best face at ({best_face.center_x},{best_face.center_y}) score={best_score:.3f}")
+    best_face, best_score, best_ar = max(scored_faces, key=lambda x: x[1])
+    print(f"  ✅ _detect_best_face_for_fullcam(): Best face {best_face.width}x{best_face.height} area={best_ar:.3%} score={best_score:.3f}")
     return best_face
 
 
