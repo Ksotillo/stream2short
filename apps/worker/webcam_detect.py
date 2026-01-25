@@ -657,34 +657,89 @@ def _score_face_for_fullcam(face: FaceDetection, frame_w: int, frame_h: int) -> 
     """
     Score a face for FULL_CAM streamer selection.
     
+    CRITICAL: This scoring is designed to REJECT background people and SELECT the streamer.
+    
     Streamers typically:
-    - Are in the LOWER portion of the frame (seated at desk)
-    - Are relatively CENTERED horizontally
+    - Are in the LOWER portion of the frame (seated at desk, y_ratio > 0.50)
+    - Are on the LEFT or CENTER-LEFT (typical desk setup, x_ratio 0.20-0.50)
     - Have LARGER faces (closer to camera than background people)
+    
+    Background people typically:
+    - Are in the UPPER portion (standing, y_ratio < 0.40)
+    - Are on the RIGHT side (walking behind, x_ratio > 0.60)
+    - Have SMALLER faces (farther from camera)
     """
     face_area = face.width * face.height
     frame_area = frame_w * frame_h
     
-    # Factor 1: Size - larger faces are likely the main subject
-    size_score = min(1.0, (face_area / frame_area) / 0.25)
-    
-    # Factor 2: Vertical position - prefer faces in LOWER half
+    # =========================================================================
+    # Factor 1: VERTICAL POSITION (most important)
+    # Streamers sit at desk level = LOWER portion of frame
+    # =========================================================================
     y_ratio = face.center_y / frame_h
-    if y_ratio < 0.25:
-        position_score = 0.3  # Upper area - likely background person
-    elif y_ratio > 0.85:
-        position_score = 0.7  # Very bottom - might be cut off
+    
+    if y_ratio < 0.35:
+        # Upper area - VERY LIKELY background person standing
+        position_score = 0.10
+    elif y_ratio < 0.45:
+        # Upper-middle - probably background
+        position_score = 0.25
+    elif y_ratio < 0.55:
+        # Middle - could be either
+        position_score = 0.50
+    elif y_ratio < 0.70:
+        # Lower-middle - likely streamer seated
+        position_score = 0.85
     else:
-        # Sweet spot: 0.4-0.8 from top
-        position_score = 0.4 + 0.6 * min(1.0, (y_ratio - 0.25) / 0.5)
+        # Lower area - streamer at desk level
+        position_score = 0.95
     
-    # Factor 3: Horizontal centering
+    # =========================================================================
+    # Factor 2: HORIZONTAL POSITION
+    # Streamers are typically LEFT or CENTER-LEFT (desk setup)
+    # Background people often walk behind on the RIGHT
+    # =========================================================================
     x_ratio = face.center_x / frame_w
-    center_score = 1.0 - abs(x_ratio - 0.5) * 1.5
-    center_score = max(0.2, center_score)
     
-    # Combined score: position matters most for distinguishing streamer from background
-    return (size_score * 0.35) + (position_score * 0.45) + (center_score * 0.20)
+    if x_ratio < 0.20:
+        # Far left - probably streamer
+        horizontal_score = 0.80
+    elif x_ratio < 0.40:
+        # Left-center - sweet spot for streamer
+        horizontal_score = 0.95
+    elif x_ratio < 0.55:
+        # Center - good for streamer
+        horizontal_score = 0.85
+    elif x_ratio < 0.70:
+        # Right-center - could be either
+        horizontal_score = 0.50
+    else:
+        # Far right - likely background person
+        horizontal_score = 0.20
+    
+    # =========================================================================
+    # Factor 3: SIZE
+    # Streamers have larger faces (closer to camera)
+    # But size should NOT dominate position!
+    # =========================================================================
+    size_ratio = face_area / frame_area
+    
+    if size_ratio > 0.10:
+        size_score = 1.0  # Very large face
+    elif size_ratio > 0.05:
+        size_score = 0.85
+    elif size_ratio > 0.02:
+        size_score = 0.70
+    elif size_ratio > 0.01:
+        size_score = 0.50
+    else:
+        size_score = 0.30  # Small face (far away)
+    
+    # =========================================================================
+    # COMBINED SCORE
+    # Position is MOST important, then horizontal, then size
+    # =========================================================================
+    return (position_score * 0.45) + (horizontal_score * 0.35) + (size_score * 0.20)
 
 
 def _detect_best_face_for_fullcam(frame_bgr: np.ndarray) -> Optional[FaceDetection]:

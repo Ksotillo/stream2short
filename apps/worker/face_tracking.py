@@ -4,19 +4,70 @@ Tracks face positions across video frames and generates smooth crop paths
 for FULL_CAM layout rendering.
 
 Strategy:
-1. Sample frames at regular intervals (every ~0.5 seconds)
-2. Detect face position in each frame using DNN detection
+1. Sample frames at regular intervals (every ~1.5 seconds)
+2. Detect face position using DNN (preferred) or Haar Cascade (fallback)
 3. Apply EMA (Exponential Moving Average) smoothing to reduce jitter
-4. Generate FFmpeg-compatible expressions for interpolated crop positions
+4. Generate FFmpeg-compatible crop positions
+
+DNN Model Setup:
+- Models are downloaded during Docker build to /app/models/
+- deploy.prototxt and res10_300x300_ssd_iter_140000.caffemodel
 """
 
 import cv2
+import os
 import subprocess
 import json
 import numpy as np
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
+
+
+# =============================================================================
+# GLOBAL CACHED DNN NET (singleton pattern for performance)
+# =============================================================================
+_DNN_NET = None
+_DNN_NET_LOADED = False  # Track if we've attempted loading
+
+DEBUG_FACE_TRACKING = os.environ.get("DEBUG_FACE_TRACKING", "1") == "1"
+
+
+def _get_dnn_net():
+    """
+    Load DNN face detection model once and cache it.
+    
+    Returns:
+        cv2.dnn.Net or None if models are missing
+    """
+    global _DNN_NET, _DNN_NET_LOADED
+    
+    if _DNN_NET_LOADED:
+        return _DNN_NET
+    
+    _DNN_NET_LOADED = True
+    
+    model_base = Path(__file__).parent / "models"
+    prototxt = model_base / "deploy.prototxt"
+    caffemodel = model_base / "res10_300x300_ssd_iter_140000.caffemodel"
+    
+    if not prototxt.exists() or not caffemodel.exists():
+        print(f"   ⚠️ DNN models not found at {model_base}")
+        print(f"      Prototxt exists: {prototxt.exists()}")
+        print(f"      Caffemodel exists: {caffemodel.exists()}")
+        return None
+    
+    try:
+        net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
+        # Set optimal backend/target for CPU
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        _DNN_NET = net
+        print("   ✅ DNN face detector loaded successfully")
+        return _DNN_NET
+    except Exception as e:
+        print(f"   ❌ Failed to load DNN model: {e}")
+        return None
 
 
 @dataclass
@@ -92,14 +143,45 @@ def extract_frame_at_time(video_path: str, timestamp: float, temp_dir: str) -> O
     return None
 
 
+def _preprocess_frame_for_detection(frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    Preprocess frame to improve face detection in challenging lighting.
+    
+    Applies CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    to enhance contrast, especially helpful for blue/dim lighting.
+    """
+    # Convert to LAB color space
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+    
+    # Split channels
+    l, a, b = cv2.split(lab)
+    
+    # Apply CLAHE to L channel (luminance)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l)
+    
+    # Merge back
+    lab_enhanced = cv2.merge([l_enhanced, a, b])
+    
+    # Convert back to BGR
+    return cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+
 def _score_face_for_fullcam(x: int, y: int, w: int, h: int, frame_w: int, frame_h: int) -> float:
     """
     Score a face for FULL_CAM selection (streamer detection).
     
+    CRITICAL: This scoring is designed to REJECT background people and SELECT the streamer.
+    
     Streamers typically:
-    - Are in the LOWER portion of the frame (seated at desk)
-    - Are relatively CENTERED horizontally
+    - Are in the LOWER portion of the frame (seated at desk, y_ratio > 0.50)
+    - Are on the LEFT or CENTER-LEFT (typical desk setup, x_ratio 0.20-0.50)
     - Have LARGER faces (closer to camera than background people)
+    
+    Background people typically:
+    - Are in the UPPER portion (standing, y_ratio < 0.40)
+    - Are on the RIGHT side (walking behind, x_ratio > 0.60)
+    - Have SMALLER faces (farther from camera)
     
     Args:
         x, y, w, h: Face bounding box
@@ -113,105 +195,192 @@ def _score_face_for_fullcam(x: int, y: int, w: int, h: int, frame_w: int, frame_
     face_area = w * h
     frame_area = frame_w * frame_h
     
-    # Factor 1: Size - larger faces are likely the main subject (closer to camera)
-    # Normalize to 0-1 range (max expected face area ~30% of frame)
-    size_score = min(1.0, (face_area / frame_area) / 0.30)
-    
-    # Factor 2: Vertical position - prefer faces in LOWER half of frame
-    # Streamers sit at desk level, background people are often standing
-    # y_ratio = 0 at top, 1 at bottom
+    # =========================================================================
+    # Factor 1: VERTICAL POSITION (most important)
+    # Streamers sit at desk level = LOWER portion of frame
+    # =========================================================================
     y_ratio = face_center_y / frame_h
-    # Score: 0.3 at top, 1.0 at 70% down, 0.8 at bottom
-    if y_ratio < 0.3:
-        position_score = 0.3  # Upper area - likely background
-    elif y_ratio > 0.85:
-        position_score = 0.8  # Very bottom - might be cut off
+    
+    if y_ratio < 0.35:
+        # Upper area - VERY LIKELY background person standing
+        position_score = 0.10
+    elif y_ratio < 0.45:
+        # Upper-middle - probably background
+        position_score = 0.25
+    elif y_ratio < 0.55:
+        # Middle - could be either
+        position_score = 0.50
+    elif y_ratio < 0.70:
+        # Lower-middle - likely streamer seated
+        position_score = 0.85
     else:
-        # Sweet spot: 0.3-0.85 from top, peaking around 0.6-0.7
-        position_score = 0.5 + 0.5 * min(1.0, (y_ratio - 0.3) / 0.4)
+        # Lower area - streamer at desk level
+        position_score = 0.95
     
-    # Factor 3: Horizontal centering - streamers are usually centered
+    # =========================================================================
+    # Factor 2: HORIZONTAL POSITION
+    # Streamers are typically LEFT or CENTER-LEFT (desk setup)
+    # Background people often walk behind on the RIGHT
+    # =========================================================================
     x_ratio = face_center_x / frame_w
-    # Score peaks at center (0.5), drops toward edges
-    center_score = 1.0 - abs(x_ratio - 0.5) * 1.5  # 1.0 at center, 0.25 at edges
-    center_score = max(0.2, center_score)
     
-    # Combined score: size matters most, then position, then centering
-    total_score = (size_score * 0.5) + (position_score * 0.35) + (center_score * 0.15)
+    if x_ratio < 0.20:
+        # Far left - probably streamer
+        horizontal_score = 0.80
+    elif x_ratio < 0.40:
+        # Left-center - sweet spot for streamer
+        horizontal_score = 0.95
+    elif x_ratio < 0.55:
+        # Center - good for streamer
+        horizontal_score = 0.85
+    elif x_ratio < 0.70:
+        # Right-center - could be either
+        horizontal_score = 0.50
+    else:
+        # Far right - likely background person
+        horizontal_score = 0.20
+    
+    # =========================================================================
+    # Factor 3: SIZE
+    # Streamers have larger faces (closer to camera)
+    # But size should NOT dominate position!
+    # =========================================================================
+    size_ratio = face_area / frame_area
+    
+    if size_ratio > 0.10:
+        size_score = 1.0  # Very large face
+    elif size_ratio > 0.05:
+        size_score = 0.85
+    elif size_ratio > 0.02:
+        size_score = 0.70
+    elif size_ratio > 0.01:
+        size_score = 0.50
+    else:
+        size_score = 0.30  # Small face (far away)
+    
+    # =========================================================================
+    # COMBINED SCORE
+    # Position is MOST important, then horizontal, then size
+    # =========================================================================
+    total_score = (position_score * 0.45) + (horizontal_score * 0.35) + (size_score * 0.20)
     
     return total_score
 
 
-def detect_face_dnn(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
+def detect_face_dnn(
+    frame_bgr: np.ndarray,
+    confidence_threshold: float = 0.35,  # Lower threshold for better detection
+    try_preprocessing: bool = True,
+) -> Optional[Tuple[int, int, int, int, float]]:
     """
-    Detect face using OpenCV DNN (Caffe model).
+    Detect face using OpenCV DNN (ResNet SSD Caffe model).
     
-    For FULL_CAM scenarios, prefers faces that are:
-    - Larger (closer to camera)
-    - In the lower portion of frame (streamer at desk)
-    - More centered horizontally
+    This is more robust than Haar Cascade, especially for:
+    - Profile/angled faces
+    - Variable lighting conditions
+    - Faces with glasses/accessories
+    
+    Args:
+        frame_bgr: Input frame in BGR format
+        confidence_threshold: Minimum confidence (default 0.35 for better recall)
+        try_preprocessing: Whether to try enhanced preprocessing if first pass fails
     
     Returns:
         Tuple of (x, y, width, height, confidence) or None
     """
-    model_base = Path(__file__).parent / "models"
-    prototxt = model_base / "deploy.prototxt"
-    caffemodel = model_base / "res10_300x300_ssd_iter_140000.caffemodel"
-    
-    if not prototxt.exists() or not caffemodel.exists():
+    net = _get_dnn_net()
+    if net is None:
         return None
     
-    net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
-    
     h, w = frame_bgr.shape[:2]
-    blob = cv2.dnn.blobFromImage(
-        cv2.resize(frame_bgr, (300, 300)),
-        1.0,
-        (300, 300),
-        (104.0, 177.0, 123.0),
-    )
     
-    net.setInput(blob)
-    detections = net.forward()
-    
-    # Collect all valid faces
-    candidates = []
-    
-    for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
+    def _run_detection(input_frame):
+        """Run DNN detection on a frame."""
+        blob = cv2.dnn.blobFromImage(
+            cv2.resize(input_frame, (300, 300)),
+            1.0,
+            (300, 300),
+            (104.0, 177.0, 123.0),
+        )
         
-        if confidence > 0.5:  # Minimum confidence
-            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-            x1, y1, x2, y2 = box.astype("int")
+        net.setInput(blob)
+        detections = net.forward()
+        
+        candidates = []
+        
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
             
-            # Ensure coordinates are valid
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(w, x2)
-            y2 = min(h, y2)
-            
-            if x2 > x1 and y2 > y1:
-                fw, fh = x2 - x1, y2 - y1
-                # Score for streamer detection
-                score = _score_face_for_fullcam(x1, y1, fw, fh, w, h)
-                candidates.append((x1, y1, fw, fh, confidence, score))
+            if confidence > confidence_threshold:
+                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                x1, y1, x2, y2 = box.astype("int")
+                
+                # Ensure coordinates are valid
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(w, x2)
+                y2 = min(h, y2)
+                
+                if x2 > x1 and y2 > y1:
+                    fw, fh = x2 - x1, y2 - y1
+                    # Score for streamer detection
+                    score = _score_face_for_fullcam(x1, y1, fw, fh, w, h)
+                    y_ratio = (y1 + fh // 2) / h
+                    x_ratio = (x1 + fw // 2) / w
+                    candidates.append({
+                        'bbox': (x1, y1, fw, fh),
+                        'confidence': float(confidence),
+                        'score': score,
+                        'y_ratio': y_ratio,
+                        'x_ratio': x_ratio,
+                    })
+        
+        return candidates
+    
+    # First pass: original frame
+    candidates = _run_detection(frame_bgr)
+    
+    # Second pass: try preprocessing if no good candidates found
+    if try_preprocessing and (len(candidates) == 0 or max(c['score'] for c in candidates) < 0.50):
+        enhanced = _preprocess_frame_for_detection(frame_bgr)
+        enhanced_candidates = _run_detection(enhanced)
+        
+        # Merge candidates, keeping best score for each rough position
+        for ec in enhanced_candidates:
+            is_new = True
+            for c in candidates:
+                # Check if same face (close position)
+                if abs(ec['bbox'][0] - c['bbox'][0]) < 50 and abs(ec['bbox'][1] - c['bbox'][1]) < 50:
+                    if ec['score'] > c['score']:
+                        c.update(ec)
+                    is_new = False
+                    break
+            if is_new:
+                candidates.append(ec)
     
     if not candidates:
         return None
     
+    # Debug logging
+    if DEBUG_FACE_TRACKING:
+        candidates_sorted = sorted(candidates, key=lambda c: c['score'], reverse=True)
+        print(f"   🔍 DNN candidates ({len(candidates_sorted)}):")
+        for i, c in enumerate(candidates_sorted[:3]):
+            x, y, fw, fh = c['bbox']
+            print(f"      #{i+1}: ({x},{y}) {fw}x{fh} conf={c['confidence']:.2f} score={c['score']:.3f} y={c['y_ratio']:.2f} x={c['x_ratio']:.2f}")
+    
     # Pick face with highest streamer score
-    best = max(candidates, key=lambda c: c[5])
-    return (best[0], best[1], best[2], best[3], best[4])
+    best = max(candidates, key=lambda c: c['score'])
+    x, y, fw, fh = best['bbox']
+    
+    return (x, y, fw, fh, best['confidence'])
 
 
 def detect_face_haar(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
     """
     Fallback face detection using Haar Cascade.
     
-    For FULL_CAM scenarios, prefers faces that are:
-    - Larger (closer to camera)
-    - In the lower portion of frame (streamer at desk)
-    - More centered horizontally
+    Less robust than DNN but works without model files.
     
     Returns:
         Tuple of (x, y, width, height, confidence) or None
@@ -247,20 +416,37 @@ def detect_face_haar(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int
     candidates = []
     for (fx, fy, fw, fh) in faces:
         score = _score_face_for_fullcam(fx, fy, fw, fh, w, h)
-        candidates.append((fx, fy, fw, fh, 0.8, score))  # Haar confidence = 0.8
+        y_ratio = (fy + fh // 2) / h
+        x_ratio = (fx + fw // 2) / w
+        candidates.append({
+            'bbox': (fx, fy, fw, fh),
+            'confidence': 0.8,
+            'score': score,
+            'y_ratio': y_ratio,
+            'x_ratio': x_ratio,
+        })
+    
+    # Debug logging
+    if DEBUG_FACE_TRACKING:
+        candidates_sorted = sorted(candidates, key=lambda c: c['score'], reverse=True)
+        print(f"   🔍 Haar candidates ({len(candidates_sorted)}):")
+        for i, c in enumerate(candidates_sorted[:3]):
+            x, y, fw, fh = c['bbox']
+            print(f"      #{i+1}: ({x},{y}) {fw}x{fh} score={c['score']:.3f} y={c['y_ratio']:.2f} x={c['x_ratio']:.2f}")
     
     # Pick face with highest streamer score
-    best = max(candidates, key=lambda c: c[5])
+    best = max(candidates, key=lambda c: c['score'])
+    x, y, fw, fh = best['bbox']
     
-    return (best[0], best[1], best[2], best[3], 0.8)  # Haar doesn't give confidence, use 0.8
+    return (x, y, fw, fh, 0.8)
 
 
 def track_faces(
     video_path: str,
     temp_dir: str,
-    sample_interval: float = 1.5,  # Sample every 1.5 seconds for better coverage
+    sample_interval: float = 1.5,
     ema_alpha: float = 0.4,
-    max_keyframes: int = 20,  # Allow more keyframes for better tracking
+    max_keyframes: int = 20,
 ) -> Optional[FaceTrack]:
     """
     Track face positions throughout a video.
@@ -268,9 +454,9 @@ def track_faces(
     Args:
         video_path: Path to input video
         temp_dir: Temporary directory for frame extraction
-        sample_interval: Time between samples in seconds (default 2.0s)
-        ema_alpha: EMA smoothing factor (0-1, higher = more responsive, default 0.4)
-        max_keyframes: Maximum keyframes to keep (FFmpeg expression limit)
+        sample_interval: Time between samples in seconds
+        ema_alpha: EMA smoothing factor (0-1, higher = more responsive)
+        max_keyframes: Maximum keyframes to keep
     
     Returns:
         FaceTrack with smoothed keyframes, or None if no faces detected
@@ -285,24 +471,22 @@ def track_faces(
     
     print(f"   📹 Video: {width}x{height}, {duration:.2f}s")
     
-    # Calculate sample timestamps - limit to avoid too many keyframes
-    # For a 30s clip with 2s interval: 15 samples
+    # Calculate sample timestamps
     timestamps = []
     t = 0.0
     while t < duration:
         timestamps.append(t)
         t += sample_interval
     
-    # Always include the last frame
+    # Always include near the end
     if timestamps[-1] < duration - 0.5:
         timestamps.append(duration - 0.5)
     
     # Limit total samples
     if len(timestamps) > max_keyframes:
-        # Evenly space the samples
         step = len(timestamps) / max_keyframes
         timestamps = [timestamps[int(i * step)] for i in range(max_keyframes)]
-        timestamps.append(duration - 0.5)  # Ensure we have the end
+        timestamps.append(duration - 0.5)
     
     print(f"   🎯 Sampling {len(timestamps)} frames...")
     
@@ -314,7 +498,7 @@ def track_faces(
         if frame is None:
             continue
         
-        # Try DNN first, then Haar fallback
+        # Try DNN first (more robust), then Haar fallback
         detection = detect_face_dnn(frame)
         if detection is None:
             detection = detect_face_haar(frame)
@@ -328,13 +512,14 @@ def track_faces(
     
     print(f"   ✅ Detected faces in {len(raw_detections)}/{len(timestamps)} frames")
     
-    # Debug: show face positions to verify scoring is working
+    # Debug: show face positions
     print(f"   📊 Face positions detected:")
-    for ts, det in raw_detections[:5]:  # Show first 5
+    for ts, det in raw_detections[:5]:
         x, y, w, h, conf = det
         cx, cy = x + w // 2, y + h // 2
         y_ratio = cy / height
-        print(f"      t={ts:.1f}s: center=({cx},{cy}) y_ratio={y_ratio:.2f} size={w}x{h}")
+        x_ratio = cx / width
+        print(f"      t={ts:.1f}s: center=({cx},{cy}) y={y_ratio:.2f} x={x_ratio:.2f} size={w}x{h}")
     if len(raw_detections) > 5:
         print(f"      ... and {len(raw_detections) - 5} more")
     
@@ -379,7 +564,7 @@ def track_faces(
             confidence=conf,
         ))
     
-    # If we have gaps (missing detections), interpolate
+    # Interpolate gaps
     keyframes = _interpolate_gaps(keyframes, timestamps, smoothed_cx, smoothed_cy, smoothed_w, smoothed_h)
     
     print(f"   🎬 Generated {len(keyframes)} smoothed keyframes")
@@ -401,11 +586,7 @@ def _interpolate_gaps(
     last_w: int,
     last_h: int,
 ) -> List[FaceKeyframe]:
-    """
-    Fill gaps in keyframes where face wasn't detected.
-    Uses last known position for missing frames.
-    """
-    # Create a map of existing keyframes
+    """Fill gaps in keyframes where face wasn't detected."""
     kf_map = {kf.timestamp: kf for kf in keyframes}
     
     filled_keyframes = []
@@ -416,14 +597,13 @@ def _interpolate_gaps(
             filled_keyframes.append(kf_map[ts])
             last_kf = kf_map[ts]
         elif last_kf:
-            # Use last known position
             filled_keyframes.append(FaceKeyframe(
                 timestamp=ts,
                 center_x=last_kf.center_x,
                 center_y=last_kf.center_y,
                 width=last_kf.width,
                 height=last_kf.height,
-                confidence=0.5,  # Lower confidence for interpolated
+                confidence=0.5,
             ))
     
     return filled_keyframes
@@ -434,25 +614,23 @@ def generate_ffmpeg_crop_expr(
     crop_width: int,
     crop_height: int,
     target_face_y_ratio: float = 0.45,
-    movement_threshold: int = 100,  # Minimum movement in pixels to enable dynamic crop
+    movement_threshold: int = 100,
 ) -> Tuple[str, str]:
     """
-    Generate FFmpeg expressions for dynamic crop x and y positions.
+    Generate FFmpeg crop x and y positions.
     
-    The expressions use linear interpolation between keyframes based on time (t).
-    Face is positioned at target_face_y_ratio from top of frame (default 45%).
-    
-    If face movement is minimal, returns static crop positions for simplicity.
+    Returns static positions based on average face position.
+    Includes heuristics to detect and reject background people.
     
     Args:
         face_track: Face tracking result
         crop_width: Width of crop region
         crop_height: Height of crop region
         target_face_y_ratio: Where face should be positioned vertically (0-1)
-        movement_threshold: Minimum face movement (px) to use dynamic crop
+        movement_threshold: Unused (kept for API compatibility)
     
     Returns:
-        Tuple of (x_expression, y_expression) for FFmpeg crop filter
+        Tuple of (x_position, y_position) as strings for FFmpeg
     """
     if len(face_track.keyframes) == 0:
         # Fallback to center crop
@@ -465,7 +643,6 @@ def generate_ffmpeg_crop_expr(
     # Calculate crop positions for each keyframe
     crop_positions = []
     for kf in face_track.keyframes:
-        # Calculate crop position to center face at target ratio
         crop_x = kf.center_x - crop_width // 2
         crop_y = kf.center_y - int(crop_height * target_face_y_ratio)
         
@@ -476,127 +653,54 @@ def generate_ffmpeg_crop_expr(
         crop_positions.append((kf.timestamp, crop_x, crop_y))
     
     if len(crop_positions) == 1:
-        # Single keyframe - static crop
         return str(crop_positions[0][1]), str(crop_positions[0][2])
     
-    # Check face movement range
+    # Calculate averages
     x_positions = [p[1] for p in crop_positions]
     y_positions = [p[2] for p in crop_positions]
     
-    x_range = max(x_positions) - min(x_positions)
-    y_range = max(y_positions) - min(y_positions)
-    
-    # Calculate average position for stable crop
     avg_x = sum(x_positions) // len(x_positions)
     avg_y = sum(y_positions) // len(y_positions)
     
-    # CRITICAL: Check if detected faces are ALL in the upper portion of frame
-    # This indicates we're detecting background people, NOT the main streamer
-    # Streamers sit at desk level (lower 40-70% of frame)
-    avg_face_y_ratio = sum(kf.center_y for kf in face_track.keyframes) / len(face_track.keyframes) / face_track.video_height
-    
-    # Also check if all faces are on one side (background person standing)
+    # =========================================================================
+    # BACKGROUND DETECTION: Check if detected faces are background people
+    # =========================================================================
+    avg_face_y = sum(kf.center_y for kf in face_track.keyframes) / len(face_track.keyframes)
     avg_face_x = sum(kf.center_x for kf in face_track.keyframes) / len(face_track.keyframes)
+    
+    avg_face_y_ratio = avg_face_y / face_track.video_height
     avg_face_x_ratio = avg_face_x / face_track.video_width
     
-    # Background detection: faces in upper area OR consistently on far right (background person)
+    # Background indicators:
+    # - Faces in upper portion (y_ratio < 0.45) = standing person
+    # - Faces on far right (x_ratio > 0.55) = walking behind streamer
     faces_in_upper = avg_face_y_ratio < 0.45
-    faces_on_far_right = avg_face_x_ratio > 0.55  # Background person at right side
+    faces_on_far_right = avg_face_x_ratio > 0.55
     
     if faces_in_upper or faces_on_far_right:
-        # Detected faces are likely background people, NOT the main streamer!
-        # For FULL_CAM "just chatting" streams, default to CENTER-LEFT crop
-        # (streamer typically sits slightly left of center at their desk)
-        print(f"   ⚠️ Detected faces likely background: y_ratio={avg_face_y_ratio:.2f}, x_ratio={avg_face_x_ratio:.2f}")
-        print(f"   🎯 Defaulting to center-left crop (typical streamer position)")
+        # Detected faces are likely background people, NOT the streamer!
+        # Use TRUE LEFT BIAS: streamer is typically on the LEFT side at their desk
+        print(f"   ⚠️ Background faces detected: y_ratio={avg_face_y_ratio:.2f}, x_ratio={avg_face_x_ratio:.2f}")
+        print(f"   🎯 Using LEFT-BIASED crop (typical streamer position)")
         
-        # Center horizontally (or slightly left for desk setup)
-        default_x = max(0, (face_track.video_width - crop_width) // 2 - int(crop_width * 0.15))
+        # TRUE LEFT BIAS: Position crop at 10% from left edge
+        # This ensures the streamer on the left side is captured
+        default_x = int((face_track.video_width - crop_width) * 0.10)
         default_y = max(0, (face_track.video_height - crop_height) // 2)
         
         # Clamp to valid bounds
-        default_x = min(default_x, face_track.video_width - crop_width)
-        default_y = min(default_y, face_track.video_height - crop_height)
+        default_x = max(0, min(default_x, face_track.video_width - crop_width))
+        default_y = max(0, min(default_y, face_track.video_height - crop_height))
         
-        print(f"   📍 Using default position ({default_x}, {default_y})")
+        print(f"   📍 Left-biased position: ({default_x}, {default_y})")
         return str(default_x), str(default_y)
     
-    # For now, always use static crop based on average face position
-    # Dynamic FFmpeg expressions with nested if() are complex and error-prone
-    # The average position provides smooth, centered framing
-    print(f"   📍 Face tracking: range=({x_range}px, {y_range}px), using avg position ({avg_x}, {avg_y})")
+    # Detected face appears to be the streamer - use tracked position
+    x_range = max(x_positions) - min(x_positions)
+    y_range = max(y_positions) - min(y_positions)
+    
+    print(f"   📍 Face tracking: range=({x_range}px, {y_range}px), avg position ({avg_x}, {avg_y})")
     return str(avg_x), str(avg_y)
-    
-    # NOTE: Dynamic expressions disabled for reliability
-    # Uncomment below to enable dynamic tracking (requires FFmpeg expression debugging)
-    #
-    # # If movement is significant, use dynamic expressions
-    # if x_range >= movement_threshold or y_range >= movement_threshold:
-    #     print(f"   🎯 Face movement detected ({x_range}px, {y_range}px) - using dynamic crop")
-    #     x_expr = _build_interpolation_expr(crop_positions, 'x')
-    #     y_expr = _build_interpolation_expr(crop_positions, 'y')
-    #     return x_expr, y_expr
-    # 
-    # return str(avg_x), str(avg_y)
-
-
-def _build_interpolation_expr(positions: List[Tuple[float, int, int]], axis: str) -> str:
-    """
-    Build FFmpeg expression for linear interpolation between keyframe positions.
-    
-    Uses nested if() with escaped commas for FFmpeg filter chain compatibility.
-    
-    Args:
-        positions: List of (timestamp, x, y) tuples
-        axis: 'x' or 'y'
-    
-    Returns:
-        FFmpeg expression string with properly escaped commas
-    """
-    idx = 1 if axis == 'x' else 2
-    
-    if len(positions) <= 1:
-        return str(positions[0][idx]) if positions else "0"
-    
-    # Limit to very few keyframes to keep expression simple
-    # FFmpeg can struggle with complex nested expressions
-    MAX_EXPR_KEYFRAMES = 6
-    if len(positions) > MAX_EXPR_KEYFRAMES:
-        # Downsample to MAX_EXPR_KEYFRAMES evenly spaced
-        step = len(positions) / MAX_EXPR_KEYFRAMES
-        sampled = [positions[int(i * step)] for i in range(MAX_EXPR_KEYFRAMES - 1)]
-        sampled.append(positions[-1])  # Always include last
-        positions = sampled
-    
-    def lerp_expr(v0: int, v1: int, t0: float, t1: float) -> str:
-        """Linear interpolation: v0 + (v1-v0) * (t-t0)/(t1-t0)"""
-        if t1 <= t0 or v0 == v1:
-            return str(v0)
-        dt = t1 - t0
-        dv = v1 - v0
-        # Simple format without nested parens: v0+dv*(t-t0)/dt
-        return f"{v0}+{dv}*(t-{t0:.1f})/{dt:.1f}"
-    
-    n = len(positions)
-    
-    # Start with last value
-    expr = str(positions[-1][idx])
-    
-    # Build nested if statements backwards
-    # Commas must be escaped as \, for FFmpeg filter parsing
-    for i in range(n - 2, -1, -1):
-        t0, x0, y0 = positions[i]
-        t1, x1, y1 = positions[i + 1]
-        v0 = x0 if axis == 'x' else y0
-        v1 = x1 if axis == 'x' else y1
-        
-        lerp = lerp_expr(v0, v1, t0, t1)
-        
-        # Escape commas with single backslash for FFmpeg
-        # if(lt(t\,T)\,THEN\,ELSE)
-        expr = f"if(lt(t\\,{t1:.1f})\\,{lerp}\\,{expr})"
-    
-    return expr
 
 
 def get_static_face_center(face_track: FaceTrack) -> Optional[Tuple[int, int]]:
@@ -623,4 +727,3 @@ def get_static_face_center(face_track: FaceTrack) -> Optional[Tuple[int, int]]:
         return None
     
     return (int(weighted_x / total_weight), int(weighted_y / total_weight))
-
