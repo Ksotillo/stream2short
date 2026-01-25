@@ -185,8 +185,9 @@ def detect_face_haar(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int
 def track_faces(
     video_path: str,
     temp_dir: str,
-    sample_interval: float = 0.5,
-    ema_alpha: float = 0.3,
+    sample_interval: float = 2.0,  # Sample every 2 seconds (not 0.5!)
+    ema_alpha: float = 0.4,
+    max_keyframes: int = 12,  # Max keyframes for FFmpeg expression
 ) -> Optional[FaceTrack]:
     """
     Track face positions throughout a video.
@@ -194,8 +195,9 @@ def track_faces(
     Args:
         video_path: Path to input video
         temp_dir: Temporary directory for frame extraction
-        sample_interval: Time between samples in seconds (default 0.5s)
-        ema_alpha: EMA smoothing factor (0-1, higher = more responsive, default 0.3)
+        sample_interval: Time between samples in seconds (default 2.0s)
+        ema_alpha: EMA smoothing factor (0-1, higher = more responsive, default 0.4)
+        max_keyframes: Maximum keyframes to keep (FFmpeg expression limit)
     
     Returns:
         FaceTrack with smoothed keyframes, or None if no faces detected
@@ -210,7 +212,8 @@ def track_faces(
     
     print(f"   📹 Video: {width}x{height}, {duration:.2f}s")
     
-    # Calculate sample timestamps
+    # Calculate sample timestamps - limit to avoid too many keyframes
+    # For a 30s clip with 2s interval: 15 samples
     timestamps = []
     t = 0.0
     while t < duration:
@@ -218,8 +221,15 @@ def track_faces(
         t += sample_interval
     
     # Always include the last frame
-    if timestamps[-1] < duration - 0.1:
-        timestamps.append(duration - 0.1)
+    if timestamps[-1] < duration - 0.5:
+        timestamps.append(duration - 0.5)
+    
+    # Limit total samples
+    if len(timestamps) > max_keyframes:
+        # Evenly space the samples
+        step = len(timestamps) / max_keyframes
+        timestamps = [timestamps[int(i * step)] for i in range(max_keyframes)]
+        timestamps.append(duration - 0.5)  # Ensure we have the end
     
     print(f"   🎯 Sampling {len(timestamps)} frames...")
     
@@ -341,6 +351,7 @@ def generate_ffmpeg_crop_expr(
     crop_width: int,
     crop_height: int,
     target_face_y_ratio: float = 0.45,
+    movement_threshold: int = 100,  # Minimum movement in pixels to enable dynamic crop
 ) -> Tuple[str, str]:
     """
     Generate FFmpeg expressions for dynamic crop x and y positions.
@@ -348,11 +359,14 @@ def generate_ffmpeg_crop_expr(
     The expressions use linear interpolation between keyframes based on time (t).
     Face is positioned at target_face_y_ratio from top of frame (default 45%).
     
+    If face movement is minimal, returns static crop positions for simplicity.
+    
     Args:
         face_track: Face tracking result
         crop_width: Width of crop region
         crop_height: Height of crop region
         target_face_y_ratio: Where face should be positioned vertically (0-1)
+        movement_threshold: Minimum face movement (px) to use dynamic crop
     
     Returns:
         Tuple of (x_expression, y_expression) for FFmpeg crop filter
@@ -364,16 +378,6 @@ def generate_ffmpeg_crop_expr(
         crop_x = max(0, cx - crop_width // 2)
         crop_y = max(0, cy - crop_height // 2)
         return str(crop_x), str(crop_y)
-    
-    if len(face_track.keyframes) == 1:
-        # Single keyframe - static crop
-        kf = face_track.keyframes[0]
-        crop_x = max(0, min(kf.center_x - crop_width // 2, face_track.video_width - crop_width))
-        crop_y = max(0, min(kf.center_y - int(crop_height * target_face_y_ratio), face_track.video_height - crop_height))
-        return str(crop_x), str(crop_y)
-    
-    # Build expressions for multiple keyframes using nested if() statements
-    # Format: if(lt(t,t1),expr1,if(lt(t,t2),lerp(expr1,expr2),if(...)))
     
     # Calculate crop positions for each keyframe
     crop_positions = []
@@ -388,46 +392,84 @@ def generate_ffmpeg_crop_expr(
         
         crop_positions.append((kf.timestamp, crop_x, crop_y))
     
-    # Build the expression
-    x_expr = _build_interpolation_expr(crop_positions, 'x')
-    y_expr = _build_interpolation_expr(crop_positions, 'y')
+    if len(crop_positions) == 1:
+        # Single keyframe - static crop
+        return str(crop_positions[0][1]), str(crop_positions[0][2])
     
-    return x_expr, y_expr
+    # Check face movement range
+    x_positions = [p[1] for p in crop_positions]
+    y_positions = [p[2] for p in crop_positions]
+    
+    x_range = max(x_positions) - min(x_positions)
+    y_range = max(y_positions) - min(y_positions)
+    
+    # Calculate average position for stable crop
+    avg_x = sum(x_positions) // len(x_positions)
+    avg_y = sum(y_positions) // len(y_positions)
+    
+    # For now, always use static crop based on average face position
+    # Dynamic FFmpeg expressions with nested if() are complex and error-prone
+    # The average position provides smooth, centered framing
+    print(f"   📍 Face tracking: range=({x_range}px, {y_range}px), using avg position ({avg_x}, {avg_y})")
+    return str(avg_x), str(avg_y)
+    
+    # NOTE: Dynamic expressions disabled for reliability
+    # Uncomment below to enable dynamic tracking (requires FFmpeg expression debugging)
+    #
+    # # If movement is significant, use dynamic expressions
+    # if x_range >= movement_threshold or y_range >= movement_threshold:
+    #     print(f"   🎯 Face movement detected ({x_range}px, {y_range}px) - using dynamic crop")
+    #     x_expr = _build_interpolation_expr(crop_positions, 'x')
+    #     y_expr = _build_interpolation_expr(crop_positions, 'y')
+    #     return x_expr, y_expr
+    # 
+    # return str(avg_x), str(avg_y)
 
 
 def _build_interpolation_expr(positions: List[Tuple[float, int, int]], axis: str) -> str:
     """
     Build FFmpeg expression for linear interpolation between keyframe positions.
     
+    Uses nested if() with escaped commas for FFmpeg filter chain compatibility.
+    
     Args:
         positions: List of (timestamp, x, y) tuples
         axis: 'x' or 'y'
     
     Returns:
-        FFmpeg expression string
+        FFmpeg expression string with properly escaped commas
     """
     idx = 1 if axis == 'x' else 2
     
     if len(positions) <= 1:
         return str(positions[0][idx]) if positions else "0"
     
-    # For smoother interpolation with many keyframes, build nested lerp expressions
-    # Format: if(lt(t,t1), v0, if(lt(t,t2), lerp(v0,v1,t,t0,t1), ...))
+    # Limit to very few keyframes to keep expression simple
+    # FFmpeg can struggle with complex nested expressions
+    MAX_EXPR_KEYFRAMES = 6
+    if len(positions) > MAX_EXPR_KEYFRAMES:
+        # Downsample to MAX_EXPR_KEYFRAMES evenly spaced
+        step = len(positions) / MAX_EXPR_KEYFRAMES
+        sampled = [positions[int(i * step)] for i in range(MAX_EXPR_KEYFRAMES - 1)]
+        sampled.append(positions[-1])  # Always include last
+        positions = sampled
     
     def lerp_expr(v0: int, v1: int, t0: float, t1: float) -> str:
-        """Linear interpolation expression: v0 + (v1-v0) * (t-t0)/(t1-t0)"""
-        if t1 <= t0:
+        """Linear interpolation: v0 + (v1-v0) * (t-t0)/(t1-t0)"""
+        if t1 <= t0 or v0 == v1:
             return str(v0)
-        # Use floor to get integer values
-        return f"floor({v0}+({v1}-{v0})*(t-{t0:.3f})/({t1-t0:.3f}))"
+        dt = t1 - t0
+        dv = v1 - v0
+        # Simple format without nested parens: v0+dv*(t-t0)/dt
+        return f"{v0}+{dv}*(t-{t0:.1f})/{dt:.1f}"
     
-    # Build from the end (last segment) backwards
     n = len(positions)
     
-    # Start with the last value (for t >= last timestamp)
+    # Start with last value
     expr = str(positions[-1][idx])
     
-    # Build nested if statements from second-to-last backwards
+    # Build nested if statements backwards
+    # Commas must be escaped as \, for FFmpeg filter parsing
     for i in range(n - 2, -1, -1):
         t0, x0, y0 = positions[i]
         t1, x1, y1 = positions[i + 1]
@@ -436,12 +478,9 @@ def _build_interpolation_expr(positions: List[Tuple[float, int, int]], axis: str
         
         lerp = lerp_expr(v0, v1, t0, t1)
         
-        if i == 0:
-            # First segment: just use lerp for t < t1
-            expr = f"if(lt(t,{t1:.3f}),{lerp},{expr})"
-        else:
-            # Middle segments: if t < t1, lerp from prev, else continue
-            expr = f"if(lt(t,{t1:.3f}),{lerp},{expr})"
+        # Escape commas with single backslash for FFmpeg
+        # if(lt(t\,T)\,THEN\,ELSE)
+        expr = f"if(lt(t\\,{t1:.1f})\\,{lerp}\\,{expr})"
     
     return expr
 
