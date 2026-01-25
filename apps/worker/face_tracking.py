@@ -258,9 +258,9 @@ def detect_face_haar(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int
 def track_faces(
     video_path: str,
     temp_dir: str,
-    sample_interval: float = 2.0,  # Sample every 2 seconds (not 0.5!)
+    sample_interval: float = 1.5,  # Sample every 1.5 seconds for better coverage
     ema_alpha: float = 0.4,
-    max_keyframes: int = 12,  # Max keyframes for FFmpeg expression
+    max_keyframes: int = 20,  # Allow more keyframes for better tracking
 ) -> Optional[FaceTrack]:
     """
     Track face positions throughout a video.
@@ -327,6 +327,16 @@ def track_faces(
         return None
     
     print(f"   ✅ Detected faces in {len(raw_detections)}/{len(timestamps)} frames")
+    
+    # Debug: show face positions to verify scoring is working
+    print(f"   📊 Face positions detected:")
+    for ts, det in raw_detections[:5]:  # Show first 5
+        x, y, w, h, conf = det
+        cx, cy = x + w // 2, y + h // 2
+        y_ratio = cy / height
+        print(f"      t={ts:.1f}s: center=({cx},{cy}) y_ratio={y_ratio:.2f} size={w}x{h}")
+    if len(raw_detections) > 5:
+        print(f"      ... and {len(raw_detections) - 5} more")
     
     # Apply EMA smoothing
     keyframes: List[FaceKeyframe] = []
