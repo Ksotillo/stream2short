@@ -165,6 +165,11 @@ def classify_layout(
     if webcam_bbox is None:
         return 'NO_WEBCAM', 'No webcam detected', 0.0
     
+    # Special case: 'full' position means the entire frame is the camera (FULL_CAM)
+    # This is set when Gemini found no overlay but we detected a face in full frame
+    if corner == 'full':
+        return 'FULL_CAM', 'Full frame is camera (no overlay detected, face found)', 1.0
+    
     # Extract bbox dimensions
     bx = webcam_bbox.get('x', 0)
     by = webcam_bbox.get('y', 0)
@@ -2157,10 +2162,65 @@ def detect_webcam_region(
     except Exception as e:
         print(f"  ⚠️ Gemini detection failed: {e}")
     
-    # If Gemini explicitly said "no webcam", trust it and skip OpenCV
-    # (OpenCV has too many false positives with game graphics)
+    # If Gemini explicitly said "no webcam overlay", check if this is a FULL_CAM scenario
+    # (The entire frame might BE the webcam/camera - no overlay, just the person)
     if gemini_explicitly_no_webcam:
-        print("  📹 Skipping OpenCV (Gemini confirmed no webcam) → using simple crop")
+        print("  🔍 Gemini found no webcam overlay - checking for FULL_CAM scenario...")
+        
+        # Extract a frame to check for face in full frame
+        frame = extract_frame(video_path, 5.0)
+        if frame is None:
+            frame = extract_frame(video_path, 3.0)
+        
+        if frame is not None:
+            height, width = frame.shape[:2]
+            
+            # Detect face in full frame
+            face = detect_face_dnn(frame)
+            
+            if face:
+                # Calculate how much of the frame the face occupies
+                # A prominent face (FULL_CAM) typically means the face is reasonably large
+                face_area = face.width * face.height
+                frame_area = width * height
+                face_ratio = face_area / frame_area
+                
+                # Also check if face is reasonably centered (not in a small corner)
+                face_center_x = face.center_x
+                face_center_y = face.center_y
+                
+                # Face should be somewhat centered (within middle 70% of frame)
+                is_centered_x = 0.15 * width < face_center_x < 0.85 * width
+                is_centered_y = 0.10 * height < face_center_y < 0.90 * height
+                
+                print(f"  👤 Face detected in full frame:")
+                print(f"     Face size: {face.width}x{face.height} ({face_ratio:.1%} of frame)")
+                print(f"     Face center: ({face_center_x}, {face_center_y})")
+                print(f"     Centered: X={is_centered_x}, Y={is_centered_y}")
+                
+                # FULL_CAM criteria:
+                # - Face detected (DNN is reliable)
+                # - Face is at least 2% of frame (not tiny background face)
+                # - Face is reasonably centered (not a corner overlay)
+                if face_ratio >= 0.02 and is_centered_x and is_centered_y:
+                    print(f"  ✅ FULL_CAM detected: person in full frame (no overlay)")
+                    
+                    # Return a full-frame WebcamRegion to trigger FULL_CAM layout
+                    # Small inset to avoid edge artifacts
+                    inset = int(min(width, height) * 0.01)
+                    return WebcamRegion(
+                        x=inset,
+                        y=inset,
+                        width=width - 2 * inset,
+                        height=height - 2 * inset,
+                        position='full'  # Special marker for FULL_CAM
+                    )
+                else:
+                    print(f"  ❌ Face found but doesn't meet FULL_CAM criteria")
+            else:
+                print(f"  ❌ No face detected in full frame")
+        
+        print("  📹 Confirmed NO_WEBCAM → using simple center crop")
         return None
     
     # =========================================================================
