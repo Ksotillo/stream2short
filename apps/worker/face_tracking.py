@@ -531,6 +531,8 @@ def track_faces(
     sample_interval: float = 1.5,
     ema_alpha: float = 0.4,
     max_keyframes: int = 20,
+    initial_center: Optional[Tuple[int, int]] = None,  # (cx, cy) seed from layout detection
+    initial_size: Optional[Tuple[int, int]] = None,    # (w, h) expected face size
 ) -> Optional[FaceTrack]:
     """
     Track face positions throughout a video.
@@ -541,11 +543,15 @@ def track_faces(
         sample_interval: Time between samples in seconds
         ema_alpha: EMA smoothing factor (0-1, higher = more responsive)
         max_keyframes: Maximum keyframes to keep
+        initial_center: Optional (cx, cy) seed from layout detection to prevent wrong anchor
+        initial_size: Optional (w, h) expected face size for MIN SIZE validation
     
     Returns:
         FaceTrack with smoothed keyframes, or None if no faces detected
     """
     print(f"🔍 Starting face tracking for: {video_path}")
+    if initial_center:
+        print(f"   🎯 Using layout face_center as tracking seed: {initial_center}")
     
     # Get video info
     info = get_video_info(video_path)
@@ -575,17 +581,32 @@ def track_faces(
     print(f"   🎯 Sampling {len(timestamps)} frames...")
     
     # ==========================================================================
-    # TEMPORAL ASSOCIATION (Task B)
-    # Maintain prev_center to avoid jumping between different faces
+    # TEMPORAL ASSOCIATION with SEED from layout detection
     # ==========================================================================
-    prev_center: Optional[Tuple[int, int]] = None  # (cx, cy)
-    anchor_center: Optional[Tuple[int, int]] = None  # First detected face
+    # If initial_center provided, use it as the seed (prevents wrong anchor)
+    if initial_center:
+        prev_center: Optional[Tuple[int, int]] = initial_center
+        anchor_center: Optional[Tuple[int, int]] = initial_center
+        print(f"   🎯 Anchor PRE-SET from layout: {anchor_center}")
+    else:
+        prev_center = None
+        anchor_center = None
+    
+    # MIN SIZE thresholds for filtering tiny faces (posters/background)
+    frame_area = width * height
+    min_area_ratio = 0.01   # 1% of frame
+    min_width_ratio = 0.08  # 8% of frame width
     
     keyframes: List[FaceKeyframe] = []
     smoothed_cx = 0
     smoothed_cy = 0
     smoothed_w = 0
     smoothed_h = 0
+    
+    # Initialize smoothed values from initial_size if provided
+    if initial_size and initial_center:
+        smoothed_cx, smoothed_cy = initial_center
+        smoothed_w, smoothed_h = initial_size
     
     detections_found = 0
     detections_held = 0  # Times we held position due to jump rejection
@@ -619,10 +640,20 @@ def track_faces(
             cx = x + w // 2
             cy = y + h // 2
             
-            # Set anchor on first detection
+            # =========================================================
+            # MIN SIZE FILTER when setting anchor (prevents tiny face lock)
+            # =========================================================
+            area_ratio = (w * h) / frame_area
+            width_ratio = w / width
+            
             if anchor_center is None:
+                # First detection - apply MIN SIZE filter before using as anchor
+                if area_ratio < min_area_ratio or width_ratio < min_width_ratio:
+                    print(f"   ⚠️ Rejecting tiny face as anchor: {w}x{h} area={area_ratio:.4f} width={width_ratio:.3f}")
+                    continue  # Skip this detection, try next frame
+                
                 anchor_center = (cx, cy)
-                print(f"   🎯 Anchor set at ({cx},{cy})")
+                print(f"   🎯 Anchor set at ({cx},{cy}) size={w}x{h} area={area_ratio:.3%}")
             
             # Update prev_center
             prev_center = (cx, cy)
@@ -1295,12 +1326,14 @@ def track_faces_with_fallback(
     sample_interval: float = 1.5,
     ema_alpha: float = 0.4,
     max_keyframes: int = 20,
+    initial_center: Optional[Tuple[int, int]] = None,  # (cx, cy) from layout detection
+    initial_size: Optional[Tuple[int, int]] = None,    # (w, h) from layout detection
 ) -> Optional[FaceTrack]:
     """
     Track faces with automatic fallback to Gemini anchor if face detection picks background.
     
     Flow:
-    1. Try standard face tracking (DNN + Haar)
+    1. Try standard face tracking (DNN + Haar), seeded with initial_center if provided
     2. If NO faces found OR detected faces appear to be background → try Gemini anchor + tracker
     3. Return the best result, or None to trigger left-biased fallback
     
@@ -1310,19 +1343,25 @@ def track_faces_with_fallback(
         sample_interval: Time between samples
         ema_alpha: EMA smoothing factor
         max_keyframes: Maximum keyframes
+        initial_center: Optional (cx, cy) seed from layout detection
+        initial_size: Optional (w, h) from layout detection
     
     Returns:
         FaceTrack or None
     """
     print(f"🔍 track_faces_with_fallback() START")
+    if initial_center:
+        print(f"   🎯 Seeding with layout face_center: {initial_center}")
     
-    # First try standard face tracking
+    # First try standard face tracking (seeded with initial_center if provided)
     face_track = track_faces(
         video_path=video_path,
         temp_dir=temp_dir,
         sample_interval=sample_interval,
         ema_alpha=ema_alpha,
         max_keyframes=max_keyframes,
+        initial_center=initial_center,
+        initial_size=initial_size,
     )
     
     # Determine if we need to use Gemini anchor fallback

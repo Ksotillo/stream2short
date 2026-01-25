@@ -579,15 +579,27 @@ def render_full_cam_video(
     
     if enable_face_tracking:
         print("   🔍 Running face tracking (with Gemini fallback if needed)...")
+        
+        # Extract initial_center from face_center (from layout detection) to seed tracking
+        initial_center = None
+        initial_size = None
+        if face_center:
+            initial_center = (face_center.center_x, face_center.center_y)
+            initial_size = (face_center.width, face_center.height)
+            print(f"   🎯 Using layout face_center as tracking seed: {initial_center}")
+        
         try:
             # Use the new fallback-aware tracking function
             # This will try standard face tracking first, then Gemini anchor if
             # the detected faces appear to be background people
+            # IMPORTANT: Pass initial_center to prevent wrong anchor lock
             face_track = track_faces_with_fallback(
                 video_path=input_path,
                 temp_dir=temp_dir,
                 sample_interval=1.5,  # Sample every 1.5 seconds for better coverage
                 ema_alpha=0.4,  # Smooth but responsive
+                initial_center=initial_center,
+                initial_size=initial_size,
             )
             
             if face_track and len(face_track.keyframes) > 1:
