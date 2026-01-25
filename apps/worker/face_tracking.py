@@ -460,17 +460,29 @@ def detect_face_dnn(
     return (x, y, fw, fh, best['confidence'])
 
 
-def detect_face_haar(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
+def detect_face_haar(
+    frame_bgr: np.ndarray,
+    prev_center: Optional[Tuple[int, int]] = None,  # (cx, cy) for proximity selection
+) -> Optional[Tuple[int, int, int, int, float]]:
     """
     Fallback face detection using Haar Cascade.
     
     Less robust than DNN but works without model files.
     
+    Args:
+        frame_bgr: Input frame in BGR format
+        prev_center: Optional (cx, cy) to select candidate closest to this point
+    
     Returns:
         Tuple of (x, y, width, height, confidence) or None
     """
     h, w = frame_bgr.shape[:2]
+    frame_area = w * h
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # MIN SIZE thresholds (same as _detect_best_face_for_fullcam)
+    min_area_ratio = 0.01   # 1% of frame
+    min_width_ratio = 0.08  # 8% of frame width
     
     cascade_paths = [
         cv2.data.haarcascades + 'haarcascade_frontalface_default.xml',
@@ -496,33 +508,68 @@ def detect_face_haar(frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int
     if len(faces) == 0:
         return None
     
-    # Score each face for streamer detection
+    # Build candidates with MIN SIZE filter
     candidates = []
     for (fx, fy, fw, fh) in faces:
-        score = _score_face_for_fullcam(fx, fy, fw, fh, w, h)
-        y_ratio = (fy + fh // 2) / h
-        x_ratio = (fx + fw // 2) / w
+        area_ratio = (fw * fh) / frame_area
+        width_ratio = fw / w
+        cx = fx + fw // 2
+        cy = fy + fh // 2
+        
+        # Apply MIN SIZE filter
+        if area_ratio < min_area_ratio or width_ratio < min_width_ratio:
+            if DEBUG_FACE_TRACKING:
+                print(f"      [REJECT Haar] {fw}x{fh} area={area_ratio:.4f} width={width_ratio:.3f}")
+            continue
+        
+        # Calculate distance to prev_center if provided
+        dist = 0
+        if prev_center:
+            px, py = prev_center
+            dist = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+        
         candidates.append({
             'bbox': (fx, fy, fw, fh),
+            'center': (cx, cy),
             'confidence': 0.8,
-            'score': score,
-            'y_ratio': y_ratio,
-            'x_ratio': x_ratio,
+            'area_ratio': area_ratio,
+            'width_ratio': width_ratio,
+            'dist': dist,
         })
+    
+    if not candidates:
+        if DEBUG_FACE_TRACKING:
+            print(f"   ⚠️ Haar: All {len(faces)} faces rejected by MIN SIZE filter")
+        return None
     
     # Debug logging
     if DEBUG_FACE_TRACKING:
-        candidates_sorted = sorted(candidates, key=lambda c: c['score'], reverse=True)
-        print(f"   🔍 Haar candidates ({len(candidates_sorted)}):")
-        for i, c in enumerate(candidates_sorted[:3]):
-            x, y, fw, fh = c['bbox']
-            print(f"      #{i+1}: ({x},{y}) {fw}x{fh} score={c['score']:.3f} y={c['y_ratio']:.2f} x={c['x_ratio']:.2f}")
+        print(f"   🔍 Haar candidates after MIN SIZE filter ({len(candidates)}):")
+        for i, c in enumerate(candidates[:3]):
+            fx, fy, fw, fh = c['bbox']
+            cx, cy = c['center']
+            print(f"      #{i+1}: {fw}x{fh} center=({cx},{cy}) area={c['area_ratio']:.3%} dist={c['dist']:.0f}px")
     
-    # Pick face with highest streamer score
-    best = max(candidates, key=lambda c: c['score'])
-    x, y, fw, fh = best['bbox']
+    # =========================================================================
+    # SELECTION: If prev_center provided, choose CLOSEST candidate
+    #            Otherwise, choose LARGEST candidate
+    # =========================================================================
+    if prev_center:
+        # Sort by distance to prev_center (closest first)
+        candidates_sorted = sorted(candidates, key=lambda c: c['dist'])
+        best = candidates_sorted[0]
+        fx, fy, fw, fh = best['bbox']
+        cx, cy = best['center']
+        print(f"   ✅ Haar selected: {fw}x{fh} center=({cx},{cy}) dist={best['dist']:.0f}px prev_center={prev_center} area={best['area_ratio']:.3%} width={best['width_ratio']:.3f}")
+    else:
+        # No prev_center - choose largest by area
+        candidates_sorted = sorted(candidates, key=lambda c: c['area_ratio'], reverse=True)
+        best = candidates_sorted[0]
+        fx, fy, fw, fh = best['bbox']
+        cx, cy = best['center']
+        print(f"   ✅ Haar selected (largest): {fw}x{fh} center=({cx},{cy}) area={best['area_ratio']:.3%}")
     
-    return (x, y, fw, fh, 0.8)
+    return (fx, fy, fw, fh, 0.8)
 
 
 def track_faces(
@@ -633,7 +680,8 @@ def track_faces(
             prev_center=prev_center if prev_center else anchor_center,
         )
         if detection is None:
-            detection = detect_face_haar(frame)
+            # Pass prev_center to Haar so it picks closest face, not wrong one
+            detection = detect_face_haar(frame, prev_center=prev_center if prev_center else anchor_center)
         
         if detection:
             x, y, w, h, conf = detection
