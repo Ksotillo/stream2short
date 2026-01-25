@@ -807,7 +807,10 @@ def generate_ffmpeg_crop_expr(
     movement_threshold: int = 100,
 ) -> Tuple[str, str]:
     """
-    Generate FFmpeg crop x and y positions.
+    Generate FFmpeg crop x and y expressions for TRUE DYNAMIC PANNING.
+    
+    Creates FFmpeg expressions using linear interpolation between keyframes.
+    The crop position smoothly follows the face throughout the video.
     
     IMPORTANT: Coordinates are in SOURCE video dimensions, not scaled.
     FFmpeg pipeline: crop(source) -> scale(output)
@@ -817,22 +820,25 @@ def generate_ffmpeg_crop_expr(
         crop_width: Width of crop region (in source coords, e.g. 607 for 1920x1080 -> 9:16)
         crop_height: Height of crop region (in source coords, e.g. 1080)
         target_face_y_ratio: Where face should be positioned vertically (0-1)
-        movement_threshold: Unused (kept for API compatibility)
+        movement_threshold: Minimum x_range to enable panning (avoids jitter on static faces)
     
     Returns:
-        Tuple of (x_position, y_position) as strings for FFmpeg crop filter
+        Tuple of (x_expression, y_expression) as strings for FFmpeg crop filter
     """
-    print(f"   🎯 generate_ffmpeg_crop_expr():")
+    print(f"   🎯 generate_ffmpeg_crop_expr() - TRUE PANNING MODE:")
     print(f"      Video: {face_track.video_width}x{face_track.video_height}")
     print(f"      Crop: {crop_width}x{crop_height}")
     print(f"      Keyframes: {len(face_track.keyframes)}")
+    
+    max_x = face_track.video_width - crop_width
+    max_y = face_track.video_height - crop_height
     
     if len(face_track.keyframes) == 0:
         # Fallback to center crop
         cx = face_track.video_width // 2
         cy = face_track.video_height // 2
-        crop_x = max(0, cx - crop_width // 2)
-        crop_y = max(0, cy - crop_height // 2)
+        crop_x = max(0, min(cx - crop_width // 2, max_x))
+        crop_y = max(0, min(cy - crop_height // 2, max_y))
         print(f"      No keyframes, using center crop: ({crop_x},{crop_y})")
         return str(crop_x), str(crop_y)
     
@@ -844,87 +850,131 @@ def generate_ffmpeg_crop_expr(
         crop_y = kf.center_y - int(crop_height * target_face_y_ratio)
         
         # Clamp to valid bounds
-        crop_x = max(0, min(crop_x, face_track.video_width - crop_width))
-        crop_y = max(0, min(crop_y, face_track.video_height - crop_height))
+        crop_x = max(0, min(crop_x, max_x))
+        crop_y = max(0, min(crop_y, max_y))
         
-        crop_positions.append((kf.timestamp, crop_x, crop_y))
+        crop_positions.append((float(kf.timestamp), int(crop_x), int(crop_y)))
         
-        # Log first 3 keyframes for debugging (Task D)
-        if i < 3:
-            print(f"      KF[{i}] t={kf.timestamp:.1f}s: face=({kf.center_x},{kf.center_y}) -> crop=({crop_x},{crop_y})")
+        # Log first 5 keyframes for debugging
+        if i < 5:
+            print(f"      KF[{i}] t={kf.timestamp:.2f}s: face=({kf.center_x},{kf.center_y}) -> crop=({crop_x},{crop_y})")
+    
+    if len(crop_positions) > 5:
+        print(f"      ... and {len(crop_positions) - 5} more keyframes")
     
     if len(crop_positions) == 1:
         return str(crop_positions[0][1]), str(crop_positions[0][2])
     
-    # Calculate averages
+    # Calculate stats
     x_positions = [p[1] for p in crop_positions]
     y_positions = [p[2] for p in crop_positions]
     
     avg_x = sum(x_positions) // len(x_positions)
     avg_y = sum(y_positions) // len(y_positions)
-    
-    # =========================================================================
-    # BACKGROUND DETECTION (Task 4): Use FACE SIZE, not position
-    # Posters/background people have tiny faces
-    # =========================================================================
-    frame_area = face_track.video_width * face_track.video_height
-    
-    # Calculate area_ratio and width_ratio for each keyframe
-    area_ratios = []
-    width_ratios = []
-    for kf in face_track.keyframes:
-        area = kf.width * kf.height
-        area_ratios.append(area / frame_area)
-        width_ratios.append(kf.width / face_track.video_width)
-    
-    # Use median to be robust to outliers
-    area_ratios_sorted = sorted(area_ratios)
-    width_ratios_sorted = sorted(width_ratios)
-    median_idx = len(area_ratios_sorted) // 2
-    
-    median_area_ratio = area_ratios_sorted[median_idx]
-    median_width_ratio = width_ratios_sorted[median_idx]
-    
-    print(f"   📊 Face sizes: median_area={median_area_ratio:.4f}, median_width={median_width_ratio:.3f}")
-    
-    # Background/poster indicators based on SIZE:
-    # - median area_ratio < 0.008 (0.8% of frame) = tiny/poster face
-    # - median width_ratio < 0.06 (6% of frame width) = tiny face
-    is_likely_background = (median_area_ratio < 0.008) or (median_width_ratio < 0.06)
-    
-    if is_likely_background:
-        # Detected faces are too small - likely poster/background
-        # Use Gemini anchor or left-biased fallback
-        print(f"   ⚠️ Tiny faces detected (poster/background): area={median_area_ratio:.4f} width={median_width_ratio:.3f}")
-        print(f"   🎯 Using LEFT-BIASED crop (typical streamer position)")
-        
-        # TRUE LEFT BIAS: Position crop at 10% from left edge
-        default_x = int((face_track.video_width - crop_width) * 0.10)
-        default_y = max(0, (face_track.video_height - crop_height) // 2)
-        
-        # Clamp to valid bounds
-        default_x = max(0, min(default_x, face_track.video_width - crop_width))
-        default_y = max(0, min(default_y, face_track.video_height - crop_height))
-        
-        print(f"   📍 Left-biased position: ({default_x}, {default_y})")
-        return str(default_x), str(default_y)
-    
-    # Detected face appears to be the streamer - use tracked position
     x_range = max(x_positions) - min(x_positions)
     y_range = max(y_positions) - min(y_positions)
     
-    # ==========================================================================
-    # STABILITY DEBUG: avg crop_x and max delta between consecutive crop_x
-    # ==========================================================================
+    # =========================================================================
+    # BACKGROUND DETECTION: Use FACE SIZE
+    # =========================================================================
+    frame_area = face_track.video_width * face_track.video_height
+    area_ratios = [(kf.width * kf.height) / frame_area for kf in face_track.keyframes]
+    width_ratios = [kf.width / face_track.video_width for kf in face_track.keyframes]
+    
+    median_area = sorted(area_ratios)[len(area_ratios) // 2]
+    median_width = sorted(width_ratios)[len(width_ratios) // 2]
+    
+    print(f"   📊 Face sizes: median_area={median_area:.4f}, median_width={median_width:.3f}")
+    
+    if median_area < 0.008 or median_width < 0.06:
+        print(f"   ⚠️ Tiny faces detected (poster/background)")
+        print(f"   🎯 Using LEFT-BIASED static crop")
+        default_x = int(max_x * 0.10)
+        default_y = max(0, max_y // 2)
+        return str(default_x), str(default_y)
+    
+    # =========================================================================
+    # MOVEMENT CHECK: Only pan if there's meaningful movement
+    # =========================================================================
+    print(f"   📊 Movement: x_range={x_range}px, y_range={y_range}px")
+    
+    if x_range < movement_threshold:
+        # Not enough movement - use static average to avoid jitter
+        print(f"   📍 Low movement ({x_range}px < {movement_threshold}px threshold)")
+        print(f"   📍 Using STATIC average: ({avg_x}, {avg_y})")
+        return str(avg_x), str(avg_y)
+    
+    # =========================================================================
+    # TRUE DYNAMIC PANNING: Generate FFmpeg interpolation expression
+    # =========================================================================
+    print(f"   🎬 TRUE PANNING ENABLED: {x_range}px horizontal movement")
+    
+    # Build FFmpeg expression for x using linear interpolation between keyframes
+    # Format: if(lt(t,t1), lerp(x0,x1,t,t0,t1), if(lt(t,t2), lerp(x1,x2,t,t1,t2), ...))
+    # Where lerp(a,b,t,t0,t1) = a + (b-a)*(t-t0)/(t1-t0)
+    
+    def build_lerp_expr(positions: List[Tuple[float, int, int]], coord_idx: int, max_val: int) -> str:
+        """
+        Build FFmpeg expression for linear interpolation.
+        
+        Args:
+            positions: List of (timestamp, x, y)
+            coord_idx: 1 for x, 2 for y
+            max_val: Maximum valid value (for clamping)
+        """
+        if len(positions) <= 1:
+            return str(positions[0][coord_idx])
+        
+        # Start with the last segment's end value (for t >= last timestamp)
+        expr = str(positions[-1][coord_idx])
+        
+        # Build nested if statements from end to start
+        for i in range(len(positions) - 2, -1, -1):
+            t0, x0_full, y0_full = positions[i]
+            t1, x1_full, y1_full = positions[i + 1]
+            
+            v0 = x0_full if coord_idx == 1 else y0_full
+            v1 = x1_full if coord_idx == 1 else y1_full
+            
+            # Avoid division by zero
+            dt = t1 - t0
+            if dt < 0.001:
+                dt = 0.001
+            
+            # Linear interpolation: v0 + (v1-v0) * (t-t0) / (t1-t0)
+            # Simplified: v0 + dv * (t-t0) / dt
+            dv = v1 - v0
+            
+            if abs(dv) < 1:
+                # No movement in this segment - use static value
+                lerp = str(v0)
+            else:
+                # Interpolation expression
+                # Use clip() to ensure we stay in valid range
+                lerp = f"clip({v0}+{dv}*(t-{t0:.3f})/{dt:.3f},0,{max_val})"
+            
+            # Wrap in if statement
+            expr = f"if(lt(t,{t1:.3f}),{lerp},{expr})"
+        
+        return expr
+    
+    x_expr = build_lerp_expr(crop_positions, 1, max_x)
+    y_expr = build_lerp_expr(crop_positions, 2, max_y)
+    
+    # Log expression length
+    print(f"   📐 X expression length: {len(x_expr)} chars")
+    print(f"   📐 Y expression length: {len(y_expr)} chars")
+    
+    # Show first/last crop positions for verification
+    print(f"   📍 Panning: t=0s crop_x={crop_positions[0][1]} -> t={crop_positions[-1][0]:.1f}s crop_x={crop_positions[-1][1]}")
+    
+    # Stability stats
     if len(x_positions) >= 2:
         deltas = [abs(x_positions[i] - x_positions[i-1]) for i in range(1, len(x_positions))]
         max_delta = max(deltas)
-        print(f"   📊 STABILITY: avg_crop_x={avg_x}, max_delta={max_delta}px, x_range={x_range}px")
-    else:
-        print(f"   📊 STABILITY: avg_crop_x={avg_x}, single position")
+        print(f"   📊 STABILITY: max_delta={max_delta}px between consecutive frames")
     
-    print(f"   📍 Face tracking: range=({x_range}px, {y_range}px), avg position ({avg_x}, {avg_y})")
-    return str(avg_x), str(avg_y)
+    return x_expr, y_expr
 
 
 def get_static_face_center(face_track: FaceTrack) -> Optional[Tuple[int, int]]:

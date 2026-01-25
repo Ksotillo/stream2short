@@ -625,17 +625,30 @@ def render_full_cam_video(
             target_face_y_ratio=0.45,  # Face at 45% from top
         )
         
-        # Use expressions in crop filter with eval=frame for per-frame evaluation
-        crop_filter = f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr}:eval=frame"
-        print(f"   🎯 Dynamic crop enabled with {len(face_track.keyframes)} keyframes")
-        print(f"   📐 CROP FILTER: {crop_filter}")
+        # Build crop filter - may be static values or FFmpeg expressions
+        crop_filter = f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr}"
+        
+        # Check if expressions are dynamic (contain 't' for time-based interpolation)
+        is_dynamic = 'if(lt(t,' in x_expr or 'if(lt(t,' in y_expr
+        
+        if is_dynamic:
+            print(f"   🎬 TRUE DYNAMIC PANNING with {len(face_track.keyframes)} keyframes")
+            print(f"   📐 Crop filter uses time-based interpolation (smooth panning)")
+        else:
+            print(f"   📍 Static crop (low movement or single keyframe)")
+        
+        # Log crop filter (truncate if very long)
+        if len(crop_filter) > 200:
+            print(f"   📐 CROP FILTER: crop={crop_w}:{crop_h}:[{len(x_expr)}ch expr]:[{len(y_expr)}ch expr]")
+        else:
+            print(f"   📐 CROP FILTER: {crop_filter}")
         
     elif face_track and len(face_track.keyframes) == 1:
         # Single keyframe - static crop at detected position
         kf = face_track.keyframes[0]
         crop_x = max(0, min(kf.center_x - crop_w // 2, src_width - crop_w))
         crop_y = max(0, min(kf.center_y - int(crop_h * 0.45), src_height - crop_h))
-        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}:eval=frame"
+        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
         print(f"   📍 Static crop at tracked position: ({crop_x},{crop_y})")
         print(f"   📐 CROP FILTER: {crop_filter}")
         
@@ -650,14 +663,14 @@ def render_full_cam_video(
         crop_x = max(0, min(crop_x, src_width - crop_w))
         crop_y = max(0, min(crop_y, src_height - crop_h))
         
-        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}:eval=frame"
+        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
         print(f"   📐 Face-centered crop: {crop_w}x{crop_h} at ({crop_x},{crop_y})")
         print(f"   📐 CROP FILTER: {crop_filter}")
     else:
         # Center crop (no face detected)
         crop_x = (src_width - crop_w) // 2
         crop_y = (src_height - crop_h) // 2
-        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}:eval=frame"
+        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
         print(f"   📐 Center crop (no face): {crop_w}x{crop_h} at ({crop_x},{crop_y})")
         print(f"   📐 CROP FILTER: {crop_filter}")
     
