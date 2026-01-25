@@ -625,22 +625,24 @@ def render_full_cam_video(
             target_face_y_ratio=0.45,  # Face at 45% from top
         )
         
-        # Build crop filter - may be static values or FFmpeg expressions
-        crop_filter = f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr}"
-        
         # Check if expressions are dynamic (contain 't' for time-based interpolation)
         is_dynamic = 'if(lt(t,' in x_expr or 'if(lt(t,' in y_expr
         
         if is_dynamic:
             print(f"   🎬 TRUE DYNAMIC PANNING with {len(face_track.keyframes)} keyframes")
             print(f"   📐 Crop filter uses time-based interpolation (smooth panning)")
-        else:
-            print(f"   📍 Static crop (low movement or single keyframe)")
-        
-        # Log crop filter (truncate if very long)
-        if len(crop_filter) > 200:
+            
+            # CRITICAL: Escape commas in expressions for FFmpeg filter graph parsing
+            # FFmpeg uses commas to separate filters, so commas inside expressions must be escaped with backslash
+            # When using subprocess.run with a list, no shell escaping needed - just FFmpeg escaping
+            x_expr_escaped = x_expr.replace(',', r'\,')
+            y_expr_escaped = y_expr.replace(',', r'\,')
+            
+            crop_filter = f"crop={crop_w}:{crop_h}:{x_expr_escaped}:{y_expr_escaped}"
             print(f"   📐 CROP FILTER: crop={crop_w}:{crop_h}:[{len(x_expr)}ch expr]:[{len(y_expr)}ch expr]")
         else:
+            print(f"   📍 Static crop (low movement or single keyframe)")
+            crop_filter = f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr}"
             print(f"   📐 CROP FILTER: {crop_filter}")
         
     elif face_track and len(face_track.keyframes) == 1:

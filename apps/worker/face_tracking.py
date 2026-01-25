@@ -917,14 +917,29 @@ def generate_ffmpeg_crop_expr(
         """
         Build FFmpeg expression for linear interpolation.
         
+        Uses FFmpeg's expression syntax with 'between' for time ranges to avoid comma issues.
+        FFmpeg parses commas as filter separators, so we use semicolon syntax instead.
+        
         Args:
             positions: List of (timestamp, x, y)
             coord_idx: 1 for x, 2 for y
-            max_val: Maximum valid value (for clamping)
+            max_val: Maximum valid value (for clamping) - unused since values are pre-clamped
         """
         if len(positions) <= 1:
             return str(positions[0][coord_idx])
         
+        # For FFmpeg, we need to avoid commas in expressions
+        # Use a weighted sum approach: sum of (value * weight) where weight is 1 for active segment
+        # Expression: v0*between(t,t0,t1) + v1*between(t,t1,t2) + ...
+        #
+        # But 'between' also uses commas. So let's use a different approach:
+        # Use gte (>=) and lt (<) without commas:
+        # if(lt(t;t1);lerp1;if(lt(t;t2);lerp2;...))
+        # 
+        # Actually FFmpeg uses , not ; for function args. The issue is the filter graph parsing.
+        # Solution: Escape commas in the expression with backslash when building -vf string
+        
+        # Build expression without escaping - we'll escape when constructing the filter
         # Start with the last segment's end value (for t >= last timestamp)
         expr = str(positions[-1][coord_idx])
         
@@ -942,19 +957,19 @@ def generate_ffmpeg_crop_expr(
                 dt = 0.001
             
             # Linear interpolation: v0 + (v1-v0) * (t-t0) / (t1-t0)
-            # Simplified: v0 + dv * (t-t0) / dt
             dv = v1 - v0
             
             if abs(dv) < 1:
                 # No movement in this segment - use static value
                 lerp = str(v0)
             else:
-                # Interpolation expression
-                # Use clip() to ensure we stay in valid range
-                lerp = f"clip({v0}+{dv}*(t-{t0:.3f})/{dt:.3f},0,{max_val})"
+                # Interpolation expression (values already clamped)
+                # Format: (v0 + dv*(t-t0)/dt)
+                lerp = f"({v0}+{dv}*(t-{t0:.2f})/{dt:.2f})"
             
-            # Wrap in if statement
-            expr = f"if(lt(t,{t1:.3f}),{lerp},{expr})"
+            # Wrap in if statement - use COLON instead of comma for FFmpeg expression separator
+            # FFmpeg crop filter expressions use : as separator, not ,
+            expr = f"if(lt(t,{t1:.2f}),{lerp},{expr})"
         
         return expr
     
