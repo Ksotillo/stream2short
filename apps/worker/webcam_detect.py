@@ -2718,10 +2718,20 @@ def detect_layout_with_cache(
     # Detect face for face-centered cropping (especially for FULL_CAM)
     face_center = None
     if layout == 'FULL_CAM':
-        # For FULL_CAM, detect face in full frame for face-centered crop
-        face_center = detect_face_in_frame(frame)
-        if face_center:
-            print(f"  👤 Face detected for FULL_CAM crop: center at ({face_center.center_x}, {face_center.center_y})")
+        # For FULL_CAM, use _detect_best_face_for_fullcam which has proper scoring
+        # DO NOT use detect_face_in_frame as it uses different (worse) detection
+        print(f"  🔍 FULL_CAM: Using _detect_best_face_for_fullcam for consistent face selection")
+        best_face = _detect_best_face_for_fullcam(frame)
+        if best_face:
+            face_center = FaceCenter(
+                x=best_face.x,
+                y=best_face.y,
+                width=best_face.width,
+                height=best_face.height
+            )
+            print(f"  👤 FULL_CAM face_center SET: ({face_center.center_x}, {face_center.center_y}) - SAME face as detection")
+        else:
+            print(f"  ⚠️ FULL_CAM: No face found, face tracking will use Gemini anchor")
         
         # For FULL_CAM, set webcam_region to full frame (or slightly inset)
         # This ensures the render uses the full frame, not just the detected bbox

@@ -291,8 +291,10 @@ def _score_face_for_fullcam(x: int, y: int, w: int, h: int, frame_w: int, frame_
 
 def detect_face_dnn(
     frame_bgr: np.ndarray,
-    confidence_threshold: float = 0.35,  # Lower threshold for better detection
+    confidence_threshold: float = 0.50,  # Raised from 0.35 to reduce false positives
     try_preprocessing: bool = True,
+    prev_center: Optional[Tuple[int, int]] = None,  # For temporal association
+    max_jump_ratio: float = 0.18,  # Max allowed jump as fraction of frame width
 ) -> Optional[Tuple[int, int, int, int, float]]:
     """
     Detect face using OpenCV DNN (ResNet SSD Caffe model).
@@ -304,13 +306,15 @@ def detect_face_dnn(
     
     Args:
         frame_bgr: Input frame in BGR format
-        confidence_threshold: Minimum confidence (default 0.35 for better recall)
+        confidence_threshold: Minimum confidence (default 0.50)
         try_preprocessing: Whether to try enhanced preprocessing if first pass fails
+        prev_center: Previous face center (cx, cy) for temporal association
+        max_jump_ratio: Max allowed jump as fraction of frame width
     
     Returns:
         Tuple of (x, y, width, height, confidence) or None
     """
-    print(f"   🔍 detect_face_dnn() ENTER - threshold={confidence_threshold}")
+    print(f"   🔍 detect_face_dnn() ENTER - conf_thresh={confidence_threshold}, prev_center={prev_center}")
     
     net = _get_dnn_net()
     if net is None:
@@ -320,9 +324,11 @@ def detect_face_dnn(
     print(f"   ✅ detect_face_dnn(): DNN net loaded, running detection...")
     
     h, w = frame_bgr.shape[:2]
+    frame_area = w * h
+    max_jump_px = int(w * max_jump_ratio)
     
     def _run_detection(input_frame):
-        """Run DNN detection on a frame."""
+        """Run DNN detection on a frame with sanity filters."""
         blob = cv2.dnn.blobFromImage(
             cv2.resize(input_frame, (300, 300)),
             1.0,
@@ -338,7 +344,7 @@ def detect_face_dnn(
         for i in range(detections.shape[2]):
             confidence = detections[0, 0, i, 2]
             
-            if confidence > confidence_threshold:
+            if confidence >= confidence_threshold:  # >= for clarity
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 x1, y1, x2, y2 = box.astype("int")
                 
@@ -350,16 +356,37 @@ def detect_face_dnn(
                 
                 if x2 > x1 and y2 > y1:
                     fw, fh = x2 - x1, y2 - y1
+                    face_area = fw * fh
+                    area_ratio = face_area / frame_area
+                    aspect_ratio = fw / fh if fh > 0 else 0
+                    
+                    # ==========================================================
+                    # SANITY FILTERS (Task C)
+                    # ==========================================================
+                    # Reject tiny or huge detections
+                    if area_ratio < 0.002 or area_ratio > 0.08:
+                        print(f"      [REJECT] area_ratio={area_ratio:.4f} out of [0.002, 0.08]")
+                        continue
+                    
+                    # Reject non-face aspect ratios
+                    if aspect_ratio < 0.6 or aspect_ratio > 1.6:
+                        print(f"      [REJECT] aspect_ratio={aspect_ratio:.2f} out of [0.6, 1.6]")
+                        continue
+                    
                     # Score for streamer detection
                     score = _score_face_for_fullcam(x1, y1, fw, fh, w, h)
                     y_ratio = (y1 + fh // 2) / h
                     x_ratio = (x1 + fw // 2) / w
+                    cx = x1 + fw // 2
+                    cy = y1 + fh // 2
+                    
                     candidates.append({
                         'bbox': (x1, y1, fw, fh),
                         'confidence': float(confidence),
                         'score': score,
                         'y_ratio': y_ratio,
                         'x_ratio': x_ratio,
+                        'center': (cx, cy),
                     })
         
         return candidates
@@ -368,7 +395,7 @@ def detect_face_dnn(
     candidates = _run_detection(frame_bgr)
     
     # Second pass: try preprocessing if no good candidates found
-    if try_preprocessing and (len(candidates) == 0 or max(c['score'] for c in candidates) < 0.50):
+    if try_preprocessing and (len(candidates) == 0 or max((c['score'] for c in candidates), default=0) < 0.50):
         enhanced = _preprocess_frame_for_detection(frame_bgr)
         enhanced_candidates = _run_detection(enhanced)
         
@@ -386,19 +413,45 @@ def detect_face_dnn(
                 candidates.append(ec)
     
     if not candidates:
-        print(f"   ❌ detect_face_dnn(): No candidates found above threshold {confidence_threshold}")
+        print(f"   ❌ detect_face_dnn(): No valid candidates after filtering")
         return None
     
     # ALWAYS log candidates for diagnostics
     candidates_sorted = sorted(candidates, key=lambda c: c['score'], reverse=True)
-    print(f"   📊 detect_face_dnn(): Found {len(candidates_sorted)} candidates:")
+    print(f"   📊 detect_face_dnn(): Found {len(candidates_sorted)} valid candidates:")
     for i, c in enumerate(candidates_sorted[:3]):
         x, y, fw, fh = c['bbox']
         print(f"      #{i+1}: ({x},{y}) {fw}x{fh} conf={c['confidence']:.2f} score={c['score']:.3f} y={c['y_ratio']:.2f} x={c['x_ratio']:.2f}")
     if len(candidates_sorted) > 3:
         print(f"      ... and {len(candidates_sorted) - 3} more")
     
-    # Pick face with highest streamer score
+    # ==========================================================================
+    # TEMPORAL ASSOCIATION (Task B)
+    # If we have a previous center, prefer the candidate closest to it
+    # ==========================================================================
+    if prev_center is not None:
+        prev_cx, prev_cy = prev_center
+        
+        # Find candidate closest to prev_center
+        def distance_to_prev(c):
+            cx, cy = c['center']
+            return ((cx - prev_cx) ** 2 + (cy - prev_cy) ** 2) ** 0.5
+        
+        candidates_by_dist = sorted(candidates, key=distance_to_prev)
+        closest = candidates_by_dist[0]
+        dist = distance_to_prev(closest)
+        
+        if dist <= max_jump_px:
+            # Accept closest candidate
+            x, y, fw, fh = closest['bbox']
+            print(f"   ✅ detect_face_dnn(): Temporal match at ({x},{y}) dist={dist:.0f}px")
+            return (x, y, fw, fh, closest['confidence'])
+        else:
+            # Jump too large - reject all candidates
+            print(f"   ⚠️ detect_face_dnn(): Jump {dist:.0f}px > max {max_jump_px}px - holding position")
+            return None
+    
+    # No previous center - pick face with highest streamer score
     best = max(candidates, key=lambda c: c['score'])
     x, y, fw, fh = best['bbox']
     
@@ -521,84 +574,111 @@ def track_faces(
     
     print(f"   🎯 Sampling {len(timestamps)} frames...")
     
-    # Detect faces at each timestamp
-    raw_detections: List[Tuple[float, Tuple[int, int, int, int, float]]] = []
+    # ==========================================================================
+    # TEMPORAL ASSOCIATION (Task B)
+    # Maintain prev_center to avoid jumping between different faces
+    # ==========================================================================
+    prev_center: Optional[Tuple[int, int]] = None  # (cx, cy)
+    anchor_center: Optional[Tuple[int, int]] = None  # First detected face
     
-    for ts in timestamps:
+    keyframes: List[FaceKeyframe] = []
+    smoothed_cx = 0
+    smoothed_cy = 0
+    smoothed_w = 0
+    smoothed_h = 0
+    
+    detections_found = 0
+    detections_held = 0  # Times we held position due to jump rejection
+    
+    for i, ts in enumerate(timestamps):
         frame = extract_frame_at_time(video_path, ts, temp_dir)
         if frame is None:
+            # Hold last position if no frame
+            if prev_center and smoothed_w > 0:
+                keyframes.append(FaceKeyframe(
+                    timestamp=ts,
+                    center_x=smoothed_cx,
+                    center_y=smoothed_cy,
+                    width=smoothed_w,
+                    height=smoothed_h,
+                    confidence=0.5,
+                ))
+                detections_held += 1
             continue
         
-        # Try DNN first (more robust), then Haar fallback
-        detection = detect_face_dnn(frame)
+        # Try DNN first with temporal association, then Haar fallback
+        detection = detect_face_dnn(
+            frame,
+            prev_center=prev_center if prev_center else anchor_center,
+        )
         if detection is None:
             detection = detect_face_haar(frame)
         
         if detection:
-            raw_detections.append((ts, detection))
+            x, y, w, h, conf = detection
+            cx = x + w // 2
+            cy = y + h // 2
+            
+            # Set anchor on first detection
+            if anchor_center is None:
+                anchor_center = (cx, cy)
+                print(f"   🎯 Anchor set at ({cx},{cy})")
+            
+            # Update prev_center
+            prev_center = (cx, cy)
+            detections_found += 1
+            
+            # Apply EMA smoothing AFTER association (Task B)
+            if smoothed_w == 0:
+                # First keyframe - initialize
+                smoothed_cx = cx
+                smoothed_cy = cy
+                smoothed_w = w
+                smoothed_h = h
+            else:
+                # EMA with alpha=0.6 for responsiveness
+                smoothed_cx = int(0.6 * cx + 0.4 * smoothed_cx)
+                smoothed_cy = int(0.6 * cy + 0.4 * smoothed_cy)
+                smoothed_w = int(0.6 * w + 0.4 * smoothed_w)
+                smoothed_h = int(0.6 * h + 0.4 * smoothed_h)
+            
+            keyframes.append(FaceKeyframe(
+                timestamp=ts,
+                center_x=smoothed_cx,
+                center_y=smoothed_cy,
+                width=smoothed_w,
+                height=smoothed_h,
+                confidence=conf,
+            ))
+        else:
+            # No detection or jump rejected - HOLD last position
+            if prev_center and smoothed_w > 0:
+                keyframes.append(FaceKeyframe(
+                    timestamp=ts,
+                    center_x=smoothed_cx,
+                    center_y=smoothed_cy,
+                    width=smoothed_w,
+                    height=smoothed_h,
+                    confidence=0.5,
+                ))
+                detections_held += 1
     
-    if len(raw_detections) == 0:
+    if len(keyframes) == 0:
         print("   ⚠️ No faces detected in any frame")
         return None
     
-    print(f"   ✅ Detected faces in {len(raw_detections)}/{len(timestamps)} frames")
+    print(f"   ✅ Tracking: {detections_found} detections, {detections_held} held positions")
     
     # Debug: show face positions
-    print(f"   📊 Face positions detected:")
-    for ts, det in raw_detections[:5]:
-        x, y, w, h, conf = det
-        cx, cy = x + w // 2, y + h // 2
-        y_ratio = cy / height
-        x_ratio = cx / width
-        print(f"      t={ts:.1f}s: center=({cx},{cy}) y={y_ratio:.2f} x={x_ratio:.2f} size={w}x{h}")
-    if len(raw_detections) > 5:
-        print(f"      ... and {len(raw_detections) - 5} more")
+    print(f"   📊 Final keyframe positions:")
+    for kf in keyframes[:5]:
+        y_ratio = kf.center_y / height
+        x_ratio = kf.center_x / width
+        print(f"      t={kf.timestamp:.1f}s: center=({kf.center_x},{kf.center_y}) y={y_ratio:.2f} x={x_ratio:.2f}")
+    if len(keyframes) > 5:
+        print(f"      ... and {len(keyframes) - 5} more")
     
-    # Apply EMA smoothing
-    keyframes: List[FaceKeyframe] = []
-    
-    # Initialize with first detection
-    first_ts, first_det = raw_detections[0]
-    x, y, w, h, conf = first_det
-    smoothed_cx = x + w // 2
-    smoothed_cy = y + h // 2
-    smoothed_w = w
-    smoothed_h = h
-    
-    keyframes.append(FaceKeyframe(
-        timestamp=first_ts,
-        center_x=smoothed_cx,
-        center_y=smoothed_cy,
-        width=smoothed_w,
-        height=smoothed_h,
-        confidence=conf,
-    ))
-    
-    # Apply EMA to subsequent detections
-    for ts, det in raw_detections[1:]:
-        x, y, w, h, conf = det
-        cx = x + w // 2
-        cy = y + h // 2
-        
-        # EMA smoothing
-        smoothed_cx = int(ema_alpha * cx + (1 - ema_alpha) * smoothed_cx)
-        smoothed_cy = int(ema_alpha * cy + (1 - ema_alpha) * smoothed_cy)
-        smoothed_w = int(ema_alpha * w + (1 - ema_alpha) * smoothed_w)
-        smoothed_h = int(ema_alpha * h + (1 - ema_alpha) * smoothed_h)
-        
-        keyframes.append(FaceKeyframe(
-            timestamp=ts,
-            center_x=smoothed_cx,
-            center_y=smoothed_cy,
-            width=smoothed_w,
-            height=smoothed_h,
-            confidence=conf,
-        ))
-    
-    # Interpolate gaps
-    keyframes = _interpolate_gaps(keyframes, timestamps, smoothed_cx, smoothed_cy, smoothed_w, smoothed_h)
-    
-    print(f"   🎬 Generated {len(keyframes)} smoothed keyframes")
+    print(f"   🎬 Generated {len(keyframes)} keyframes with temporal smoothing")
     
     return FaceTrack(
         keyframes=keyframes,
@@ -650,30 +730,37 @@ def generate_ffmpeg_crop_expr(
     """
     Generate FFmpeg crop x and y positions.
     
-    Returns static positions based on average face position.
-    Includes heuristics to detect and reject background people.
+    IMPORTANT: Coordinates are in SOURCE video dimensions, not scaled.
+    FFmpeg pipeline: crop(source) -> scale(output)
     
     Args:
         face_track: Face tracking result
-        crop_width: Width of crop region
-        crop_height: Height of crop region
+        crop_width: Width of crop region (in source coords, e.g. 607 for 1920x1080 -> 9:16)
+        crop_height: Height of crop region (in source coords, e.g. 1080)
         target_face_y_ratio: Where face should be positioned vertically (0-1)
         movement_threshold: Unused (kept for API compatibility)
     
     Returns:
-        Tuple of (x_position, y_position) as strings for FFmpeg
+        Tuple of (x_position, y_position) as strings for FFmpeg crop filter
     """
+    print(f"   🎯 generate_ffmpeg_crop_expr():")
+    print(f"      Video: {face_track.video_width}x{face_track.video_height}")
+    print(f"      Crop: {crop_width}x{crop_height}")
+    print(f"      Keyframes: {len(face_track.keyframes)}")
+    
     if len(face_track.keyframes) == 0:
         # Fallback to center crop
         cx = face_track.video_width // 2
         cy = face_track.video_height // 2
         crop_x = max(0, cx - crop_width // 2)
         crop_y = max(0, cy - crop_height // 2)
+        print(f"      No keyframes, using center crop: ({crop_x},{crop_y})")
         return str(crop_x), str(crop_y)
     
     # Calculate crop positions for each keyframe
     crop_positions = []
-    for kf in face_track.keyframes:
+    for i, kf in enumerate(face_track.keyframes):
+        # Center crop on face
         crop_x = kf.center_x - crop_width // 2
         crop_y = kf.center_y - int(crop_height * target_face_y_ratio)
         
@@ -682,6 +769,10 @@ def generate_ffmpeg_crop_expr(
         crop_y = max(0, min(crop_y, face_track.video_height - crop_height))
         
         crop_positions.append((kf.timestamp, crop_x, crop_y))
+        
+        # Log first 3 keyframes for debugging (Task D)
+        if i < 3:
+            print(f"      KF[{i}] t={kf.timestamp:.1f}s: face=({kf.center_x},{kf.center_y}) -> crop=({crop_x},{crop_y})")
     
     if len(crop_positions) == 1:
         return str(crop_positions[0][1]), str(crop_positions[0][2])
@@ -729,6 +820,16 @@ def generate_ffmpeg_crop_expr(
     # Detected face appears to be the streamer - use tracked position
     x_range = max(x_positions) - min(x_positions)
     y_range = max(y_positions) - min(y_positions)
+    
+    # ==========================================================================
+    # STABILITY DEBUG: avg crop_x and max delta between consecutive crop_x
+    # ==========================================================================
+    if len(x_positions) >= 2:
+        deltas = [abs(x_positions[i] - x_positions[i-1]) for i in range(1, len(x_positions))]
+        max_delta = max(deltas)
+        print(f"   📊 STABILITY: avg_crop_x={avg_x}, max_delta={max_delta}px, x_range={x_range}px")
+    else:
+        print(f"   📊 STABILITY: avg_crop_x={avg_x}, single position")
     
     print(f"   📍 Face tracking: range=({x_range}px, {y_range}px), avg position ({avg_x}, {avg_y})")
     return str(avg_x), str(avg_y)
