@@ -490,6 +490,37 @@ def generate_ffmpeg_crop_expr(
     avg_x = sum(x_positions) // len(x_positions)
     avg_y = sum(y_positions) // len(y_positions)
     
+    # CRITICAL: Check if detected faces are ALL in the upper portion of frame
+    # This indicates we're detecting background people, NOT the main streamer
+    # Streamers sit at desk level (lower 40-70% of frame)
+    avg_face_y_ratio = sum(kf.center_y for kf in face_track.keyframes) / len(face_track.keyframes) / face_track.video_height
+    
+    # Also check if all faces are on one side (background person standing)
+    avg_face_x = sum(kf.center_x for kf in face_track.keyframes) / len(face_track.keyframes)
+    avg_face_x_ratio = avg_face_x / face_track.video_width
+    
+    # Background detection: faces in upper area OR consistently on far right (background person)
+    faces_in_upper = avg_face_y_ratio < 0.45
+    faces_on_far_right = avg_face_x_ratio > 0.55  # Background person at right side
+    
+    if faces_in_upper or faces_on_far_right:
+        # Detected faces are likely background people, NOT the main streamer!
+        # For FULL_CAM "just chatting" streams, default to CENTER-LEFT crop
+        # (streamer typically sits slightly left of center at their desk)
+        print(f"   ⚠️ Detected faces likely background: y_ratio={avg_face_y_ratio:.2f}, x_ratio={avg_face_x_ratio:.2f}")
+        print(f"   🎯 Defaulting to center-left crop (typical streamer position)")
+        
+        # Center horizontally (or slightly left for desk setup)
+        default_x = max(0, (face_track.video_width - crop_width) // 2 - int(crop_width * 0.15))
+        default_y = max(0, (face_track.video_height - crop_height) // 2)
+        
+        # Clamp to valid bounds
+        default_x = min(default_x, face_track.video_width - crop_width)
+        default_y = min(default_y, face_track.video_height - crop_height)
+        
+        print(f"   📍 Using default position ({default_x}, {default_y})")
+        return str(default_x), str(default_y)
+    
     # For now, always use static crop based on average face position
     # Dynamic FFmpeg expressions with nested if() are complex and error-prone
     # The average position provides smooth, centered framing
