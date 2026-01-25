@@ -14,6 +14,11 @@ from webcam_detect import (
     FaceCenter,
     get_video_dimensions,
 )
+from face_tracking import (
+    track_faces,
+    generate_ffmpeg_crop_expr,
+    FaceTrack,
+)
 
 
 class VideoProcessingError(Exception):
@@ -507,21 +512,25 @@ def render_full_cam_video(
     subtitle_path: str | None = None,
     width: int = 1080,
     height: int = 1920,
+    temp_dir: str = "/tmp",
+    enable_face_tracking: bool = True,
 ) -> str:
     """
     Render a FULL_CAM layout video - entire clip is webcam/streamer face.
     
-    Uses face-centered cropping if face is detected, otherwise center-crops.
-    The face is positioned at ~45% from top (slightly above center) for
-    a natural, portrait-friendly composition.
+    Uses DYNAMIC face tracking to follow the speaker throughout the video.
+    The crop smoothly follows the face position, creating a professional
+    portrait-style video that keeps the subject centered.
     
     Args:
         input_path: Path to input video
         output_path: Path to output video
-        face_center: Optional FaceCenter for face-centered crop
+        face_center: Optional FaceCenter for static fallback crop
         subtitle_path: Optional path to subtitle file
         width: Output width (default 1080)
         height: Output height (default 1920)
+        temp_dir: Temporary directory for face tracking
+        enable_face_tracking: Whether to use dynamic tracking (default True)
         
     Returns:
         Path to output video
@@ -529,7 +538,7 @@ def render_full_cam_video(
     Raises:
         VideoProcessingError: If FFmpeg fails
     """
-    print(f"🎬 Rendering FULL_CAM video: {input_path} -> {output_path}")
+    print(f"🎬 Rendering FULL_CAM video with face tracking: {input_path} -> {output_path}")
     
     # Get source dimensions
     src_width, src_height = get_video_dimensions(input_path)
@@ -545,8 +554,7 @@ def render_full_cam_video(
     # ==========================================================================
     # Calculate crop region for 9:16 output
     # ==========================================================================
-    # Target aspect ratio: 9:16 = 0.5625
-    target_ar = width / height  # 0.5625
+    target_ar = width / height  # 9:16 = 0.5625
     src_ar = src_width / src_height
     
     if src_ar > target_ar:
@@ -563,38 +571,83 @@ def render_full_cam_video(
     crop_h = crop_h - (crop_h % 2)
     
     # ==========================================================================
-    # Face-centered positioning
+    # DYNAMIC FACE TRACKING
     # ==========================================================================
-    if face_center:
-        print(f"   👤 Face-centered crop: face at ({face_center.center_x}, {face_center.center_y})")
+    face_track: Optional[FaceTrack] = None
+    use_dynamic_tracking = False
+    
+    if enable_face_tracking:
+        print("   🔍 Running face tracking...")
+        try:
+            face_track = track_faces(
+                video_path=input_path,
+                temp_dir=temp_dir,
+                sample_interval=0.5,  # Sample every 0.5 seconds
+                ema_alpha=0.3,  # Smooth but responsive
+            )
+            
+            if face_track and len(face_track.keyframes) > 1:
+                use_dynamic_tracking = True
+                print(f"   ✅ Face tracking: {len(face_track.keyframes)} keyframes")
+            elif face_track and len(face_track.keyframes) == 1:
+                print("   📍 Single face position detected, using static crop")
+            else:
+                print("   ⚠️ No faces tracked, falling back to static crop")
+                
+        except Exception as e:
+            print(f"   ⚠️ Face tracking failed: {e}, using static crop")
+    
+    # ==========================================================================
+    # Build crop filter (dynamic or static)
+    # ==========================================================================
+    if use_dynamic_tracking and face_track:
+        # Generate dynamic FFmpeg expressions
+        x_expr, y_expr = generate_ffmpeg_crop_expr(
+            face_track=face_track,
+            crop_width=crop_w,
+            crop_height=crop_h,
+            target_face_y_ratio=0.45,  # Face at 45% from top
+        )
         
-        # Position face at 45% from top (slightly above center for portrait)
+        # Use expressions in crop filter
+        crop_filter = f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr}"
+        print(f"   🎯 Dynamic crop enabled with {len(face_track.keyframes)} keyframes")
+        
+    elif face_track and len(face_track.keyframes) == 1:
+        # Single keyframe - static crop at detected position
+        kf = face_track.keyframes[0]
+        crop_x = max(0, min(kf.center_x - crop_w // 2, src_width - crop_w))
+        crop_y = max(0, min(kf.center_y - int(crop_h * 0.45), src_height - crop_h))
+        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
+        print(f"   📍 Static crop at tracked position: ({crop_x},{crop_y})")
+        
+    elif face_center:
+        # Fallback to provided face_center
+        print(f"   👤 Using provided face center: ({face_center.center_x}, {face_center.center_y})")
+        
         target_face_y = int(crop_h * 0.45)
-        
-        # Calculate crop position to place face at target position
         crop_y = face_center.center_y - target_face_y
-        
-        # Center horizontally on face
         crop_x = face_center.center_x - crop_w // 2
         
-        # Clamp to valid bounds
         crop_x = max(0, min(crop_x, src_width - crop_w))
         crop_y = max(0, min(crop_y, src_height - crop_h))
         
+        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
         print(f"   📐 Face-centered crop: {crop_w}x{crop_h} at ({crop_x},{crop_y})")
     else:
         # Center crop (no face detected)
         crop_x = (src_width - crop_w) // 2
         crop_y = (src_height - crop_h) // 2
-        print(f"   📐 Center crop: {crop_w}x{crop_h} at ({crop_x},{crop_y})")
+        crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
+        print(f"   📐 Center crop (no face): {crop_w}x{crop_h} at ({crop_x},{crop_y})")
     
     # ==========================================================================
     # Build FFmpeg filter chain
     # ==========================================================================
     filters = []
     
-    # Crop to 9:16 region
-    filters.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+    # Crop (dynamic or static)
+    filters.append(crop_filter)
     
     # Scale to output size
     filters.append(f"scale={width}:{height}:flags=lanczos")
@@ -656,7 +709,8 @@ def render_full_cam_video(
             text=True,
             check=True,
         )
-        print("✅ FULL_CAM video rendering complete")
+        tracking_mode = "dynamic" if use_dynamic_tracking else "static"
+        print(f"✅ FULL_CAM video rendering complete ({tracking_mode} tracking)")
         return output_path
         
     except subprocess.CalledProcessError as e:
@@ -669,6 +723,8 @@ def render_full_cam_video(
                 subtitle_path=None,
                 width=width,
                 height=height,
+                temp_dir=temp_dir,
+                enable_face_tracking=enable_face_tracking,
             )
         
         error_msg = f"FFmpeg failed: {e.stderr}"
@@ -742,8 +798,8 @@ def render_video_auto(
     layout = layout_info.layout
     
     if layout == 'FULL_CAM':
-        # Entire clip is webcam - use face-centered full-frame crop
-        print(f"🎥 Using FULL_CAM layout: {layout_info.reason}")
+        # Entire clip is webcam - use dynamic face tracking
+        print(f"🎥 Using FULL_CAM layout with face tracking: {layout_info.reason}")
         return render_full_cam_video(
             input_path=input_path,
             output_path=output_path,
@@ -751,6 +807,8 @@ def render_video_auto(
             subtitle_path=subtitle_path,
             width=width,
             height=height,
+            temp_dir=temp_dir,
+            enable_face_tracking=True,  # Always enable face tracking for FULL_CAM
         )
     
     elif layout == 'SPLIT' and layout_info.webcam_region:

@@ -223,9 +223,9 @@ Replaced fixed "3-word chunks" with intelligent rules in `smart_chunker.py`:
 |----------|-------------|--------|
 | `center_crop` | Simple center crop | ✅ Done |
 | `split_webcam` | Webcam top, game bottom | ✅ Done |
-| `full_cam` | Full-camera vertical crop | ✅ **NEW** |
+| `full_cam` | Full-camera vertical crop | ✅ Done |
 | `blur_bg` | Blurred full frame as background | ❌ Not done |
-| `face_track` | Dynamic crop following speaker's face | ❌ Not done |
+| `face_track` | Dynamic crop following speaker's face | ✅ **NEW** (default for FULL_CAM) |
 | `pip` | Picture-in-picture (small webcam corner) | ❌ Not done |
 
 **Store:** `channels.settings.render_template`
@@ -235,15 +235,17 @@ Replaced fixed "3-word chunks" with intelligent rules in `smart_chunker.py`:
 - `SPLIT` - when webcam detected in corner
 - `NO_WEBCAM` - simple center crop
 
-### 3.2 Face Tracking (MediaPipe)
-- **Status:** 🟡 Partially Complete (using OpenCV DNN + Gemini Vision instead)
+### 3.2 Face Tracking
+- **Status:** ✅ Complete (using OpenCV DNN)
 - **Effort:** ~4-6 hours
 
 **What we have:**
 - ✅ OpenCV DNN face detection
 - ✅ Gemini Vision AI webcam rectangle detection
 - ✅ Face-anchored cropping
-- ❌ Dynamic per-frame tracking (static detection only)
+- ✅ **Dynamic per-frame tracking** with EMA smoothing
+- ✅ FFmpeg expression-based interpolation between keyframes
+- ✅ Automatic face following for FULL_CAM layout
 
 ### 3.3 Blur Background Template
 - **Status:** Not Started
@@ -254,7 +256,7 @@ Replaced fixed "3-word chunks" with intelligent rules in `smart_chunker.py`:
 - [x] FULL_CAM mode handles webcam-only clips
 - [x] Auto-detection chooses appropriate layout
 - [ ] Blur BG template available
-- [ ] Face tracking keeps speaker centered without jitter
+- [x] Face tracking keeps speaker centered without jitter
 
 ---
 
@@ -383,6 +385,7 @@ These features were implemented outside the original roadmap:
 | **Groq Transcription** | Cloud-based Whisper API (faster than local) | ✅ Done |
 | **Gemini Vision** | AI webcam detection with frame analysis | ✅ Done |
 | **FULL_CAM Mode** | Layout for webcam-only clips | ✅ Done |
+| **Dynamic Face Tracking** | Follow speaker's face throughout video | ✅ Done |
 | **Game Categories** | Track and filter by game/category | ✅ Done |
 | **Twitch OAuth Dashboard** | Proper auth instead of shared password | ✅ Done |
 | **Mobile UI Redesign** | TikTok/Instagram-style mobile experience | ✅ Done |
