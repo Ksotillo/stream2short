@@ -742,44 +742,55 @@ def _score_face_for_fullcam(face: FaceDetection, frame_w: int, frame_h: int) -> 
     return (position_score * 0.45) + (horizontal_score * 0.35) + (size_score * 0.20)
 
 
-def _detect_best_face_for_fullcam(frame_bgr: np.ndarray) -> Optional[FaceDetection]:
+def _detect_best_face_for_fullcam(
+    frame_bgr: np.ndarray,
+    frame_path: Optional[str] = None,  # For Gemini escalation
+) -> Tuple[Optional[FaceDetection], str, float]:
     """
     Detect the best face for FULL_CAM mode (the main streamer, not background people).
     
-    Uses DNN detector (ResNet SSD) first for better accuracy, falls back to Haar.
+    IMPORTANT: NO HAAR CASCADE for global seed selection!
+    - DNN only for initial detection
+    - Gemini escalation if DNN fails or produces unreliable result
     
-    Uses scoring that prefers:
-    - Faces in lower portion of frame (streamers sit at desk level)
-    - Faces on left/center (typical desk setup)
-    - Larger faces (closer to camera than background people)
+    Returns:
+        Tuple of (face, detector_used, fullcam_score)
+        - face: FaceDetection or None
+        - detector_used: 'DNN', 'GEMINI', or 'NONE'
+        - fullcam_score: 0-1 reliability score for the seed
     """
     h, w = frame_bgr.shape[:2]
-    faces = []
-    dnn_attempted = False
-    dnn_succeeded = False
+    frame_area = w * h
     
     print(f"  🔍 _detect_best_face_for_fullcam() ENTER - frame {w}x{h}")
+    print(f"  ⚠️ NOTE: Haar CASCADE DISABLED for global seed (DNN + Gemini only)")
     
     # ==========================================================================
-    # TRY DNN DETECTOR FIRST (more robust, handles profile/angled faces)
+    # TRY DNN DETECTOR ONLY (no Haar for global seed)
     # ==========================================================================
-    print(f"  🚀 Trying DNN detector first...")
+    dnn_face = None
+    dnn_score = 0.0
+    
+    print(f"  🚀 Trying DNN detector...")
     try:
         from face_tracking import detect_face_dnn
-        dnn_attempted = True
-        print(f"  📦 face_tracking.detect_face_dnn imported successfully")
         
         dnn_result = detect_face_dnn(frame_bgr, confidence_threshold=0.35, try_preprocessing=True)
         
         if dnn_result is not None:
             fx, fy, fw, fh, conf = dnn_result
-            dnn_succeeded = True
             print(f"  ✅ DNN RETURNED FACE: ({fx},{fy}) {fw}x{fh} conf={conf:.2f}")
-            faces.append(FaceDetection(
-                x=fx, y=fy, width=fw, height=fh, confidence=conf
-            ))
+            
+            # Create FaceDetection and compute fullcam score
+            dnn_face = FaceDetection(x=fx, y=fy, width=fw, height=fh, confidence=conf)
+            dnn_score = _score_face_for_fullcam(dnn_face, w, h)
+            
+            y_ratio = dnn_face.center_y / h
+            x_ratio = dnn_face.center_x / w
+            print(f"  📊 DNN face fullcam_score={dnn_score:.3f} y_ratio={y_ratio:.2f} x_ratio={x_ratio:.2f}")
         else:
             print(f"  ⚠️ DNN returned None (no faces detected)")
+            
     except ImportError as e:
         print(f"  ❌ ImportError: face_tracking module not available: {e}")
     except Exception as e:
@@ -788,110 +799,222 @@ def _detect_best_face_for_fullcam(frame_bgr: np.ndarray) -> Optional[FaceDetecti
         print(f"     Traceback: {traceback.format_exc()}")
     
     # ==========================================================================
-    # FALLBACK TO HAAR CASCADE only if DNN didn't find anything
+    # SEED RELIABILITY CHECK
+    # Reject DNN seed if:
+    # - Score < 0.70 (unreliable)
+    # - y_ratio < 0.45 (too high in frame - likely background)
     # ==========================================================================
-    if not faces:
-        if dnn_attempted:
-            print(f"  🔄 DNN attempted but found no faces, trying Haar Cascade fallback...")
+    RELIABILITY_THRESHOLD = 0.70
+    Y_RATIO_MIN = 0.45
+    
+    dnn_is_reliable = False
+    if dnn_face is not None:
+        y_ratio = dnn_face.center_y / h
+        
+        if dnn_score >= RELIABILITY_THRESHOLD and y_ratio >= Y_RATIO_MIN:
+            dnn_is_reliable = True
+            print(f"  ✅ DNN seed is RELIABLE (score={dnn_score:.2f} >= {RELIABILITY_THRESHOLD}, y={y_ratio:.2f} >= {Y_RATIO_MIN})")
         else:
-            print(f"  🔄 DNN not available, trying Haar Cascade...")
-        
-        detector = get_dnn_face_detector()
-        
-        if detector is not None and isinstance(detector, cv2.CascadeClassifier):
-            print(f"  ✅ Haar Cascade loaded, running detectMultiScale...")
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            detections = detector.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=5,
-                minSize=(40, 40),
-                flags=cv2.CASCADE_SCALE_IMAGE
+            reasons = []
+            if dnn_score < RELIABILITY_THRESHOLD:
+                reasons.append(f"score={dnn_score:.2f} < {RELIABILITY_THRESHOLD}")
+            if y_ratio < Y_RATIO_MIN:
+                reasons.append(f"y_ratio={y_ratio:.2f} < {Y_RATIO_MIN} (too high in frame)")
+            print(f"  ⚠️ DNN seed UNRELIABLE: {', '.join(reasons)}")
+    
+    # ==========================================================================
+    # GEMINI ESCALATION if DNN failed or unreliable
+    # ==========================================================================
+    if not dnn_is_reliable and frame_path is not None:
+        print(f"  🤖 Escalating to GEMINI anchor detection...")
+        try:
+            from gemini_vision import get_fullcam_anchor_bbox_with_gemini
+            
+            gemini_result = get_fullcam_anchor_bbox_with_gemini(
+                frame_path=frame_path,
+                video_width=w,
+                video_height=h
             )
-            print(f"  📊 Haar found {len(detections)} raw detections")
             
-            for (fx, fy, fw, fh) in detections:
-                faces.append(FaceDetection(
-                    x=fx, y=fy, width=fw, height=fh, confidence=0.8
-                ))
+            if gemini_result and 'x' in gemini_result:
+                gx = gemini_result['x']
+                gy = gemini_result['y']
+                gw = gemini_result['w']
+                gh = gemini_result['h']
+                gconf = gemini_result.get('confidence', 0.8)
+                
+                gemini_face = FaceDetection(x=gx, y=gy, width=gw, height=gh, confidence=gconf)
+                gemini_score = _score_face_for_fullcam(gemini_face, w, h)
+                
+                gy_ratio = gemini_face.center_y / h
+                gx_ratio = gemini_face.center_x / w
+                
+                print(f"  ✅ GEMINI RETURNED FACE: ({gx},{gy}) {gw}x{gh}")
+                print(f"  📊 Gemini face fullcam_score={gemini_score:.3f} y_ratio={gy_ratio:.2f} x_ratio={gx_ratio:.2f}")
+                
+                # Use Gemini if it's better than DNN OR if DNN was unreliable
+                use_gemini = False
+                if dnn_face is None:
+                    use_gemini = True
+                    print(f"  🎯 Using GEMINI (DNN found nothing)")
+                elif gemini_score > dnn_score + 0.10:
+                    use_gemini = True
+                    print(f"  🎯 Using GEMINI (score {gemini_score:.2f} > DNN {dnn_score:.2f} + 0.10)")
+                elif not dnn_is_reliable and gemini_score >= RELIABILITY_THRESHOLD:
+                    use_gemini = True
+                    print(f"  🎯 Using GEMINI (DNN unreliable, Gemini score {gemini_score:.2f} >= {RELIABILITY_THRESHOLD})")
+                
+                if use_gemini:
+                    return (gemini_face, 'GEMINI', gemini_score)
+            else:
+                print(f"  ⚠️ Gemini returned no valid bbox")
+                
+        except Exception as e:
+            print(f"  ❌ Gemini escalation failed: {e}")
+    
+    # ==========================================================================
+    # RETURN BEST AVAILABLE
+    # ==========================================================================
+    if dnn_face is not None:
+        print(f"  🎯 Using DNN seed (detector=DNN, score={dnn_score:.3f})")
+        return (dnn_face, 'DNN', dnn_score)
+    
+    print(f"  ❌ _detect_best_face_for_fullcam(): No reliable face found")
+    return (None, 'NONE', 0.0)
+
+
+def _detect_best_face_multiframe(
+    video_path: str,
+    timestamps: List[float] = None,
+) -> Tuple[Optional[FaceDetection], str, float]:
+    """
+    Multi-frame bootstrap for FULL_CAM seed selection.
+    
+    Samples multiple frames and aggregates face detections to find the most
+    consistent, reliable streamer face.
+    
+    Args:
+        video_path: Path to video file
+        timestamps: List of timestamps to sample (default: [1, 3, 5, 7] seconds)
+    
+    Returns:
+        Tuple of (best_face, detector_used, score)
+    """
+    if timestamps is None:
+        timestamps = [1.0, 3.0, 5.0, 7.0]
+    
+    print(f"  🎬 Multi-frame bootstrap: sampling {len(timestamps)} frames")
+    
+    # Collect face detections from each frame
+    all_detections = []  # List of (face, detector, score, timestamp)
+    
+    for ts in timestamps:
+        frame = extract_frame(video_path, ts)
+        if frame is None:
+            print(f"     t={ts}s: Could not extract frame")
+            continue
         
-        elif detector is not None and hasattr(cv2, 'FaceDetectorYN') and isinstance(detector, cv2.FaceDetectorYN):
-            print(f"  ✅ FaceDetectorYN loaded, running detection...")
-            detector.setInputSize((w, h))
-            _, detections = detector.detect(frame_bgr)
-            
-            if detections is not None:
-                print(f"  📊 FaceDetectorYN found {len(detections)} raw detections")
-                for det in detections:
-                    fx, fy, fw, fh = int(det[0]), int(det[1]), int(det[2]), int(det[3])
-                    conf = float(det[-1])
-                    if conf >= 0.5:
-                        faces.append(FaceDetection(
-                            x=fx, y=fy, width=fw, height=fh, confidence=conf
-                        ))
+        h, w = frame.shape[:2]
+        
+        # Save frame for potential Gemini escalation
+        frame_path_temp = None
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                cv2.imwrite(f.name, frame)
+                frame_path_temp = f.name
+        except:
+            pass
+        
+        face, detector, score = _detect_best_face_for_fullcam(frame, frame_path_temp)
+        
+        # Clean up
+        if frame_path_temp:
+            try:
+                os.unlink(frame_path_temp)
+            except:
+                pass
+        
+        if face:
+            y_ratio = face.center_y / h
+            x_ratio = face.center_x / w
+            print(f"     t={ts}s: {detector} face at ({face.center_x},{face.center_y}) score={score:.2f} y={y_ratio:.2f}")
+            all_detections.append((face, detector, score, ts, w, h))
         else:
-            print(f"  ❌ No face detector available (detector={type(detector).__name__ if detector else None})")
+            print(f"     t={ts}s: No face detected")
     
-    if not faces:
-        print(f"  ❌ _detect_best_face_for_fullcam(): No faces found by any detector")
-        return None
+    if not all_detections:
+        print(f"  ❌ Multi-frame: No faces found in any frame")
+        return (None, 'NONE', 0.0)
     
-    # ===========================================================================
-    # MIN SIZE FILTER (Task 1): Reject poster/false faces that are too small
-    # - area_ratio >= 0.01 (1% of frame)
-    # - width_ratio >= 0.08 (8% of frame width)
-    # ===========================================================================
-    frame_area = w * h
-    valid_faces = []
+    # ==========================================================================
+    # AGGREGATION: Group faces by proximity and find most consistent
+    # ==========================================================================
+    # Simple approach: use the face with highest score that appears in multiple frames
+    # More sophisticated: cluster by center position
     
-    for f in faces:
-        area_ratio = (f.width * f.height) / frame_area
-        width_ratio = f.width / w
+    # For now, prefer faces that:
+    # 1. Have high score (>= 0.70)
+    # 2. Appear in multiple frames with consistent position
+    
+    # Group by approximate center (within 15% of frame width)
+    face_groups = []  # List of lists
+    
+    for det in all_detections:
+        face, detector, score, ts, w, h = det
+        cx, cy = face.center_x, face.center_y
         
-        if area_ratio < 0.01:
-            print(f"     [REJECT] {f.width}x{f.height} area_ratio={area_ratio:.4f} < 0.01 (poster/tiny)")
-            continue
-        if width_ratio < 0.08:
-            print(f"     [REJECT] {f.width}x{f.height} width_ratio={width_ratio:.3f} < 0.08 (too narrow)")
-            continue
+        # Find existing group within distance threshold
+        added = False
+        proximity_threshold = w * 0.15
         
-        valid_faces.append(f)
+        for group in face_groups:
+            ref_face = group[0][0]
+            ref_cx, ref_cy = ref_face.center_x, ref_face.center_y
+            dist = ((cx - ref_cx) ** 2 + (cy - ref_cy) ** 2) ** 0.5
+            
+            if dist < proximity_threshold:
+                group.append(det)
+                added = True
+                break
+        
+        if not added:
+            face_groups.append([det])
     
-    if not valid_faces:
-        print(f"  ❌ All {len(faces)} faces rejected by MIN SIZE filter (area<1% or width<8%)")
-        return None
+    print(f"  📊 Multi-frame: Found {len(face_groups)} distinct face groups")
     
-    # ===========================================================================
-    # SCORING: Primarily by SIZE (area_ratio), with center proximity bonus
-    # ===========================================================================
-    scored_faces = []
-    for f in valid_faces:
-        area_ratio = (f.width * f.height) / frame_area
-        
-        # Size score (primary): larger faces = more likely the streamer
-        size_score = min(area_ratio * 20, 1.0)  # 5% area = score 1.0
-        
-        # Center proximity bonus (secondary): prefer faces near center
-        cx_ratio = f.center_x / w
-        cy_ratio = f.center_y / h
-        center_dist = ((cx_ratio - 0.5) ** 2 + (cy_ratio - 0.5) ** 2) ** 0.5
-        center_score = max(0, 1.0 - center_dist * 1.5)  # Soft penalty for edge faces
-        
-        # Combined score: 70% size, 30% center proximity
-        total_score = size_score * 0.70 + center_score * 0.30
-        scored_faces.append((f, total_score, area_ratio))
+    # Score each group by: count * avg_score
+    best_group = None
+    best_group_score = 0
     
-    # Log face candidates for debugging
-    print(f"  📊 FULLCAM face candidates ({len(scored_faces)}) after MIN SIZE filter:")
-    for face, score, ar in sorted(scored_faces, key=lambda x: -x[1]):
+    for i, group in enumerate(face_groups):
+        count = len(group)
+        avg_score = sum(d[2] for d in group) / count
+        group_score = count * avg_score
+        
+        # Get representative face (highest individual score in group)
+        best_in_group = max(group, key=lambda d: d[2])
+        face = best_in_group[0]
+        h = best_in_group[5]
+        w = best_in_group[4]
         y_ratio = face.center_y / h
         x_ratio = face.center_x / w
-        print(f"     - {face.width}x{face.height} area={ar:.3%} at ({face.center_x},{face.center_y}) "
-              f"y={y_ratio:.2f} x={x_ratio:.2f} score={score:.3f}")
+        
+        print(f"     Group {i+1}: {count} detections, avg_score={avg_score:.2f}, group_score={group_score:.2f}")
+        print(f"            Best: ({face.center_x},{face.center_y}) y={y_ratio:.2f} x={x_ratio:.2f}")
+        
+        if group_score > best_group_score:
+            best_group_score = group_score
+            best_group = group
     
-    best_face, best_score, best_ar = max(scored_faces, key=lambda x: x[1])
-    print(f"  ✅ _detect_best_face_for_fullcam(): Best face {best_face.width}x{best_face.height} area={best_ar:.3%} score={best_score:.3f}")
-    return best_face
+    if best_group:
+        # Return the best detection from the winning group
+        best_det = max(best_group, key=lambda d: d[2])
+        face, detector, score, ts, w, h = best_det
+        print(f"  ✅ Multi-frame winner: {detector} at t={ts}s, score={score:.2f}")
+        return (face, detector, score)
+    
+    return (None, 'NONE', 0.0)
 
 
 def bbox_contains_face(
@@ -2418,9 +2541,26 @@ def detect_webcam_region(
         if frame is not None:
             height, width = frame.shape[:2]
             
-            # Detect ALL faces and pick the best one for FULL_CAM
-            # (prefer faces in lower portion - streamers sit at desk level)
-            face = _detect_best_face_for_fullcam(frame)
+            # Save frame for Gemini escalation
+            import tempfile
+            frame_path_temp = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                    cv2.imwrite(f.name, frame)
+                    frame_path_temp = f.name
+            except Exception as e:
+                print(f"  ⚠️ Could not save temp frame for Gemini: {e}")
+            
+            # Detect best face using DNN + Gemini escalation (NO HAAR for global seed)
+            face, detector_used, seed_score = _detect_best_face_for_fullcam(frame, frame_path_temp)
+            
+            # Clean up temp frame
+            if frame_path_temp:
+                try:
+                    import os
+                    os.unlink(frame_path_temp)
+                except:
+                    pass
             
             # Calculate face metrics for logging
             face_ratio = 0.0
@@ -2440,7 +2580,7 @@ def detect_webcam_region(
                 is_centered_x = 0.10 * width < face_center_x < 0.90 * width
                 is_in_frame = 0.05 * height < face_center_y < 0.95 * height
                 
-                print(f"  👤 Face detected for FULL_CAM:")
+                print(f"  👤 Face detected for FULL_CAM (detector={detector_used}, seed_score={seed_score:.2f}):")
                 print(f"     Face size: {face.width}x{face.height} ({face_ratio:.1%} of frame)")
                 print(f"     Face center: ({face_center_x}, {face_center_y})")
                 print(f"     In-frame: X={is_centered_x}, Y={is_in_frame}")
@@ -2753,11 +2893,32 @@ def detect_layout_with_cache(
     
     # Detect face for face-centered cropping (especially for FULL_CAM)
     face_center = None
+    seed_detector = None
+    seed_score = 0.0
+    
     if layout == 'FULL_CAM':
-        # For FULL_CAM, use _detect_best_face_for_fullcam which has proper scoring
-        # DO NOT use detect_face_in_frame as it uses different (worse) detection
-        print(f"  🔍 FULL_CAM: Using _detect_best_face_for_fullcam for consistent face selection")
-        best_face = _detect_best_face_for_fullcam(frame)
+        # For FULL_CAM, use _detect_best_face_for_fullcam which has DNN + Gemini (NO HAAR)
+        print(f"  🔍 FULL_CAM: Using _detect_best_face_for_fullcam (DNN + Gemini, NO HAAR for seed)")
+        
+        # Save frame for Gemini escalation
+        frame_path_temp = None
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                cv2.imwrite(f.name, frame)
+                frame_path_temp = f.name
+        except Exception as e:
+            print(f"  ⚠️ Could not save temp frame for Gemini: {e}")
+        
+        best_face, seed_detector, seed_score = _detect_best_face_for_fullcam(frame, frame_path_temp)
+        
+        # Clean up temp frame
+        if frame_path_temp:
+            try:
+                os.unlink(frame_path_temp)
+            except:
+                pass
+        
         if best_face:
             face_center = FaceCenter(
                 x=best_face.x,
@@ -2765,7 +2926,10 @@ def detect_layout_with_cache(
                 width=best_face.width,
                 height=best_face.height
             )
-            print(f"  👤 FULL_CAM face_center SET: ({face_center.center_x}, {face_center.center_y}) - SAME face as detection")
+            y_ratio = face_center.center_y / height
+            x_ratio = face_center.center_x / width
+            print(f"  👤 FULL_CAM face_center SET: ({face_center.center_x}, {face_center.center_y})")
+            print(f"     Detector: {seed_detector}, Score: {seed_score:.2f}, y_ratio: {y_ratio:.2f}, x_ratio: {x_ratio:.2f}")
         else:
             print(f"  ⚠️ FULL_CAM: No face found, face tracking will use Gemini anchor")
         

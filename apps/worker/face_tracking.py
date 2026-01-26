@@ -730,6 +730,14 @@ def track_faces(
     detections_found = 0
     detections_held = 0  # Times we held position due to jump rejection
     
+    # ==========================================================================
+    # RE-ACQUIRE STATE: Track potential better face for switching
+    # ==========================================================================
+    reacquire_candidate = None  # (cx, cy, w, h, score, consecutive_count)
+    reacquire_threshold = 0.20  # Score difference to consider re-acquire
+    reacquire_persistence = 2   # Frames needed to confirm re-acquire
+    current_anchor_score = 0.70 if initial_center else 0.0  # Assume layout seed is reliable
+    
     for i, ts in enumerate(timestamps):
         frame = extract_frame_at_time(video_path, ts, temp_dir)
         if frame is None:
@@ -746,19 +754,28 @@ def track_faces(
                 detections_held += 1
             continue
         
-        # Try DNN first with temporal association, then Haar fallback
+        # =====================================================================
+        # DETECTION: DNN only for global, Haar only for ROI near prev_center
+        # =====================================================================
         detection = detect_face_dnn(
             frame,
             prev_center=prev_center if prev_center else anchor_center,
         )
-        if detection is None:
-            # Pass prev_center to Haar so it picks closest face, not wrong one
-            detection = detect_face_haar(frame, prev_center=prev_center if prev_center else anchor_center)
+        
+        # HAAR ONLY AS ROI FALLBACK (not for global discovery)
+        if detection is None and prev_center is not None:
+            # Haar only when we have a prev_center to search near
+            detection = detect_face_haar(frame, prev_center=prev_center)
+            if detection:
+                print(f"      Haar ROI fallback used (near prev_center)")
         
         if detection:
             x, y, w, h, conf = detection
             cx = x + w // 2
             cy = y + h // 2
+            
+            # Calculate fullcam score for this detection
+            detection_score = _score_face_for_fullcam(x, y, w, h, width, height)
             
             # =========================================================
             # MIN SIZE FILTER when setting anchor (prevents tiny face lock)
@@ -773,7 +790,58 @@ def track_faces(
                     continue  # Skip this detection, try next frame
                 
                 anchor_center = (cx, cy)
-                print(f"   🎯 Anchor set at ({cx},{cy}) size={w}x{h} area={area_ratio:.3%}")
+                current_anchor_score = detection_score
+                print(f"   🎯 Anchor set at ({cx},{cy}) size={w}x{h} area={area_ratio:.3%} score={detection_score:.2f}")
+            
+            # =================================================================
+            # RE-ACQUIRE LOGIC: Check if there's a much better face
+            # =================================================================
+            # Only consider re-acquire if detection is far from current anchor (jump rejected)
+            if prev_center:
+                dist_to_prev = ((cx - prev_center[0]) ** 2 + (cy - prev_center[1]) ** 2) ** 0.5
+                max_jump_px = int(width * 0.18)
+                
+                if dist_to_prev > max_jump_px and detection_score > current_anchor_score + reacquire_threshold:
+                    # This is a potential re-acquire candidate
+                    y_ratio = cy / height
+                    x_ratio = cx / width
+                    print(f"   🔄 RE-ACQUIRE candidate: ({cx},{cy}) score={detection_score:.2f} vs current={current_anchor_score:.2f}")
+                    print(f"      y_ratio={y_ratio:.2f} x_ratio={x_ratio:.2f} dist={dist_to_prev:.0f}px")
+                    
+                    if reacquire_candidate and abs(cx - reacquire_candidate[0]) < width * 0.10:
+                        # Same face as previous re-acquire candidate - increment count
+                        reacquire_candidate = (cx, cy, w, h, detection_score, reacquire_candidate[5] + 1)
+                        print(f"      Consecutive re-acquire: {reacquire_candidate[5]} frames")
+                        
+                        if reacquire_candidate[5] >= reacquire_persistence:
+                            # SWITCH to the new face
+                            print(f"   🎯🎯 RE-ACQUIRE TRIGGERED! Switching anchor from score={current_anchor_score:.2f} to {detection_score:.2f}")
+                            anchor_center = (cx, cy)
+                            prev_center = (cx, cy)
+                            current_anchor_score = detection_score
+                            reacquire_candidate = None
+                            # Continue to use this detection
+                    else:
+                        # New re-acquire candidate
+                        reacquire_candidate = (cx, cy, w, h, detection_score, 1)
+                    
+                    # Still hold position while evaluating re-acquire
+                    if smoothed_w > 0:
+                        keyframes.append(FaceKeyframe(
+                            timestamp=ts,
+                            center_x=smoothed_cx,
+                            center_y=smoothed_cy,
+                            width=smoothed_w,
+                            height=smoothed_h,
+                            confidence=0.5,
+                        ))
+                        detections_held += 1
+                    continue
+            
+            # Clear re-acquire state if we got a normal detection
+            if reacquire_candidate:
+                # Detection was close to prev_center, not a re-acquire
+                reacquire_candidate = None
             
             # Update prev_center
             prev_center = (cx, cy)
@@ -803,6 +871,7 @@ def track_faces(
             ))
         else:
             # No detection or jump rejected - HOLD last position
+            reacquire_candidate = None  # Clear re-acquire if no detection at all
             if prev_center and smoothed_w > 0:
                 keyframes.append(FaceKeyframe(
                     timestamp=ts,
@@ -914,12 +983,42 @@ def generate_ffmpeg_crop_expr(
         print(f"      No keyframes, using center crop: ({crop_x},{crop_y})")
         return str(crop_x), str(crop_y)
     
+    # ==========================================================================
+    # CROP SAFETY MARGIN: Ensure face bbox + padding fits inside crop window
+    # ==========================================================================
+    safety_padding_ratio = 0.10  # 10% of crop width as padding
+    safety_padding_x = int(crop_width * safety_padding_ratio)
+    
     # Calculate crop positions for each keyframe
     crop_positions = []
     for i, kf in enumerate(face_track.keyframes):
-        # Center crop on face
+        # Calculate face bbox bounds
+        face_left = kf.center_x - kf.width // 2
+        face_right = kf.center_x + kf.width // 2
+        
+        # Ideal crop position (centered on face)
         crop_x = kf.center_x - crop_width // 2
         crop_y = kf.center_y - int(crop_height * target_face_y_ratio)
+        
+        # =================================================================
+        # SAFETY MARGIN: Ensure face bbox + padding is inside crop window
+        # =================================================================
+        crop_left = crop_x
+        crop_right = crop_x + crop_width
+        
+        # Check if face is too close to left edge of crop
+        if face_left - safety_padding_x < crop_left:
+            # Shift crop left to include face with padding
+            crop_x = face_left - safety_padding_x
+            if i < 3:
+                print(f"      KF[{i}] safety: shifted LEFT to include face (face_left={face_left}, padding={safety_padding_x})")
+        
+        # Check if face is too close to right edge of crop
+        elif face_right + safety_padding_x > crop_right:
+            # Shift crop right to include face with padding
+            crop_x = face_right + safety_padding_x - crop_width
+            if i < 3:
+                print(f"      KF[{i}] safety: shifted RIGHT to include face (face_right={face_right}, padding={safety_padding_x})")
         
         # Clamp to valid bounds
         crop_x = max(0, min(crop_x, max_x))
@@ -929,7 +1028,7 @@ def generate_ffmpeg_crop_expr(
         
         # Log first 5 keyframes for debugging
         if i < 5:
-            print(f"      KF[{i}] t={kf.timestamp:.2f}s: face=({kf.center_x},{kf.center_y}) -> crop=({crop_x},{crop_y})")
+            print(f"      KF[{i}] t={kf.timestamp:.2f}s: face=({kf.center_x},{kf.center_y}) w={kf.width} -> crop=({crop_x},{crop_y})")
     
     if len(crop_positions) > 5:
         print(f"      ... and {len(crop_positions) - 5} more keyframes")
