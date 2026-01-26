@@ -1,13 +1,20 @@
 """Face tracking module for dynamic face-following crops.
 
 Tracks face positions across video frames and generates smooth crop paths
-for FULL_CAM layout rendering.
+for FULL_CAM layout rendering with TRUE DYNAMIC PANNING.
 
 Strategy:
-1. Sample frames at regular intervals (every ~1.5 seconds)
+1. Sample frames at regular intervals (every ~0.5 seconds for smooth panning)
 2. Detect face position using DNN (preferred) or Haar Cascade (fallback)
+   - DNN uses lowered confidence threshold (0.35) for profile/partial faces
+   - Haar includes profile face detection (both directions)
 3. Apply EMA (Exponential Moving Average) smoothing to reduce jitter
-4. Generate FFmpeg-compatible crop positions
+4. Generate FFmpeg-compatible crop expressions with time-based interpolation
+
+Detection Features:
+- Profile face detection via Haar cascade (catches side views)
+- Enhanced search with lower threshold when face is lost but prev_center known
+- Temporal association to avoid jumping between faces
 
 DNN Model Setup:
 - Models are downloaded during Docker build to /app/models/
@@ -291,7 +298,7 @@ def _score_face_for_fullcam(x: int, y: int, w: int, h: int, frame_w: int, frame_
 
 def detect_face_dnn(
     frame_bgr: np.ndarray,
-    confidence_threshold: float = 0.50,  # Raised from 0.35 to reduce false positives
+    confidence_threshold: float = 0.35,  # Lowered to catch partial/profile faces
     try_preprocessing: bool = True,
     prev_center: Optional[Tuple[int, int]] = None,  # For temporal association
     max_jump_ratio: float = 0.18,  # Max allowed jump as fraction of frame width
@@ -300,13 +307,13 @@ def detect_face_dnn(
     Detect face using OpenCV DNN (ResNet SSD Caffe model).
     
     This is more robust than Haar Cascade, especially for:
-    - Profile/angled faces
+    - Profile/angled faces (lowered confidence threshold helps)
     - Variable lighting conditions
     - Faces with glasses/accessories
     
     Args:
         frame_bgr: Input frame in BGR format
-        confidence_threshold: Minimum confidence (default 0.50)
+        confidence_threshold: Minimum confidence (default 0.35 for profile face tolerance)
         try_preprocessing: Whether to try enhanced preprocessing if first pass fails
         prev_center: Previous face center (cx, cy) for temporal association
         max_jump_ratio: Max allowed jump as fraction of frame width
@@ -361,16 +368,18 @@ def detect_face_dnn(
                     aspect_ratio = fw / fh if fh > 0 else 0
                     
                     # ==========================================================
-                    # SANITY FILTERS (Task C)
+                    # SANITY FILTERS (Task C) - Relaxed for profile faces
                     # ==========================================================
                     # Reject tiny or huge detections
-                    if area_ratio < 0.002 or area_ratio > 0.08:
-                        print(f"      [REJECT] area_ratio={area_ratio:.4f} out of [0.002, 0.08]")
+                    # Lowered min to 0.001 to catch faces at edges/profiles
+                    if area_ratio < 0.001 or area_ratio > 0.15:
+                        print(f"      [REJECT] area_ratio={area_ratio:.4f} out of [0.001, 0.15]")
                         continue
                     
                     # Reject non-face aspect ratios
-                    if aspect_ratio < 0.6 or aspect_ratio > 1.6:
-                        print(f"      [REJECT] aspect_ratio={aspect_ratio:.2f} out of [0.6, 1.6]")
+                    # Expanded range for profile faces (can be narrower: 0.4) and tilted heads (wider: 2.0)
+                    if aspect_ratio < 0.4 or aspect_ratio > 2.0:
+                        print(f"      [REJECT] aspect_ratio={aspect_ratio:.2f} out of [0.4, 2.0]")
                         continue
                     
                     # Score for streamer detection
@@ -413,6 +422,26 @@ def detect_face_dnn(
                 candidates.append(ec)
     
     if not candidates:
+        # ======================================================================
+        # ENHANCED SEARCH: If we have prev_center, try harder with lower threshold
+        # This helps with profile/partial faces that might be below normal threshold
+        # ======================================================================
+        if prev_center is not None and confidence_threshold > 0.20:
+            print(f"   🔄 No candidates - trying enhanced search around prev_center with lower threshold")
+            
+            # Try with much lower threshold
+            enhanced_result = detect_face_dnn(
+                frame_bgr,
+                confidence_threshold=0.20,  # Very low threshold
+                try_preprocessing=True,
+                prev_center=prev_center,
+                max_jump_ratio=max_jump_ratio * 1.5,  # Allow slightly larger jumps
+            )
+            
+            if enhanced_result:
+                print(f"   ✅ Enhanced search found face!")
+                return enhanced_result
+        
         print(f"   ❌ detect_face_dnn(): No valid candidates after filtering")
         return None
     
@@ -484,29 +513,72 @@ def detect_face_haar(
     min_area_ratio = 0.01   # 1% of frame
     min_width_ratio = 0.08  # 8% of frame width
     
-    cascade_paths = [
-        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml',
-        '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
+    # Try multiple cascades for better coverage (frontal + profile)
+    cascade_configs = [
+        # Frontal face (most common)
+        {
+            'paths': [
+                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml',
+                '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
+            ],
+            'name': 'frontal'
+        },
+        # Profile face (side view) - helps with turned heads
+        {
+            'paths': [
+                cv2.data.haarcascades + 'haarcascade_profileface.xml',
+                '/usr/share/opencv4/haarcascades/haarcascade_profileface.xml',
+            ],
+            'name': 'profile'
+        },
     ]
     
-    face_cascade = None
-    for path in cascade_paths:
-        if Path(path).exists():
-            face_cascade = cv2.CascadeClassifier(path)
-            break
+    all_faces = []
     
-    if face_cascade is None or face_cascade.empty():
+    for config in cascade_configs:
+        cascade = None
+        for path in config['paths']:
+            if Path(path).exists():
+                cascade = cv2.CascadeClassifier(path)
+                break
+        
+        if cascade is None or cascade.empty():
+            continue
+        
+        faces = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(50, 50)
+        )
+        
+        if len(faces) > 0:
+            if DEBUG_FACE_TRACKING:
+                print(f"      Haar {config['name']}: found {len(faces)} faces")
+            all_faces.extend([(f, config['name']) for f in faces])
+        
+        # Also try flipped image for profile (catches faces looking the other way)
+        if config['name'] == 'profile':
+            gray_flipped = cv2.flip(gray, 1)  # Horizontal flip
+            faces_flipped = cascade.detectMultiScale(
+                gray_flipped,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(50, 50)
+            )
+            if len(faces_flipped) > 0:
+                if DEBUG_FACE_TRACKING:
+                    print(f"      Haar profile-flipped: found {len(faces_flipped)} faces")
+                # Mirror the x coordinates back
+                for (fx, fy, fw, fh) in faces_flipped:
+                    mirrored_x = w - fx - fw
+                    all_faces.append(((mirrored_x, fy, fw, fh), 'profile-flipped'))
+    
+    if len(all_faces) == 0:
         return None
     
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(50, 50)
-    )
-    
-    if len(faces) == 0:
-        return None
+    # Convert to simple list for processing
+    faces = [f[0] for f in all_faces]
     
     # Build candidates with MIN SIZE filter
     candidates = []
@@ -575,9 +647,9 @@ def detect_face_haar(
 def track_faces(
     video_path: str,
     temp_dir: str,
-    sample_interval: float = 1.5,
+    sample_interval: float = 0.5,  # Changed from 1.5s to 0.5s for smoother panning
     ema_alpha: float = 0.4,
-    max_keyframes: int = 20,
+    max_keyframes: int = 60,  # Increased to accommodate more samples
     initial_center: Optional[Tuple[int, int]] = None,  # (cx, cy) seed from layout detection
     initial_size: Optional[Tuple[int, int]] = None,    # (w, h) expected face size
 ) -> Optional[FaceTrack]:
@@ -1097,9 +1169,9 @@ def _get_opencv_tracker():
 def track_with_gemini_anchor(
     video_path: str,
     temp_dir: str,
-    sample_interval: float = 1.5,
+    sample_interval: float = 0.5,  # Changed from 1.5s to 0.5s for smoother panning
     ema_alpha: float = 0.4,
-    max_keyframes: int = 20,
+    max_keyframes: int = 60,  # Increased to accommodate more samples
 ) -> Optional[FaceTrack]:
     """
     Track using Gemini anchor + OpenCV tracker.
@@ -1436,9 +1508,9 @@ def track_with_gemini_anchor(
 def track_faces_with_fallback(
     video_path: str,
     temp_dir: str,
-    sample_interval: float = 1.5,
+    sample_interval: float = 0.5,  # Changed from 1.5s to 0.5s for smoother panning
     ema_alpha: float = 0.4,
-    max_keyframes: int = 20,
+    max_keyframes: int = 60,  # Increased to accommodate more samples
     initial_center: Optional[Tuple[int, int]] = None,  # (cx, cy) from layout detection
     initial_size: Optional[Tuple[int, int]] = None,    # (w, h) from layout detection
 ) -> Optional[FaceTrack]:
