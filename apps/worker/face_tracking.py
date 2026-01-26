@@ -55,6 +55,15 @@ REACQUIRE_MIN_SCORE = 0.70      # Minimum fullcam score to accept re-acquired fa
 EDGE_MARGIN_RATIO = 0.12        # 12% of crop width defines "near edge"
 EDGE_PRESSURE_MULTIPLIER = 1.5  # Multiply max_jump by this when face is near edge
 
+# Candidate selection with distance penalty
+DIST_PENALTY = 0.35             # Penalty factor for distance in candidate scoring
+MIN_ACCEPT_SCORE = 0.65         # Minimum score for normal tracking acceptance
+
+# Hysteresis: far jumps require higher quality
+FAR_JUMP_RATIO = 0.60           # Jump distance ratio that triggers stricter requirements
+FAR_JUMP_MIN_SCORE = 0.80       # Minimum score for far jumps
+FAR_JUMP_MIN_CONF = 0.85        # Minimum confidence for far jumps
+
 
 def _get_dnn_net():
     """
@@ -476,36 +485,86 @@ def detect_face_dnn(
         print(f"      ... and {len(candidates_sorted) - 3} more")
     
     # ==========================================================================
-    # TEMPORAL ASSOCIATION (Task B)
-    # If we have a previous center, prefer the candidate closest to it
+    # TEMPORAL ASSOCIATION with DISTANCE-AWARE SCORING + HYSTERESIS
     # ==========================================================================
     if prev_center is not None:
         prev_cx, prev_cy = prev_center
         
-        # Find candidate closest to prev_center
+        # Calculate distance for each candidate
         def distance_to_prev(c):
             cx, cy = c['center']
             return ((cx - prev_cx) ** 2 + (cy - prev_cy) ** 2) ** 0.5
         
-        candidates_by_dist = sorted(candidates, key=distance_to_prev)
-        closest = candidates_by_dist[0]
-        dist = distance_to_prev(closest)
+        # =====================================================================
+        # DISTANCE-AWARE SCORING: Rank by combined score
+        # combined = score - DIST_PENALTY * (dist / max_jump_px)
+        # =====================================================================
+        scored_candidates = []
+        for c in candidates:
+            dist = distance_to_prev(c)
+            base_score = c['score']
+            dist_penalty = DIST_PENALTY * (dist / max(1, max_jump_px))
+            combined_score = base_score - dist_penalty
+            scored_candidates.append({
+                **c,
+                'dist': dist,
+                'combined_score': combined_score,
+            })
         
-        if dist <= max_jump_px:
-            # Accept closest candidate
-            x, y, fw, fh = closest['bbox']
-            print(f"   ✅ detect_face_dnn(): Temporal match at ({x},{y}) dist={dist:.0f}px")
-            return (x, y, fw, fh, closest['confidence'])
-        else:
-            # Jump too large - reject all candidates
-            print(f"   ⚠️ detect_face_dnn(): Jump {dist:.0f}px > max {max_jump_px}px - holding position")
+        # Sort by combined score (highest first)
+        scored_candidates.sort(key=lambda c: c['combined_score'], reverse=True)
+        best = scored_candidates[0]
+        dist = best['dist']
+        
+        # Log top candidates with combined scores
+        if DEBUG_FACE_TRACKING:
+            print(f"   📊 Candidates ranked by combined score (score - {DIST_PENALTY}*dist/max_jump):")
+            for i, c in enumerate(scored_candidates[:3]):
+                x, y, fw, fh = c['bbox']
+                print(f"      #{i+1}: ({x},{y}) score={c['score']:.2f} dist={c['dist']:.0f}px combined={c['combined_score']:.2f}")
+        
+        # =====================================================================
+        # GATE 1: Minimum score requirement
+        # =====================================================================
+        if best['score'] < MIN_ACCEPT_SCORE:
+            x, y, fw, fh = best['bbox']
+            print(f"   ⚠️ Jump rejected: score={best['score']:.2f} < MIN_ACCEPT_SCORE={MIN_ACCEPT_SCORE} (dist={dist:.0f}px, conf={best['confidence']:.2f})")
             return None
+        
+        # =====================================================================
+        # GATE 2: Max jump threshold
+        # =====================================================================
+        if dist > max_jump_px:
+            x, y, fw, fh = best['bbox']
+            print(f"   ⚠️ Jump rejected: dist={dist:.0f}px > max_jump_px={max_jump_px} (score={best['score']:.2f}, conf={best['confidence']:.2f})")
+            return None
+        
+        # =====================================================================
+        # GATE 3: HYSTERESIS - Far jumps require higher quality
+        # =====================================================================
+        far_jump_threshold = max_jump_px * FAR_JUMP_RATIO
+        if dist > far_jump_threshold:
+            score_ok = best['score'] >= FAR_JUMP_MIN_SCORE
+            conf_ok = best['confidence'] >= FAR_JUMP_MIN_CONF
+            
+            if not (score_ok or conf_ok):
+                x, y, fw, fh = best['bbox']
+                print(f"   ⚠️ Jump rejected (HYSTERESIS): dist={dist:.0f}px > {far_jump_threshold:.0f}px requires score>={FAR_JUMP_MIN_SCORE} OR conf>={FAR_JUMP_MIN_CONF}")
+                print(f"      Candidate: score={best['score']:.2f}, conf={best['confidence']:.2f} - REJECTED")
+                return None
+            else:
+                print(f"   ✓ Far jump accepted: dist={dist:.0f}px, score={best['score']:.2f}, conf={best['confidence']:.2f}")
+        
+        # ACCEPT the best candidate
+        x, y, fw, fh = best['bbox']
+        print(f"   ✅ detect_face_dnn(): Temporal match at ({x},{y}) dist={dist:.0f}px score={best['score']:.2f} combined={best['combined_score']:.2f}")
+        return (x, y, fw, fh, best['confidence'])
     
     # No previous center - pick face with highest streamer score
     best = max(candidates, key=lambda c: c['score'])
     x, y, fw, fh = best['bbox']
     
-    print(f"   ✅ detect_face_dnn(): Returning best face at ({x},{y}) {fw}x{fh} conf={best['confidence']:.2f}")
+    print(f"   ✅ detect_face_dnn(): Returning best face at ({x},{y}) {fw}x{fh} score={best['score']:.2f} conf={best['confidence']:.2f}")
     
     return (x, y, fw, fh, best['confidence'])
 
@@ -701,24 +760,40 @@ def track_faces(
     
     print(f"   📹 Video: {width}x{height}, {duration:.2f}s")
     
+    # ==========================================================================
+    # FULL_CAM HIGH-DENSITY SAMPLING: 45-60 frames for 30s clips (~0.5s spacing)
+    # ==========================================================================
+    # For FULL_CAM (initial_center provided), use higher density
+    if initial_center:
+        # Calculate ideal sample count: aim for ~0.5s spacing, min 45 frames
+        ideal_samples = max(45, int(duration / 0.5))
+        ideal_samples = min(ideal_samples, 60)  # Cap at 60
+        effective_interval = duration / ideal_samples
+        print(f"   📊 FULL_CAM high-density mode: {ideal_samples} samples (dt≈{effective_interval:.2f}s)")
+    else:
+        ideal_samples = max_keyframes
+        effective_interval = sample_interval
+    
     # Calculate sample timestamps
     timestamps = []
     t = 0.0
+    actual_interval = duration / max(1, ideal_samples)
     while t < duration:
         timestamps.append(t)
-        t += sample_interval
+        t += actual_interval
     
     # Always include near the end
     if timestamps[-1] < duration - 0.5:
         timestamps.append(duration - 0.5)
     
-    # Limit total samples
+    # Limit total samples (safety)
     if len(timestamps) > max_keyframes:
         step = len(timestamps) / max_keyframes
         timestamps = [timestamps[int(i * step)] for i in range(max_keyframes)]
         timestamps.append(duration - 0.5)
     
-    print(f"   🎯 Sampling {len(timestamps)} frames...")
+    avg_dt = duration / max(1, len(timestamps))
+    print(f"   🎯 Sampling {len(timestamps)} frames (dt≈{avg_dt:.2f}s)")
     
     # ==========================================================================
     # TEMPORAL ASSOCIATION with SEED from layout detection
