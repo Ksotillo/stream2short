@@ -39,6 +39,22 @@ _DNN_NET_LOADED = False  # Track if we've attempted loading
 
 DEBUG_FACE_TRACKING = os.environ.get("DEBUG_FACE_TRACKING", "1") == "1"
 
+# =============================================================================
+# TRACKING CONSTANTS (tunable)
+# =============================================================================
+# Time-scaled jump threshold: max_jump = frame_w * MAX_SPEED_RATIO_PER_SEC * dt
+MAX_SPEED_RATIO_PER_SEC = 0.22  # Max face movement as ratio of frame width per second
+MIN_JUMP_RATIO = 0.18           # Minimum jump threshold (prevents over-rejection)
+MAX_JUMP_RATIO = 0.55           # Maximum jump threshold (prevents runaway)
+
+# Lost mode re-acquire
+LOST_COUNT_THRESHOLD = 2        # Frames of missed detection before re-acquire attempt
+REACQUIRE_MIN_SCORE = 0.70      # Minimum fullcam score to accept re-acquired face
+
+# Edge pressure: relax jump gate when face is near crop boundary
+EDGE_MARGIN_RATIO = 0.12        # 12% of crop width defines "near edge"
+EDGE_PRESSURE_MULTIPLIER = 1.5  # Multiply max_jump by this when face is near edge
+
 
 def _get_dnn_net():
     """
@@ -301,7 +317,8 @@ def detect_face_dnn(
     confidence_threshold: float = 0.35,  # Lowered to catch partial/profile faces
     try_preprocessing: bool = True,
     prev_center: Optional[Tuple[int, int]] = None,  # For temporal association
-    max_jump_ratio: float = 0.18,  # Max allowed jump as fraction of frame width
+    max_jump_ratio: float = 0.18,  # Max allowed jump as fraction of frame width (used if max_jump_px not set)
+    max_jump_px: Optional[int] = None,  # Override: exact pixel threshold (for time-scaled jumps)
 ) -> Optional[Tuple[int, int, int, int, float]]:
     """
     Detect face using OpenCV DNN (ResNet SSD Caffe model).
@@ -316,7 +333,8 @@ def detect_face_dnn(
         confidence_threshold: Minimum confidence (default 0.35 for profile face tolerance)
         try_preprocessing: Whether to try enhanced preprocessing if first pass fails
         prev_center: Previous face center (cx, cy) for temporal association
-        max_jump_ratio: Max allowed jump as fraction of frame width
+        max_jump_ratio: Max allowed jump as fraction of frame width (used if max_jump_px not set)
+        max_jump_px: Override: exact pixel threshold (for time-scaled jumps from track_faces)
     
     Returns:
         Tuple of (x, y, width, height, confidence) or None
@@ -332,7 +350,10 @@ def detect_face_dnn(
     
     h, w = frame_bgr.shape[:2]
     frame_area = w * h
-    max_jump_px = int(w * max_jump_ratio)
+    
+    # Use provided max_jump_px or calculate from ratio
+    if max_jump_px is None:
+        max_jump_px = int(w * max_jump_ratio)
     
     def _run_detection(input_frame):
         """Run DNN detection on a frame with sanity filters."""
@@ -731,17 +752,21 @@ def track_faces(
     detections_held = 0  # Times we held position due to jump rejection
     
     # ==========================================================================
-    # RE-ACQUIRE STATE: Track potential better face for switching
+    # TRACKING STATE
     # ==========================================================================
-    reacquire_candidate = None  # (cx, cy, w, h, score, consecutive_count)
-    reacquire_threshold = 0.20  # Score difference to consider re-acquire
-    reacquire_persistence = 2   # Frames needed to confirm re-acquire
     current_anchor_score = 0.70 if initial_center else 0.0  # Assume layout seed is reliable
+    lost_count = 0  # Consecutive frames without accepted detection (for LOST MODE)
+    prev_ts = 0.0   # Previous timestamp for dt calculation
+    
+    # Crop dimensions for edge pressure calculation (9:16 from 1920x1080)
+    crop_w = int(height * 9 / 16)  # ~607 for 1080p
+    current_crop_x = (width - crop_w) // 2  # Start centered
     
     for i, ts in enumerate(timestamps):
         frame = extract_frame_at_time(video_path, ts, temp_dir)
         if frame is None:
             # Hold last position if no frame
+            lost_count += 1
             if prev_center and smoothed_w > 0:
                 keyframes.append(FaceKeyframe(
                     timestamp=ts,
@@ -752,7 +777,32 @@ def track_faces(
                     confidence=0.5,
                 ))
                 detections_held += 1
+            prev_ts = ts
             continue
+        
+        # =====================================================================
+        # TIME-SCALED JUMP THRESHOLD (dt-aware)
+        # =====================================================================
+        dt = ts - prev_ts if i > 0 else sample_interval
+        base_max_jump = width * MAX_SPEED_RATIO_PER_SEC * dt
+        max_jump_px = int(max(width * MIN_JUMP_RATIO, min(base_max_jump, width * MAX_JUMP_RATIO)))
+        
+        # =====================================================================
+        # EDGE PRESSURE: Relax jump gate when face is near crop boundary
+        # =====================================================================
+        edge_pressure_active = False
+        if smoothed_w > 0 and smoothed_cx > 0:
+            # Calculate where current face center falls in crop window
+            face_in_crop_x = smoothed_cx - current_crop_x
+            left_margin = crop_w * EDGE_MARGIN_RATIO
+            right_margin = crop_w * (1 - EDGE_MARGIN_RATIO)
+            
+            if face_in_crop_x < left_margin or face_in_crop_x > right_margin:
+                max_jump_px = int(max_jump_px * EDGE_PRESSURE_MULTIPLIER)
+                edge_pressure_active = True
+                if DEBUG_FACE_TRACKING and i < 5:
+                    edge_side = "LEFT" if face_in_crop_x < left_margin else "RIGHT"
+                    print(f"      Edge pressure: face near {edge_side} edge, max_jump increased to {max_jump_px}px")
         
         # =====================================================================
         # DETECTION: DNN only for global, Haar only for ROI near prev_center
@@ -760,106 +810,166 @@ def track_faces(
         detection = detect_face_dnn(
             frame,
             prev_center=prev_center if prev_center else anchor_center,
+            max_jump_px=max_jump_px,  # Pass time-scaled + edge-pressure adjusted threshold
         )
         
         # HAAR ONLY AS ROI FALLBACK (not for global discovery)
         if detection is None and prev_center is not None:
-            # Haar only when we have a prev_center to search near
             detection = detect_face_haar(frame, prev_center=prev_center)
             if detection:
                 print(f"      Haar ROI fallback used (near prev_center)")
+        
+        # =====================================================================
+        # LOST MODE: Re-acquire after repeated misses
+        # =====================================================================
+        detection_accepted = False
         
         if detection:
             x, y, w, h, conf = detection
             cx = x + w // 2
             cy = y + h // 2
             
-            # Calculate fullcam score for this detection
             detection_score = _score_face_for_fullcam(x, y, w, h, width, height)
-            
-            # =========================================================
-            # MIN SIZE FILTER when setting anchor (prevents tiny face lock)
-            # =========================================================
             area_ratio = (w * h) / frame_area
             width_ratio = w / width
             
+            # Check if this is the first anchor
             if anchor_center is None:
-                # First detection - apply MIN SIZE filter before using as anchor
                 if area_ratio < min_area_ratio or width_ratio < min_width_ratio:
                     print(f"   ⚠️ Rejecting tiny face as anchor: {w}x{h} area={area_ratio:.4f} width={width_ratio:.3f}")
-                    continue  # Skip this detection, try next frame
-                
-                anchor_center = (cx, cy)
-                current_anchor_score = detection_score
-                print(f"   🎯 Anchor set at ({cx},{cy}) size={w}x{h} area={area_ratio:.3%} score={detection_score:.2f}")
-            
-            # =================================================================
-            # RE-ACQUIRE LOGIC: Check if there's a much better face
-            # =================================================================
-            # Only consider re-acquire if detection is far from current anchor (jump rejected)
-            if prev_center:
+                    lost_count += 1
+                else:
+                    anchor_center = (cx, cy)
+                    current_anchor_score = detection_score
+                    prev_center = (cx, cy)
+                    lost_count = 0
+                    detection_accepted = True
+                    print(f"   🎯 Anchor set at ({cx},{cy}) size={w}x{h} area={area_ratio:.3%} score={detection_score:.2f}")
+            else:
+                # Check jump distance
                 dist_to_prev = ((cx - prev_center[0]) ** 2 + (cy - prev_center[1]) ** 2) ** 0.5
-                max_jump_px = int(width * 0.18)
                 
-                if dist_to_prev > max_jump_px and detection_score > current_anchor_score + reacquire_threshold:
-                    # This is a potential re-acquire candidate
-                    y_ratio = cy / height
-                    x_ratio = cx / width
-                    print(f"   🔄 RE-ACQUIRE candidate: ({cx},{cy}) score={detection_score:.2f} vs current={current_anchor_score:.2f}")
-                    print(f"      y_ratio={y_ratio:.2f} x_ratio={x_ratio:.2f} dist={dist_to_prev:.0f}px")
+                if dist_to_prev <= max_jump_px:
+                    # ACCEPT detection - within jump threshold
+                    detection_accepted = True
+                    lost_count = 0
+                    prev_center = (cx, cy)
                     
-                    if reacquire_candidate and abs(cx - reacquire_candidate[0]) < width * 0.10:
-                        # Same face as previous re-acquire candidate - increment count
-                        reacquire_candidate = (cx, cy, w, h, detection_score, reacquire_candidate[5] + 1)
-                        print(f"      Consecutive re-acquire: {reacquire_candidate[5]} frames")
-                        
-                        if reacquire_candidate[5] >= reacquire_persistence:
-                            # SWITCH to the new face
-                            print(f"   🎯🎯 RE-ACQUIRE TRIGGERED! Switching anchor from score={current_anchor_score:.2f} to {detection_score:.2f}")
-                            anchor_center = (cx, cy)
-                            prev_center = (cx, cy)
-                            current_anchor_score = detection_score
-                            reacquire_candidate = None
-                            # Continue to use this detection
+                    # Update anchor score if this is a better face
+                    if detection_score > current_anchor_score:
+                        current_anchor_score = detection_score
+                        anchor_center = (cx, cy)
+                else:
+                    # Jump too large - check if it's a much better face for score-based re-acquire
+                    if detection_score > current_anchor_score + 0.20:
+                        # Better face found far away - accept it (score-based re-acquire)
+                        print(f"   🔄 Score-based re-acquire: ({cx},{cy}) score={detection_score:.2f} >> current={current_anchor_score:.2f}")
+                        detection_accepted = True
+                        lost_count = 0
+                        prev_center = (cx, cy)
+                        anchor_center = (cx, cy)
+                        current_anchor_score = detection_score
                     else:
-                        # New re-acquire candidate
-                        reacquire_candidate = (cx, cy, w, h, detection_score, 1)
+                        # Reject - too far and not clearly better
+                        lost_count += 1
+                        if DEBUG_FACE_TRACKING:
+                            print(f"      Jump rejected: {dist_to_prev:.0f}px > {max_jump_px}px (dt={dt:.2f}s)")
+        else:
+            # No detection at all
+            lost_count += 1
+        
+        # =====================================================================
+        # LOST MODE RE-ACQUIRE (after repeated misses)
+        # =====================================================================
+        if not detection_accepted and lost_count >= LOST_COUNT_THRESHOLD and smoothed_w > 0:
+            print(f"   🆘 LOST MODE: reacquiring (lost_count={lost_count})")
+            
+            # Try 1: Global DNN detection (no prev_center constraint)
+            global_detection = detect_face_dnn(frame, prev_center=None, confidence_threshold=0.35)
+            
+            if global_detection:
+                gx, gy, gw, gh, gconf = global_detection
+                gcx = gx + gw // 2
+                gcy = gy + gh // 2
+                global_score = _score_face_for_fullcam(gx, gy, gw, gh, width, height)
+                
+                if global_score >= REACQUIRE_MIN_SCORE:
+                    print(f"   ✅ LOST MODE: re-acquired via DNN at center=({gcx},{gcy}) score={global_score:.2f}")
+                    detection_accepted = True
+                    lost_count = 0
+                    prev_center = (gcx, gcy)
+                    anchor_center = (gcx, gcy)
+                    current_anchor_score = global_score
+                    x, y, w, h, conf = global_detection
+                    cx, cy = gcx, gcy
+                else:
+                    print(f"   ⚠️ LOST MODE: DNN found face but score={global_score:.2f} < {REACQUIRE_MIN_SCORE}")
+            
+            # Try 2: Gemini anchor as last resort
+            if not detection_accepted:
+                try:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                        cv2.imwrite(f.name, frame)
+                        frame_path_temp = f.name
                     
-                    # Still hold position while evaluating re-acquire
-                    if smoothed_w > 0:
-                        keyframes.append(FaceKeyframe(
-                            timestamp=ts,
-                            center_x=smoothed_cx,
-                            center_y=smoothed_cy,
-                            width=smoothed_w,
-                            height=smoothed_h,
-                            confidence=0.5,
-                        ))
-                        detections_held += 1
-                    continue
+                    from gemini_vision import get_fullcam_anchor_bbox_with_gemini
+                    gemini_result = get_fullcam_anchor_bbox_with_gemini(
+                        frame_path=frame_path_temp,
+                        video_width=width,
+                        video_height=height
+                    )
+                    
+                    os.unlink(frame_path_temp)
+                    
+                    if gemini_result and 'x' in gemini_result:
+                        gx = gemini_result['x']
+                        gy = gemini_result['y']
+                        gw = gemini_result['w']
+                        gh = gemini_result['h']
+                        gconf = gemini_result.get('confidence', 0.8)
+                        gcx = gx + gw // 2
+                        gcy = gy + gh // 2
+                        gemini_score = _score_face_for_fullcam(gx, gy, gw, gh, width, height)
+                        
+                        if gemini_score >= REACQUIRE_MIN_SCORE or gconf >= 0.85:
+                            print(f"   ✅ LOST MODE: re-acquired via GEMINI at center=({gcx},{gcy}) score={gemini_score:.2f} conf={gconf:.2f}")
+                            detection_accepted = True
+                            lost_count = 0
+                            prev_center = (gcx, gcy)
+                            anchor_center = (gcx, gcy)
+                            current_anchor_score = gemini_score
+                            x, y, w, h, conf = gx, gy, gw, gh, gconf
+                            cx, cy = gcx, gcy
+                        else:
+                            print(f"   ⚠️ LOST MODE: Gemini score={gemini_score:.2f} < threshold")
+                except Exception as e:
+                    print(f"   ❌ LOST MODE: Gemini failed: {e}")
             
-            # Clear re-acquire state if we got a normal detection
-            if reacquire_candidate:
-                # Detection was close to prev_center, not a re-acquire
-                reacquire_candidate = None
-            
-            # Update prev_center
-            prev_center = (cx, cy)
+            if not detection_accepted:
+                print(f"   ❌ LOST MODE: re-acquire failed, holding position")
+        
+        # =====================================================================
+        # UPDATE KEYFRAMES
+        # =====================================================================
+        if detection_accepted:
             detections_found += 1
             
-            # Apply EMA smoothing AFTER association (Task B)
+            # Apply EMA smoothing
             if smoothed_w == 0:
-                # First keyframe - initialize
                 smoothed_cx = cx
                 smoothed_cy = cy
                 smoothed_w = w
                 smoothed_h = h
             else:
-                # EMA with alpha=0.6 for responsiveness
                 smoothed_cx = int(0.6 * cx + 0.4 * smoothed_cx)
                 smoothed_cy = int(0.6 * cy + 0.4 * smoothed_cy)
                 smoothed_w = int(0.6 * w + 0.4 * smoothed_w)
                 smoothed_h = int(0.6 * h + 0.4 * smoothed_h)
+            
+            # Update crop_x for edge pressure calculation
+            current_crop_x = smoothed_cx - crop_w // 2
+            current_crop_x = max(0, min(current_crop_x, width - crop_w))
             
             keyframes.append(FaceKeyframe(
                 timestamp=ts,
@@ -870,9 +980,9 @@ def track_faces(
                 confidence=conf,
             ))
         else:
-            # No detection or jump rejected - HOLD last position
-            reacquire_candidate = None  # Clear re-acquire if no detection at all
-            if prev_center and smoothed_w > 0:
+            # HOLD last position
+            detections_held += 1
+            if smoothed_w > 0:
                 keyframes.append(FaceKeyframe(
                     timestamp=ts,
                     center_x=smoothed_cx,
@@ -881,7 +991,8 @@ def track_faces(
                     height=smoothed_h,
                     confidence=0.5,
                 ))
-                detections_held += 1
+        
+        prev_ts = ts
     
     if len(keyframes) == 0:
         print("   ⚠️ No faces detected in any frame")
