@@ -177,8 +177,19 @@ export async function updateTranscript(
   segment_count: number
   transcript_text: string
 }> {
-  return fetchAPI(`/api/jobs/${id}/transcript`, {
+  // Use local Next.js API route (keeps API key server-side)
+  const res = await fetch('/api/clips/transcript', {
     method: 'PATCH',
-    body: { segments },
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ jobId: id, segments }),
   })
+  
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error || `API Error: ${res.status}`)
+  }
+  
+  return res.json()
 }
