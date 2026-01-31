@@ -11,7 +11,6 @@ import {
   XCircle, 
   Loader2,
   Gamepad2,
-  Eye,
 } from 'lucide-react'
 import type { Job } from '@/lib/api'
 
@@ -91,15 +90,6 @@ export function ClipCard({ job, index }: ClipCardProps) {
               )}
             </div>
             
-            {/* View count badge (mock for now) */}
-            {isReady && (
-              <div className="absolute top-3 left-3 flex items-center gap-1 px-2 py-1 rounded-full bg-black/50 backdrop-blur-sm">
-                <Eye className="w-3 h-3 text-white/70" />
-                <span className="text-xs text-white/90 font-medium">
-                  {Math.floor(Math.random() * 100) + 10}K
-                </span>
-              </div>
-            )}
             
             {/* Play button overlay */}
             {isReady && (
