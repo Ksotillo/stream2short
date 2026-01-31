@@ -2,6 +2,7 @@ import { getSession } from '@/lib/auth'
 import { getJobs, getGames } from '@/lib/api'
 import { ClipCard, ClipGrid } from '@/components/clip-card'
 import { GameFilters } from '@/components/game-filters'
+import { GameSelect } from '@/components/game-select'
 import { StatusFilters } from '@/components/status-filters'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -191,25 +192,7 @@ export default async function ClipsPage({ searchParams }: PageProps) {
           {games.length > 0 && (
             <div className="flex items-center gap-2 ml-auto">
               <Filter className="w-4 h-4 text-muted-foreground" />
-              <select 
-                className="bg-secondary text-sm rounded-lg px-3 py-1.5 border-0 focus:ring-2 focus:ring-primary"
-                value={game || ''}
-                onChange={(e) => {
-                  const newGame = e.target.value
-                  const params = new URLSearchParams()
-                  if (status) params.set('status', status)
-                  if (review) params.set('review', review)
-                  if (newGame) params.set('game', newGame)
-                  window.location.href = `/clips?${params.toString()}`
-                }}
-              >
-                <option value="">All Games</option>
-                {games.map((g) => (
-                  <option key={g.game_id} value={g.game_id}>
-                    {g.game_name} ({g.count})
-                  </option>
-                ))}
-              </select>
+              <GameSelect games={games} currentGameId={game || null} />
             </div>
           )}
         </div>
