@@ -124,29 +124,57 @@ export async function getJob(id: string, includeEvents = false): Promise<{
 
 export async function reviewJob(
   id: string, 
-  status: 'approved' | 'rejected',
+  decision: 'approved' | 'rejected',
   notes?: string
 ): Promise<{ success: boolean; message: string }> {
-  return fetchAPI(`/api/jobs/${id}/review`, {
+  // Use local Next.js API route (keeps API key server-side)
+  const res = await fetch('/api/clips/review', {
     method: 'POST',
-    body: { status, notes },
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jobId: id, decision, notes }),
   })
+  
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error || `API Error: ${res.status}`)
+  }
+  
+  return res.json()
 }
 
 export async function retryJob(id: string): Promise<{ success: boolean; message: string }> {
-  return fetchAPI(`/api/jobs/${id}/retry`, {
+  // Use local Next.js API route (keeps API key server-side)
+  const res = await fetch('/api/clips/retry', {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jobId: id }),
   })
+  
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error || `API Error: ${res.status}`)
+  }
+  
+  return res.json()
 }
 
 export async function rerenderJob(
   id: string,
   preset: string
 ): Promise<{ success: boolean; message: string }> {
-  return fetchAPI(`/api/jobs/${id}/rerender`, {
+  // Use local Next.js API route (keeps API key server-side)
+  const res = await fetch('/api/clips/rerender', {
     method: 'POST',
-    body: { preset },
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jobId: id, preset }),
   })
+  
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error || `API Error: ${res.status}`)
+  }
+  
+  return res.json()
 }
 
 export async function processClip(
