@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { updateTranscript, TranscriptSegment } from '@/lib/api'
+import { updateTranscript, rerenderJob, TranscriptSegment } from '@/lib/api'
 import { 
   Save, 
   Loader2, 
@@ -13,6 +13,8 @@ import {
   AlertCircle,
   CheckCircle,
   Pencil,
+  RefreshCw,
+  X,
 } from 'lucide-react'
 
 interface TranscriptEditorProps {
@@ -39,8 +41,10 @@ export function TranscriptEditor({
 }: TranscriptEditorProps) {
   const [segments, setSegments] = useState<TranscriptSegment[]>(initialSegments || [])
   const [saving, setSaving] = useState(false)
+  const [rerendering, setRerendering] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [hasChanges, setHasChanges] = useState(false)
+  const [showRerenderPrompt, setShowRerenderPrompt] = useState(false)
   
   // Reset segments when initialSegments change
   useEffect(() => {
@@ -68,8 +72,8 @@ export function TranscriptEditor({
       const result = await updateTranscript(jobId, segments)
       setMessage({ type: 'success', text: result.message })
       setHasChanges(false)
-      // Refresh after short delay to show updated data
-      setTimeout(() => window.location.reload(), 1500)
+      // Show re-render prompt after successful save
+      setShowRerenderPrompt(true)
     } catch (error) {
       setMessage({ 
         type: 'error', 
@@ -78,6 +82,28 @@ export function TranscriptEditor({
     } finally {
       setSaving(false)
     }
+  }
+  
+  const handleRerender = async () => {
+    setRerendering(true)
+    try {
+      await rerenderJob(jobId, 'default')
+      setShowRerenderPrompt(false)
+      setMessage({ type: 'success', text: 'Re-render started! The page will refresh shortly...' })
+      setTimeout(() => window.location.reload(), 2000)
+    } catch (error) {
+      setMessage({ 
+        type: 'error', 
+        text: error instanceof Error ? error.message : 'Failed to start re-render' 
+      })
+    } finally {
+      setRerendering(false)
+    }
+  }
+  
+  const handleSkipRerender = () => {
+    setShowRerenderPrompt(false)
+    setTimeout(() => window.location.reload(), 500)
   }
   
   const handleReset = () => {
@@ -235,6 +261,48 @@ export function TranscriptEditor({
           </span>
         </div>
       </CardContent>
+      
+      {/* Re-render Prompt Modal */}
+      {showRerenderPrompt && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <Card className="w-full max-w-md">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <RefreshCw className="w-5 h-5" />
+                Re-render Video?
+              </CardTitle>
+              <CardDescription>
+                Your transcript changes have been saved. To see them in the video, 
+                you&apos;ll need to re-render the clip with the updated subtitles.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex justify-end gap-2">
+                <Button 
+                  variant="ghost" 
+                  onClick={handleSkipRerender}
+                  disabled={rerendering}
+                >
+                  Not now
+                </Button>
+                <Button 
+                  variant="default"
+                  onClick={handleRerender}
+                  disabled={rerendering}
+                  className="gap-2"
+                >
+                  {rerendering ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="w-4 h-4" />
+                  )}
+                  Re-render now
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </Card>
   )
 }
