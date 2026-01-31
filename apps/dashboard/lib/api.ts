@@ -26,6 +26,14 @@ async function fetchAPI<T>(endpoint: string, options: FetchOptions = {}): Promis
 }
 
 // Types
+export interface TranscriptSegment {
+  start: number
+  end: number
+  text: string
+  speaker?: string
+  is_primary?: boolean
+}
+
 export interface Job {
   id: string
   channel_id: string
@@ -35,6 +43,8 @@ export interface Job {
   final_video_url: string | null
   no_subtitles_url: string | null
   transcript_text: string | null
+  transcript_segments: TranscriptSegment[] | null
+  transcript_edited_at: string | null
   error: string | null
   requested_by: string | null
   review_status: string | null
@@ -155,5 +165,20 @@ export async function processClip(
       clip_url: clipUrl,
       requested_by: requestedBy || 'dashboard',
     },
+  })
+}
+
+export async function updateTranscript(
+  id: string,
+  segments: TranscriptSegment[]
+): Promise<{ 
+  success: boolean
+  message: string
+  segment_count: number
+  transcript_text: string
+}> {
+  return fetchAPI(`/api/jobs/${id}/transcript`, {
+    method: 'PATCH',
+    body: { segments },
   })
 }

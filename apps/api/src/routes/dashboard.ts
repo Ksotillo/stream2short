@@ -8,12 +8,14 @@ import {
   reviewJob,
   resetJobForRetry,
   updateJobPreset,
+  updateTranscriptSegments,
   getGamesForChannel,
   JobFilters,
   JobStatus,
   ReviewStatus,
   LastStage,
   RenderPreset,
+  TranscriptSegment,
 } from '../db.js';
 import { enqueueJob } from '../queue.js';
 
@@ -331,6 +333,57 @@ export async function dashboardRoutes(fastify: FastifyInstance): Promise<void> {
       success: true,
       message: `Job queued for re-render`,
       preset,
+    });
+  });
+  
+  // ============================================================================
+  // PATCH /api/jobs/:id/transcript - Update transcript segments (for editing)
+  // ============================================================================
+  fastify.patch('/api/jobs/:id/transcript', async (
+    request: FastifyRequest<{
+      Params: { id: string };
+      Body: {
+        segments: TranscriptSegment[];
+      };
+    }>,
+    reply
+  ) => {
+    const { id } = request.params;
+    const { segments } = request.body;
+    
+    // Validate segments
+    if (!segments || !Array.isArray(segments)) {
+      return reply.status(400).send({ error: 'segments must be an array' });
+    }
+    
+    // Validate each segment has required fields
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      if (typeof seg.start !== 'number' || typeof seg.end !== 'number' || typeof seg.text !== 'string') {
+        return reply.status(400).send({ 
+          error: `Invalid segment at index ${i}: must have start (number), end (number), and text (string)`,
+        });
+      }
+    }
+    
+    const job = await getJob(id);
+    if (!job) {
+      return reply.status(404).send({ error: 'Job not found' });
+    }
+    
+    // Update the segments
+    await updateTranscriptSegments(id, segments);
+    
+    // Reconstruct plain text for response
+    const transcriptText = segments.map(s => s.text).join(' ');
+    
+    fastify.log.info(`Job ${id} transcript updated with ${segments.length} segments`);
+    
+    return reply.send({
+      success: true,
+      message: 'Transcript updated successfully',
+      segment_count: segments.length,
+      transcript_text: transcriptText,
     });
   });
 }

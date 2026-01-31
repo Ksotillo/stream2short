@@ -218,25 +218,53 @@ def _process_job_stages(
         
         # Stage 4: Transcribe + Diarization
         current_stage = "transcribe"
-        update_job_status(job_id, "transcribing")
-        print("🎙️ Stage 4: Transcribing audio...")
-        log_job_event(job_id, "info", "Starting transcription", "transcribe")
         
         # Get channel settings for per-channel diarization toggle
         channel_settings = channel.get("settings", {}) or {}
         
-        # Get transcript segments (using preprocessed audio if available)
-        # Uses Groq API if configured, otherwise falls back to local Whisper
-        segments, transcript_text_raw = transcribe_with_segments(
-            video_path=raw_video_path,
-            audio_path=preprocessed_audio,  # Use normalized audio
-        )
+        # Check if we have stored segments (from previous transcription or editing)
+        # This allows re-rendering without re-transcribing
+        stored_segments = job.get("transcript_segments")
         
-        # Store transcript text for dashboard preview
-        update_job(job_id, transcript_text=transcript_text_raw)
+        if stored_segments and isinstance(stored_segments, list) and len(stored_segments) > 0:
+            # Use stored/edited segments - skip transcription
+            print("📝 Stage 4: Using stored transcript segments (skipping transcription)...")
+            log_job_event(job_id, "info", "Using stored transcript segments", "transcribe")
+            
+            segments = stored_segments
+            # Reconstruct transcript text from segments
+            transcript_text_raw = " ".join(s.get("text", "") for s in segments)
+            
+            print(f"✅ Loaded {len(segments)} stored segments")
+        else:
+            # Normal transcription flow
+            update_job_status(job_id, "transcribing")
+            print("🎙️ Stage 4: Transcribing audio...")
+            log_job_event(job_id, "info", "Starting transcription", "transcribe")
+            
+            # Get transcript segments (using preprocessed audio if available)
+            # Uses Groq API if configured, otherwise falls back to local Whisper
+            segments, transcript_text_raw = transcribe_with_segments(
+                video_path=raw_video_path,
+                audio_path=preprocessed_audio,  # Use normalized audio
+            )
+            
+            # Convert segments to serializable format for storage
+            segments_for_db = [
+                {
+                    "start": float(s.get("start", 0)),
+                    "end": float(s.get("end", 0)),
+                    "text": s.get("text", ""),
+                }
+                for s in segments
+            ]
+            
+            # Store transcript text AND segments for dashboard editing/re-renders
+            update_job(job_id, transcript_text=transcript_text_raw, transcript_segments=segments_for_db)
+            log_job_event(job_id, "info", f"Transcription complete: {len(segments)} segments", "transcribe")
+            print(f"✅ Transcription complete: {len(segments)} segments")
+        
         update_last_stage(job_id, "transcribe")
-        log_job_event(job_id, "info", f"Transcription complete: {len(segments)} segments", "transcribe")
-        print(f"✅ Transcription complete: {len(segments)} segments")
         
         # Stage 4b: Speaker diarization (if enabled)
         diarization_result: Optional[DiarizationResult] = None
@@ -277,6 +305,21 @@ def _process_job_stages(
                 other_count = len(segments) - primary_count
                 speakers_found = list(set(s.get('speaker', 'UNKNOWN') for s in segments))
                 print(f"📊 Speaker distribution: {primary_count} primary, {other_count} other ({len(speakers_found)} speakers)")
+                
+                # Update stored segments with speaker info (only if we just transcribed, not using stored)
+                if not stored_segments:
+                    segments_for_db = [
+                        {
+                            "start": float(s.get("start", 0)),
+                            "end": float(s.get("end", 0)),
+                            "text": s.get("text", ""),
+                            "speaker": s.get("speaker"),
+                            "is_primary": s.get("is_primary", True),
+                        }
+                        for s in segments
+                    ]
+                    update_job(job_id, transcript_segments=segments_for_db)
+                    print("📝 Updated stored segments with speaker info")
         except Exception as e:
             print(f"⚠️ Diarization skipped: {e}")
         

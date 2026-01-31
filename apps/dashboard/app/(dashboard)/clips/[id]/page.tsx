@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import Link from 'next/link'
 import { formatDate } from '@/lib/utils'
 import { ClipActions } from './ClipActions'
+import { TranscriptEditor } from '@/components/transcript-editor'
 import { 
   ArrowLeft, 
   ExternalLink, 
@@ -202,18 +203,15 @@ export default async function ClipDetailPage({ params }: PageProps) {
         </div>
       </div>
       
-      {/* Transcript */}
-      {job.transcript_text && (
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base">Transcript</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm leading-relaxed text-muted-foreground">
-              {job.transcript_text}
-            </p>
-          </CardContent>
-        </Card>
+      {/* Transcript Editor */}
+      {(job.transcript_text || job.transcript_segments) && (
+        <TranscriptEditor
+          jobId={job.id}
+          segments={job.transcript_segments}
+          transcriptText={job.transcript_text}
+          editedAt={job.transcript_edited_at}
+          canEdit={job.status === 'ready'}
+        />
       )}
       
       {/* Processing Log */}

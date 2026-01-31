@@ -35,6 +35,15 @@ export type ReviewStatus = 'pending' | 'approved' | 'rejected';
 export type LastStage = 'download' | 'transcribe' | 'render' | 'upload';
 export type RenderPreset = 'default' | 'clean' | 'boxed' | 'minimal' | 'bold';
 
+// Transcript segment with timing info
+export interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+  speaker?: string;
+  is_primary?: boolean;
+}
+
 export interface ClipJob {
   id: string;
   channel_id: string;
@@ -58,6 +67,9 @@ export interface ClipJob {
   last_stage: LastStage | null;
   render_preset: RenderPreset;
   transcript_text: string | null;
+  // Transcript editing
+  transcript_segments: TranscriptSegment[] | null;
+  transcript_edited_at: string | null;
 }
 
 export interface JobEvent {
@@ -431,6 +443,29 @@ export async function updateJob(jobId: string, updates: Partial<ClipJob>): Promi
     .eq('id', jobId);
   
   if (error) throw new Error(`Failed to update job: ${error.message}`);
+}
+
+/**
+ * Update transcript segments (for editing from dashboard)
+ * Also updates the plain text transcript from segments
+ */
+export async function updateTranscriptSegments(
+  jobId: string,
+  segments: TranscriptSegment[]
+): Promise<void> {
+  // Reconstruct plain text from segments
+  const transcriptText = segments.map(s => s.text).join(' ');
+  
+  const { error } = await supabase
+    .from('clip_jobs')
+    .update({
+      transcript_segments: segments,
+      transcript_text: transcriptText,
+      transcript_edited_at: new Date().toISOString(),
+    })
+    .eq('id', jobId);
+  
+  if (error) throw new Error(`Failed to update transcript: ${error.message}`);
 }
 
 // ============================================================================

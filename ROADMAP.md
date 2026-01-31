@@ -127,6 +127,33 @@ ALTER TABLE clip_jobs ADD COLUMN thumbnail_url TEXT;
 ### 1.5 Retry + Re-render Mechanics
 - **Status:** ✅ Complete
 
+### 1.6 Transcript Editing
+- **Status:** ✅ Complete
+- **Effort:** ~3 hours
+
+**Features:**
+- ✅ View transcript segments with timing info
+- ✅ Edit subtitle text per segment (preserves timing)
+- ✅ Save edited transcript to database
+- ✅ Re-render uses edited transcript (skips re-transcription)
+- ✅ Visual indication of edited transcripts
+
+**Database:**
+```sql
+ALTER TABLE clip_jobs ADD COLUMN transcript_segments JSONB;
+ALTER TABLE clip_jobs ADD COLUMN transcript_edited_at TIMESTAMPTZ;
+```
+
+**API:**
+```
+PATCH /api/jobs/:id/transcript → { segments: [...] }
+```
+
+**Future Improvements:**
+- Timeline-based editor with waveform visualization
+- Video preview synced to transcript position
+- Bulk editing / find-and-replace across segments
+
 ### Phase 1 Acceptance Criteria
 - [x] Dashboard shows jobs for multiple streamers
 - [x] Can preview WITH/WITHOUT subtitles
@@ -136,6 +163,7 @@ ALTER TABLE clip_jobs ADD COLUMN thumbnail_url TEXT;
 - [x] **BONUS:** Twitch OAuth login (streamers see only their clips)
 - [x] **BONUS:** Mobile-friendly UI with bottom navigation
 - [x] **BONUS:** Game category filtering
+- [x] **BONUS:** Transcript editing and re-render with changes
 - [ ] ~~Discord notification fires on job completion~~ (skipped)
 
 ---
@@ -391,6 +419,7 @@ These features were implemented outside the original roadmap:
 | **Mobile UI Redesign** | TikTok/Instagram-style mobile experience | ✅ Done |
 | **Layout Caching** | Skip re-detection on re-renders | ✅ Done |
 | **Force Reprocess** | Bypass duplicate detection for testing | ✅ Done |
+| **Transcript Editing** | Edit subtitles in dashboard and re-render with changes | ✅ Done |
 
 ---
 
@@ -412,6 +441,7 @@ These features were implemented outside the original roadmap:
 3. Safe zones (Phase 2.3) - ~1 hour
 4. Blur background template (Phase 3.3) - ~2 hours
 5. Discord notifications (Phase 1.4) - ~1 hour
+6. Advanced transcript editor (timeline-based, waveform visualization) - ~4-6 hours
 
 ### Future
 6. VOD extraction (Phase 5.1) - ~3 hours
