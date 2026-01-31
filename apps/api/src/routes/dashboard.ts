@@ -18,6 +18,7 @@ import {
   TranscriptSegment,
 } from '../db.js';
 import { enqueueJob } from '../queue.js';
+import { getGamesInfo } from '../twitch.js';
 
 // Middleware to verify dashboard API key
 async function verifyDashboardApiKey(
@@ -146,6 +147,25 @@ export async function dashboardRoutes(fastify: FastifyInstance): Promise<void> {
     }
     
     const games = await getGamesForChannel(channel_id);
+    
+    // Find games missing box art and fetch from Twitch
+    const gamesMissingArt = games.filter(g => !g.box_art_url);
+    if (gamesMissingArt.length > 0) {
+      try {
+        const gameIds = gamesMissingArt.map(g => g.game_id);
+        const twitchGames = await getGamesInfo(gameIds);
+        
+        // Update games with fetched box art
+        for (const game of games) {
+          if (!game.box_art_url && twitchGames.has(game.game_id)) {
+            game.box_art_url = twitchGames.get(game.game_id)!.box_art_url;
+          }
+        }
+      } catch (error) {
+        // Log but don't fail - box art is nice to have, not required
+        fastify.log.warn({ error }, 'Failed to fetch game box art from Twitch');
+      }
+    }
     
     return reply.send({ games });
   });

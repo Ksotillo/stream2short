@@ -231,3 +231,119 @@ export function getClipDownloadUrl(thumbnailUrl: string): string {
   return downloadUrl;
 }
 
+// ============================================================================
+// App Access Token (for API calls that don't require user auth)
+// ============================================================================
+let cachedAppToken: { token: string; expiresAt: Date } | null = null;
+
+export async function getAppAccessToken(): Promise<string> {
+  // Check if we have a valid cached token
+  if (cachedAppToken && cachedAppToken.expiresAt > new Date()) {
+    return cachedAppToken.token;
+  }
+  
+  // Get new app access token using client credentials
+  const response = await fetch(`${TWITCH_AUTH_URL}/token`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({
+      client_id: config.twitch.clientId,
+      client_secret: config.twitch.clientSecret,
+      grant_type: 'client_credentials',
+    }),
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Failed to get app access token: ${await response.text()}`);
+  }
+  
+  const data = await response.json() as { 
+    access_token: string; 
+    expires_in: number;
+    token_type: string;
+  };
+  
+  // Cache the token (with 1 minute buffer)
+  cachedAppToken = {
+    token: data.access_token,
+    expiresAt: new Date(Date.now() + (data.expires_in - 60) * 1000),
+  };
+  
+  return data.access_token;
+}
+
+// Get game info by ID (includes box art)
+export async function getGameInfo(gameId: string): Promise<{
+  id: string;
+  name: string;
+  box_art_url: string;
+} | null> {
+  const accessToken = await getAppAccessToken();
+  
+  const response = await fetch(`${TWITCH_API_URL}/games?id=${gameId}`, {
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Client-Id': config.twitch.clientId,
+    },
+  });
+  
+  if (!response.ok) {
+    return null;
+  }
+  
+  const data = await response.json() as { data: Array<{
+    id: string;
+    name: string;
+    box_art_url: string;
+  }> };
+  
+  if (!data.data || data.data.length === 0) {
+    return null;
+  }
+  
+  return data.data[0];
+}
+
+// Get multiple games info by IDs
+export async function getGamesInfo(gameIds: string[]): Promise<Map<string, {
+  id: string;
+  name: string;
+  box_art_url: string;
+}>> {
+  if (gameIds.length === 0) {
+    return new Map();
+  }
+  
+  const accessToken = await getAppAccessToken();
+  
+  // Twitch allows up to 100 IDs per request
+  const params = new URLSearchParams();
+  gameIds.slice(0, 100).forEach(id => params.append('id', id));
+  
+  const response = await fetch(`${TWITCH_API_URL}/games?${params.toString()}`, {
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Client-Id': config.twitch.clientId,
+    },
+  });
+  
+  if (!response.ok) {
+    return new Map();
+  }
+  
+  const data = await response.json() as { data: Array<{
+    id: string;
+    name: string;
+    box_art_url: string;
+  }> };
+  
+  const result = new Map<string, { id: string; name: string; box_art_url: string }>();
+  for (const game of data.data || []) {
+    result.set(game.id, game);
+  }
+  
+  return result;
+}
+
