@@ -58,12 +58,12 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # Python Worker
+  # Python Worker (can be scaled with: docker compose up -d --scale worker=N)
   worker:
     build:
       context: ./apps/worker
       dockerfile: Dockerfile
-    container_name: stream2short-worker
+    # Note: container_name removed to allow scaling (each instance needs unique name)
     environment:
       - REDIS_URL=redis://redis:6379/0
       - SUPABASE_URL=${SUPABASE_URL}
