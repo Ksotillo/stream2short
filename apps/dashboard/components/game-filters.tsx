@@ -4,7 +4,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import { Gamepad2, Sparkles } from 'lucide-react'
-import type { Game } from '@/lib/api'
+import { formatBoxArtUrl, type Game } from '@/lib/api'
 
 // Game category icons/colors mapping
 const gameStyles: Record<string, { color: string; gradient: string }> = {
@@ -95,6 +95,7 @@ export function GameFilters({ games, selectedGameId }: GameFiltersProps) {
         {games.map((game) => {
           const isSelected = selectedGameId === game.game_id
           const style = getGameStyle(game.game_name)
+          const boxArtUrl = formatBoxArtUrl(game.box_art_url, 56, 75)
           
           return (
             <motion.button
@@ -105,17 +106,27 @@ export function GameFilters({ games, selectedGameId }: GameFiltersProps) {
             >
               <div
                 className={cn(
-                  'w-14 h-14 rounded-2xl flex items-center justify-center transition-all duration-200',
+                  'w-14 h-14 rounded-2xl flex items-center justify-center transition-all duration-200 overflow-hidden',
                   isSelected
-                    ? `bg-gradient-to-br ${style.gradient} ring-2 ring-offset-2 ring-offset-black`
-                    : 'bg-white/10 hover:bg-white/15'
+                    ? 'ring-2 ring-offset-2 ring-offset-black ring-violet-400'
+                    : 'ring-1 ring-white/10 hover:ring-white/20',
+                  !boxArtUrl && (isSelected
+                    ? `bg-gradient-to-br ${style.gradient}`
+                    : 'bg-white/10 hover:bg-white/15')
                 )}
-                style={isSelected ? { '--tw-ring-color': style.color } as React.CSSProperties : undefined}
               >
-                <Gamepad2 className={cn(
-                  'w-6 h-6',
-                  isSelected ? 'text-white' : 'text-white/70'
-                )} />
+                {boxArtUrl ? (
+                  <img
+                    src={boxArtUrl}
+                    alt={game.game_name}
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <Gamepad2 className={cn(
+                    'w-6 h-6',
+                    isSelected ? 'text-white' : 'text-white/70'
+                  )} />
+                )}
               </div>
               <span className={cn(
                 'text-xs font-medium truncate max-w-[72px] text-center',

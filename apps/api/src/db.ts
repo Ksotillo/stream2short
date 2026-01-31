@@ -70,6 +70,11 @@ export interface ClipJob {
   // Transcript editing
   transcript_segments: TranscriptSegment[] | null;
   transcript_edited_at: string | null;
+  // Game info
+  game_id: string | null;
+  game_name: string | null;
+  game_box_art_url: string | null;
+  thumbnail_url: string | null;
 }
 
 export interface JobEvent {
@@ -294,11 +299,11 @@ export async function getJobsWithFilters(filters: JobFilters): Promise<{ jobs: C
 /**
  * Get unique games for a channel (for filter UI)
  */
-export async function getGamesForChannel(channelId: string): Promise<Array<{ game_id: string; game_name: string; count: number }>> {
+export async function getGamesForChannel(channelId: string): Promise<Array<{ game_id: string; game_name: string; box_art_url: string | null; count: number }>> {
   // Get all games with counts
   const { data, error } = await supabase
     .from('clip_jobs')
-    .select('game_id, game_name')
+    .select('game_id, game_name, game_box_art_url')
     .eq('channel_id', channelId)
     .not('game_id', 'is', null)
     .not('game_name', 'is', null);
@@ -306,7 +311,7 @@ export async function getGamesForChannel(channelId: string): Promise<Array<{ gam
   if (error || !data) return [];
   
   // Aggregate by game
-  const gameMap = new Map<string, { game_id: string; game_name: string; count: number }>();
+  const gameMap = new Map<string, { game_id: string; game_name: string; box_art_url: string | null; count: number }>();
   
   for (const job of data) {
     const key = job.game_id;
@@ -314,10 +319,15 @@ export async function getGamesForChannel(channelId: string): Promise<Array<{ gam
     
     if (gameMap.has(key)) {
       gameMap.get(key)!.count++;
+      // Update box_art_url if we have a newer one
+      if (job.game_box_art_url && !gameMap.get(key)!.box_art_url) {
+        gameMap.get(key)!.box_art_url = job.game_box_art_url;
+      }
     } else {
       gameMap.set(key, {
         game_id: job.game_id,
         game_name: job.game_name || 'Unknown Game',
+        box_art_url: job.game_box_art_url || null,
         count: 1,
       });
     }

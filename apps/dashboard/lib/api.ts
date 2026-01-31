@@ -62,7 +62,14 @@ export interface Job {
 export interface Game {
   game_id: string
   game_name: string
+  box_art_url: string | null
   count: number
+}
+
+// Helper to format Twitch box art URL with dimensions
+export function formatBoxArtUrl(url: string | null, width = 40, height = 53): string | null {
+  if (!url) return null
+  return url.replace('{width}', width.toString()).replace('{height}', height.toString())
 }
 
 export interface JobEvent {

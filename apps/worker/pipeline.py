@@ -169,6 +169,10 @@ def _process_job_stages(
                 game_info = get_game_info(game_id, access_token)
                 if game_info:
                     clip_updates["game_name"] = game_info.get("name")
+                    # Save box art URL (template has {width}x{height} placeholders)
+                    box_art_url = game_info.get("box_art_url")
+                    if box_art_url:
+                        clip_updates["game_box_art_url"] = box_art_url
                     print(f"🎮 Game: {game_info.get('name')} (ID: {game_id})")
             except Exception as e:
                 print(f"⚠️ Failed to fetch game info: {e}")
