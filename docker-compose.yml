@@ -1,11 +1,12 @@
 services:
-  # Caddy - Reverse proxy with automatic HTTPS (on different ports)
+  # Caddy - Reverse proxy with automatic HTTPS (Let's Encrypt)
   caddy:
     image: caddy:2-alpine
     container_name: stream2short-caddy
     ports:
-      - "3080:80"        # API HTTP
-      - "3443:443"       # API HTTPS
+      - "80:80"          # HTTP (for Let's Encrypt challenge + redirect)
+      - "443:443"        # HTTPS
+      - "3080:80"        # Keep old port for backwards compatibility
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data

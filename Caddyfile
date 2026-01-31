@@ -1,16 +1,15 @@
 {
-    auto_https off
     admin off
 }
 
-# API (ports 80/443 inside container -> 3080/3443 on host)
-:443 {
-    tls internal {
-        on_demand
-    }
+# API with automatic HTTPS via Let's Encrypt
+# Replace YOUR_DOMAIN with your actual domain (e.g., api.yourdomain.com)
+# Or use the Azure domain: shell-n8n.northcentralus.cloudapp.azure.com
+shell-n8n.northcentralus.cloudapp.azure.com {
     reverse_proxy api:3000
 }
 
+# Fallback for direct port access (HTTP only, for internal/testing)
 :80 {
     reverse_proxy api:3000
 }

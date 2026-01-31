@@ -26,3 +26,5 @@ COMMENT ON COLUMN clip_jobs.transcript_segments IS
 
 COMMENT ON COLUMN clip_jobs.transcript_edited_at IS 
     'Timestamp of when the transcript was last manually edited. NULL means not edited.';
+
+
