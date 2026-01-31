@@ -51,10 +51,10 @@ export default async function ClipDetailPage({ params }: PageProps) {
   
   if (error || !job) {
     return (
-      <div className="flex flex-col items-center justify-center py-12">
+      <div className="flex flex-col items-center justify-center py-12 px-4">
         <AlertCircle className="w-12 h-12 text-destructive mb-4" />
         <h2 className="text-xl font-semibold mb-2">Error</h2>
-        <p className="text-muted-foreground mb-4">{error || 'Clip not found'}</p>
+        <p className="text-muted-foreground mb-4 text-center">{error || 'Clip not found'}</p>
         <Link href="/clips">
           <Button variant="outline" className="gap-2">
             <ArrowLeft className="w-4 h-4" />
@@ -66,7 +66,7 @@ export default async function ClipDetailPage({ params }: PageProps) {
   }
   
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 sm:space-y-6 px-4 sm:px-0 py-4 sm:py-0">
       {/* Back button */}
       <Link href="/clips" className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors">
         <ArrowLeft className="w-4 h-4" />
@@ -74,16 +74,16 @@ export default async function ClipDetailPage({ params }: PageProps) {
       </Link>
       
       {/* Header */}
-      <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+      <div className="flex flex-col gap-3">
         <div>
-          <div className="flex items-center gap-3 mb-2">
-            <h1 className="text-2xl font-bold">Clip Details</h1>
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3 mb-2">
+            <h1 className="text-xl sm:text-2xl font-bold">Clip Details</h1>
             <StatusBadge status={job.status} />
             {job.review_status && (
               <ReviewBadge status={job.review_status} />
             )}
           </div>
-          <p className="text-sm text-muted-foreground font-mono">{job.id}</p>
+          <p className="text-xs sm:text-sm text-muted-foreground font-mono break-all">{job.id}</p>
         </div>
         
         <ClipActions job={job} />
