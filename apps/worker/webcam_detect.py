@@ -45,15 +45,18 @@ class BBoxCandidate:
 class WebcamRegion:
     """Represents a detected webcam region in the video."""
     
-    def __init__(self, x: int, y: int, width: int, height: int, position: str):
-        self.x = x
-        self.y = y
-        self.width = width
-        self.height = height
-        self.position = position  # 'top-left', 'top-right', 'bottom-left', 'bottom-right'
+    def __init__(self, x: int, y: int, width: int, height: int, position: str,
+                 gemini_type: str = 'unknown', gemini_confidence: float = 0.0):
+        self.x = int(x)
+        self.y = int(y)
+        self.width = int(width)
+        self.height = int(height)
+        self.position = position  # 'top-left', 'top-right', 'bottom-left', 'bottom-right', 'full'
+        self.gemini_type = gemini_type  # 'corner_overlay', 'top_band', 'bottom_band', 'center_box', 'full_cam', 'none'
+        self.gemini_confidence = float(gemini_confidence)
     
     def __repr__(self):
-        return f"WebcamRegion({self.position}: x={self.x}, y={self.y}, w={self.width}, h={self.height})"
+        return f"WebcamRegion({self.position}: x={self.x}, y={self.y}, w={self.width}, h={self.height}, type={self.gemini_type})"
     
     def to_ffmpeg_crop(self) -> str:
         """Return FFmpeg crop filter string."""
@@ -62,11 +65,13 @@ class WebcamRegion:
     def to_dict(self) -> Dict[str, any]:
         """Convert to dictionary for JSON serialization."""
         return {
-            'x': self.x,
-            'y': self.y,
-            'width': self.width,
-            'height': self.height,
-            'position': self.position
+            'x': _to_python_scalar(self.x),
+            'y': _to_python_scalar(self.y),
+            'width': _to_python_scalar(self.width),
+            'height': _to_python_scalar(self.height),
+            'position': self.position,
+            'gemini_type': self.gemini_type,
+            'gemini_confidence': _to_python_scalar(self.gemini_confidence),
         }
     
     @classmethod
@@ -77,7 +82,9 @@ class WebcamRegion:
             y=data['y'],
             width=data['width'],
             height=data['height'],
-            position=data['position']
+            position=data['position'],
+            gemini_type=data.get('gemini_type', 'unknown'),
+            gemini_confidence=data.get('gemini_confidence', 0.0),
         )
 
 
@@ -105,6 +112,25 @@ class FaceCenter:
         return cls(x=data['x'], y=data['y'], width=data['width'], height=data['height'])
 
 
+def _to_python_scalar(val):
+    """Convert numpy scalar types to Python native types for JSON serialization."""
+    if val is None:
+        return None
+    if hasattr(val, 'item'):  # numpy scalar
+        return val.item()
+    if isinstance(val, (int, float, str, bool)):
+        return val
+    # Try to convert to appropriate type
+    try:
+        if isinstance(val, (np.integer,)):
+            return int(val)
+        if isinstance(val, (np.floating,)):
+            return float(val)
+    except:
+        pass
+    return val
+
+
 @dataclass
 class LayoutInfo:
     """
@@ -112,14 +138,17 @@ class LayoutInfo:
     
     Layouts:
     - FULL_CAM: Entire clip is webcam (no gameplay). Use full-frame crop.
-    - SPLIT: Traditional webcam + gameplay split layout.
+    - TOP_BAND: Wide webcam band at top with gameplay below. Source is already stacked.
+    - SPLIT: Traditional webcam + gameplay split layout (corner overlay).
     - NO_WEBCAM: No webcam detected. Use simple center crop.
     """
-    layout: str  # 'FULL_CAM', 'SPLIT', 'NO_WEBCAM'
+    layout: str  # 'FULL_CAM', 'TOP_BAND', 'SPLIT', 'NO_WEBCAM'
     webcam_region: Optional[WebcamRegion]
     face_center: Optional[FaceCenter]
     reason: str
     bbox_area_ratio: float = 0.0
+    gemini_type: str = 'unknown'  # Type from Gemini detection
+    confidence: float = 0.0  # Detection confidence
     
     def to_dict(self) -> Dict:
         return {
@@ -127,7 +156,9 @@ class LayoutInfo:
             'webcam_region': self.webcam_region.to_dict() if self.webcam_region else None,
             'face_center': self.face_center.to_dict() if self.face_center else None,
             'reason': self.reason,
-            'bbox_area_ratio': self.bbox_area_ratio,
+            'bbox_area_ratio': _to_python_scalar(self.bbox_area_ratio),
+            'gemini_type': self.gemini_type,
+            'confidence': _to_python_scalar(self.confidence),
         }
     
     @classmethod
@@ -138,6 +169,8 @@ class LayoutInfo:
             face_center=FaceCenter.from_dict(data['face_center']) if data.get('face_center') else None,
             reason=data['reason'],
             bbox_area_ratio=data.get('bbox_area_ratio', 0.0),
+            gemini_type=data.get('gemini_type', 'unknown'),
+            confidence=data.get('confidence', 0.0),
         )
 
 
@@ -147,9 +180,17 @@ def classify_layout(
     corner: Optional[str],
     video_width: int,
     video_height: int,
+    gemini_type: str = 'unknown',
+    gemini_confidence: float = 0.0,
 ) -> Tuple[str, str, float]:
     """
     Classify the video layout based on webcam bbox and frame analysis.
+    
+    Supports layouts:
+    - FULL_CAM: Entire clip is webcam (>70% or Gemini type is full_cam)
+    - TOP_BAND: Wide webcam band at top (width >= 55%, height 18-60%, near top)
+    - SPLIT: Traditional corner overlay (area 3-30%, in a corner zone)
+    - NO_WEBCAM: No webcam detected
     
     Args:
         frame_bgr: BGR frame from video
@@ -157,81 +198,83 @@ def classify_layout(
         corner: Detected corner ('top-left', 'top-right', etc.) or None
         video_width: Full frame width
         video_height: Full frame height
+        gemini_type: Type from Gemini detection (corner_overlay, top_band, etc.)
+        gemini_confidence: Confidence from Gemini detection
     
     Returns:
         Tuple of (layout, reason, bbox_area_ratio)
-        layout: 'FULL_CAM', 'SPLIT', or 'NO_WEBCAM'
+        layout: 'FULL_CAM', 'TOP_BAND', 'SPLIT', or 'NO_WEBCAM'
     """
     if webcam_bbox is None:
         return 'NO_WEBCAM', 'No webcam detected', 0.0
     
     # Special case: 'full' position means the entire frame is the camera (FULL_CAM)
-    # This is set when Gemini found no overlay but we detected a face in full frame
     if corner == 'full':
         return 'FULL_CAM', 'Full frame is camera (no overlay detected, face found)', 1.0
     
     # Extract bbox dimensions
-    bx = webcam_bbox.get('x', 0)
-    by = webcam_bbox.get('y', 0)
-    bw = webcam_bbox.get('width', 0)
-    bh = webcam_bbox.get('height', 0)
+    bx = int(webcam_bbox.get('x', 0))
+    by = int(webcam_bbox.get('y', 0))
+    bw = int(webcam_bbox.get('width', 0))
+    bh = int(webcam_bbox.get('height', 0))
     
     if bw <= 0 or bh <= 0:
         return 'NO_WEBCAM', 'Invalid webcam dimensions', 0.0
     
+    # Compute key ratios
     frame_area = video_width * video_height
     bbox_area = bw * bh
     bbox_area_ratio = bbox_area / frame_area
+    width_ratio = bw / video_width
+    height_ratio = bh / video_height
     outside_area_ratio = 1.0 - bbox_area_ratio
     
     # Edge touching tolerance
     tol_x = int(video_width * 0.03)  # 3% of width
     tol_y = int(video_height * 0.03)  # 3% of height
     
-    # Check if bbox touches 2 adjacent edges (corner behavior)
+    # Check if bbox touches edges
     touches_top = by <= tol_y
     touches_bottom = (by + bh) >= (video_height - tol_y)
     touches_left = bx <= tol_x
     touches_right = (bx + bw) >= (video_width - tol_x)
     
-    bbox_touches_edges = (
+    # Check if in corner zone
+    is_in_corner = (
         (touches_top and touches_left) or
         (touches_top and touches_right) or
         (touches_bottom and touches_left) or
         (touches_bottom and touches_right)
     )
     
+    # Check if near top (y within top 25% of frame)
+    y_center = by + bh / 2
+    is_near_top = y_center < video_height * 0.40  # Center in top 40%
+    is_near_bottom = y_center > video_height * 0.60  # Center in bottom 40%
+    
     print(f"  📊 Layout classifier:")
+    print(f"     Gemini type: {gemini_type}, confidence: {gemini_confidence:.2f}")
+    print(f"     bbox: {bw}x{bh} at ({bx},{by})")
+    print(f"     width_ratio: {width_ratio:.2%}, height_ratio: {height_ratio:.2%}")
     print(f"     bbox_area_ratio: {bbox_area_ratio:.2%}")
-    print(f"     outside_area_ratio: {outside_area_ratio:.2%}")
-    print(f"     touches_edges: {bbox_touches_edges} (top={touches_top}, bottom={touches_bottom}, left={touches_left}, right={touches_right})")
+    print(f"     touches: top={touches_top}, bottom={touches_bottom}, left={touches_left}, right={touches_right}")
+    print(f"     is_in_corner: {is_in_corner}, is_near_top: {is_near_top}")
     
     # ==========================================================================
-    # HEURISTIC 1: Webcam dominates frame (>= 72%)
+    # RULE 1: FULL_CAM - Gemini explicitly says full_cam OR very large bbox
     # ==========================================================================
-    if bbox_area_ratio >= 0.72:
-        reason = f"FULL_CAM because bbox_area_ratio={bbox_area_ratio:.2%} >= 72%"
+    if gemini_type == 'full_cam':
+        reason = f"FULL_CAM: Gemini detected full_cam type (conf={gemini_confidence:.2f})"
+        print(f"     ✅ {reason}")
+        return 'FULL_CAM', reason, bbox_area_ratio
+    
+    if bbox_area_ratio >= 0.70:
+        reason = f"FULL_CAM: bbox_area_ratio={bbox_area_ratio:.2%} >= 70%"
         print(f"     ✅ {reason}")
         return 'FULL_CAM', reason, bbox_area_ratio
     
     # ==========================================================================
-    # HEURISTIC 2: Large webcam (>= 60%) with edge touching and little outside content
-    # ==========================================================================
-    if bbox_area_ratio >= 0.60 and outside_area_ratio <= 0.40 and bbox_touches_edges:
-        # Additional check: verify outside area has low complexity (no game UI)
-        edge_density_outside = _compute_edge_density_outside(
-            frame_bgr, bx, by, bw, bh, video_width, video_height
-        )
-        print(f"     edge_density_outside: {edge_density_outside:.4f}")
-        
-        # Low complexity threshold (tunable)
-        if edge_density_outside < 0.08:  # Less than 8% edge density
-            reason = f"FULL_CAM because bbox_area_ratio={bbox_area_ratio:.2%}, outside_area low complexity ({edge_density_outside:.4f})"
-            print(f"     ✅ {reason}")
-            return 'FULL_CAM', reason, bbox_area_ratio
-    
-    # ==========================================================================
-    # HEURISTIC 3: Additional check for very high area ratio with moderate outside complexity
+    # RULE 2: Large webcam (>= 60%) with low outside complexity -> FULL_CAM
     # ==========================================================================
     if bbox_area_ratio >= 0.55:
         edge_density_outside = _compute_edge_density_outside(
@@ -239,14 +282,72 @@ def classify_layout(
         )
         print(f"     edge_density_outside: {edge_density_outside:.4f}")
         
-        # Very low complexity suggests full cam even at 55-60%
-        if edge_density_outside < 0.04:  # Less than 4% edge density
-            reason = f"FULL_CAM because bbox_area_ratio={bbox_area_ratio:.2%}, outside_area very low complexity ({edge_density_outside:.4f})"
+        if edge_density_outside < 0.05:
+            reason = f"FULL_CAM: bbox_area_ratio={bbox_area_ratio:.2%}, low outside complexity ({edge_density_outside:.4f})"
             print(f"     ✅ {reason}")
             return 'FULL_CAM', reason, bbox_area_ratio
     
-    # Default: SPLIT layout
-    reason = f"SPLIT layout (bbox_area_ratio={bbox_area_ratio:.2%})"
+    # ==========================================================================
+    # RULE 3: TOP_BAND - Wide webcam near top (Gemini type or heuristics)
+    # Conditions: width >= 55%, height 18-60%, webcam is in top portion
+    # ==========================================================================
+    is_top_band_candidate = (
+        (gemini_type == 'top_band') or
+        (width_ratio >= 0.55 and 0.15 <= height_ratio <= 0.60 and is_near_top and touches_top)
+    )
+    
+    if is_top_band_candidate:
+        # Additional validation: top band should span most of width
+        spans_width = width_ratio >= 0.55
+        reasonable_height = 0.15 <= height_ratio <= 0.60
+        
+        if spans_width and reasonable_height and is_near_top:
+            reason = f"TOP_BAND: width={width_ratio:.2%}, height={height_ratio:.2%}, near_top={is_near_top}, gemini_type={gemini_type}"
+            print(f"     ✅ {reason}")
+            return 'TOP_BAND', reason, bbox_area_ratio
+    
+    # ==========================================================================
+    # RULE 4: BOTTOM_BAND (similar to TOP_BAND but at bottom) - treat as TOP_BAND for rendering
+    # ==========================================================================
+    if gemini_type == 'bottom_band' or (width_ratio >= 0.55 and 0.15 <= height_ratio <= 0.60 and is_near_bottom and touches_bottom):
+        reason = f"TOP_BAND (bottom variant): width={width_ratio:.2%}, height={height_ratio:.2%}"
+        print(f"     ✅ {reason}")
+        return 'TOP_BAND', reason, bbox_area_ratio
+    
+    # ==========================================================================
+    # RULE 5: CENTER_BOX - Large centered webcam (treat as TOP_BAND for rendering)
+    # ==========================================================================
+    if gemini_type == 'center_box':
+        if bbox_area_ratio >= 0.20:  # Reasonably large
+            reason = f"TOP_BAND (center_box): area={bbox_area_ratio:.2%}, gemini_type={gemini_type}"
+            print(f"     ✅ {reason}")
+            return 'TOP_BAND', reason, bbox_area_ratio
+    
+    # ==========================================================================
+    # RULE 6: SPLIT - Classic corner overlay
+    # Conditions: in corner zone, area 3-35%
+    # ==========================================================================
+    is_corner_overlay = (
+        (gemini_type == 'corner_overlay') or
+        (is_in_corner and 0.03 <= bbox_area_ratio <= 0.35)
+    )
+    
+    if is_corner_overlay:
+        reason = f"SPLIT: corner overlay, area={bbox_area_ratio:.2%}, corner={corner}, gemini_type={gemini_type}"
+        print(f"     📐 {reason}")
+        return 'SPLIT', reason, bbox_area_ratio
+    
+    # ==========================================================================
+    # FALLBACK: If we have a webcam but it doesn't fit other categories
+    # ==========================================================================
+    if bbox_area_ratio >= 0.10:
+        # Larger webcams that don't fit other categories -> TOP_BAND
+        reason = f"TOP_BAND (fallback): area={bbox_area_ratio:.2%} >= 10%"
+        print(f"     📐 {reason}")
+        return 'TOP_BAND', reason, bbox_area_ratio
+    
+    # Small webcam not in corner -> treat as SPLIT anyway
+    reason = f"SPLIT (fallback): area={bbox_area_ratio:.2%}"
     print(f"     📐 {reason}")
     return 'SPLIT', reason, bbox_area_ratio
 
@@ -400,6 +501,94 @@ def compute_iou_dict(box1: Dict[str, int], box2: Dict[str, int]) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def is_hud_like_box(
+    bbox: Dict[str, int],
+    corner: str,
+    video_width: int,
+    video_height: int,
+    frame_bgr: np.ndarray = None,
+) -> Tuple[bool, str]:
+    """
+    Check if a bbox looks like a HUD/minimap element rather than a webcam.
+    
+    HUD indicators (reject if ALL are true):
+    1. In typical HUD zone (e.g., top-left stream often has minimap mid-left)
+    2. No face detected inside bbox (light DNN pass)
+    3. Near-square aspect ratio (minimaps are often square)
+    4. High edge density / UI-like appearance
+    
+    Args:
+        bbox: Dict with x, y, width, height
+        corner: Expected corner
+        video_width: Video width
+        video_height: Video height
+        frame_bgr: Optional frame for face detection and edge analysis
+    
+    Returns:
+        Tuple of (is_hud_like, reason)
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    
+    # Check 1: Position in typical HUD zones
+    # For top-left streams, minimap is often mid-left (x < 40%W, y > 20%H)
+    x_ratio = (x + w/2) / video_width
+    y_ratio = (y + h/2) / video_height
+    
+    is_in_hud_zone = False
+    hud_zone_reason = ""
+    
+    if corner == 'top-left':
+        # Minimap is typically below the webcam, mid-left area
+        # HUD zone: x < 40%W AND y > 22%H (below typical webcam)
+        if x_ratio < 0.40 and y_ratio > 0.22:
+            is_in_hud_zone = True
+            hud_zone_reason = f"mid-left HUD zone (x_ratio={x_ratio:.2f}, y_ratio={y_ratio:.2f})"
+    elif corner == 'top-right':
+        # Similar check for top-right streams
+        if x_ratio > 0.60 and y_ratio > 0.22:
+            is_in_hud_zone = True
+            hud_zone_reason = f"mid-right HUD zone (x_ratio={x_ratio:.2f}, y_ratio={y_ratio:.2f})"
+    
+    if not is_in_hud_zone:
+        return False, "not in HUD zone"
+    
+    # Check 2: Aspect ratio - minimaps are often near-square
+    ar = w / h if h > 0 else 0
+    is_near_square = 0.80 <= ar <= 1.25
+    
+    # Check 3: Try face detection inside bbox (if we have a frame)
+    has_face = False
+    if frame_bgr is not None:
+        try:
+            face = detect_face_dnn(frame_bgr, x, y, w, h)
+            has_face = face is not None
+        except:
+            pass
+    
+    # Check 4: Edge density (HUD elements have high edge density from UI lines)
+    has_high_edge_density = False
+    if frame_bgr is not None:
+        try:
+            roi = frame_bgr[y:y+h, x:x+w]
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.count_nonzero(edges) / (w * h)
+            # HUD elements typically have edge density > 15%
+            has_high_edge_density = edge_density > 0.15
+        except:
+            pass
+    
+    # Reject as HUD if: in HUD zone AND near-square AND no face
+    if is_in_hud_zone and is_near_square and not has_face:
+        return True, f"HUD-like: {hud_zone_reason}, near-square AR={ar:.2f}, no face detected"
+    
+    # Also reject if in HUD zone with very high edge density and no face
+    if is_in_hud_zone and has_high_edge_density and not has_face:
+        return True, f"HUD-like: {hud_zone_reason}, high edge density, no face detected"
+    
+    return False, "passed HUD checks"
+
+
 def check_corner_proximity(
     bbox: Dict[str, int],
     corner: str,
@@ -412,6 +601,10 @@ def check_corner_proximity(
     
     Webcam overlays should be close to their corner edges. This prevents
     selecting HUD elements like minimaps that are elsewhere on screen.
+    
+    STRICT Y CONSTRAINTS added to prevent minimap false positives:
+    - top-left/top-right: y must be <= 18% of frame height (or <= 22% with looser check)
+    - bottom-left/bottom-right: y must be >= 55% of frame height
     
     Args:
         bbox: Dict with x, y, width, height
@@ -428,18 +621,29 @@ def check_corner_proximity(
     # Calculate max inset in pixels (6% of smaller dimension)
     max_inset = int(max_inset_ratio * min(video_width, video_height))
     
+    # STRICT Y constraints to prevent minimap drift
+    max_y_top = int(video_height * 0.22)  # Top webcams must start within top 22%
+    min_y_bottom = int(video_height * 0.55)  # Bottom webcams must start at 55%+
+    
     right_edge = x + w
     bottom_edge = y + h
     
     if corner == 'top-left':
-        # Top edge and left edge should be near origin
+        # STRICT: y must be near top (within 22% of frame height)
+        if y > max_y_top:
+            return False, f"top-left: y={y} > max_y_top={max_y_top} (not near top edge)"
+        # x should be near left edge (allow some offset)
+        if x > max_inset * 2:
+            return False, f"top-left: x={x} > {max_inset * 2} (not near left edge)"
+        # Also check: at least one edge should be very close to corner
         if x > max_inset and y > max_inset:
-            return False, f"top-left: neither edge near corner (x={x}, y={y}, max_inset={max_inset})"
-        if y > max_inset * 3:  # Allow some x offset but y must be near top
-            return False, f"top-left: too far from top (y={y})"
+            return False, f"top-left: neither edge touches corner (x={x}, y={y})"
     
     elif corner == 'top-right':
-        # Top edge and right edge should be near expected positions
+        # STRICT: y must be near top
+        if y > max_y_top:
+            return False, f"top-right: y={y} > max_y_top={max_y_top} (not near top edge)"
+        # Right edge should be near video width
         if right_edge < (video_width - max_inset) and y > max_inset:
             return False, f"top-right: neither edge near corner (right={right_edge}, y={y})"
         if y > max_inset * 3:
@@ -2146,12 +2350,18 @@ def detect_webcam_region(
                             gemini_area = gemini_w * gemini_h
                             gemini_ar = gemini_w / gemini_h if gemini_h > 0 else 0
                             
+                            # NEW: Extract gemini type and confidence
+                            gemini_type = result.get('type', 'corner_overlay')
+                            gemini_confidence = result.get('confidence', 0.5)
+                            
                             cam_x, cam_y, cam_w, cam_h = gemini_x, gemini_y, gemini_w, gemini_h
                             
                             # Initialize variables that must always be defined
                             refinement_method = "gemini"  # Default: use Gemini as-is
                             detected_face = None
                             is_suspicious = False
+                            
+                            print(f"  📐 Gemini detection: type={gemini_type}, conf={gemini_confidence:.2f}")
                             
                             print(f"  📐 Gemini bbox: {gemini_w}x{gemini_h} at ({gemini_x},{gemini_y}), AR={gemini_ar:.2f}")
                             
@@ -2514,7 +2724,9 @@ def detect_webcam_region(
                                 y=new_y,
                                 width=new_w,
                                 height=new_h,
-                                position=position
+                                position=position,
+                                gemini_type=gemini_type,
+                                gemini_confidence=gemini_confidence,
                             )
                 else:
                     print(f"  ⚠️ Could not extract frame at {ts}s")
@@ -2622,7 +2834,9 @@ def detect_webcam_region(
                     y=inset,
                     width=width - 2 * inset,
                     height=height - 2 * inset,
-                    position='full'  # Special marker for FULL_CAM
+                    position='full',  # Special marker for FULL_CAM
+                    gemini_type='full_cam',
+                    gemini_confidence=0.7,
                 )
         else:
             # Could not extract frame - still treat as FULL_CAM since Gemini says no overlay
@@ -2633,7 +2847,9 @@ def detect_webcam_region(
                 y=0,
                 width=1920,  # Will be resized anyway
                 height=1080,
-                position='full'
+                position='full',
+                gemini_type='full_cam',
+                gemini_confidence=0.5,
             )
     
     # =========================================================================
@@ -2882,6 +3098,10 @@ def detect_layout_with_cache(
         'height': webcam_region.height,
     }
     
+    # Get gemini type and confidence from webcam_region
+    gemini_type = getattr(webcam_region, 'gemini_type', 'unknown')
+    gemini_confidence = getattr(webcam_region, 'gemini_confidence', 0.0)
+    
     # Classify layout
     layout, reason, bbox_area_ratio = classify_layout(
         frame_bgr=frame,
@@ -2889,6 +3109,8 @@ def detect_layout_with_cache(
         corner=webcam_region.position,
         video_width=width,
         video_height=height,
+        gemini_type=gemini_type,
+        gemini_confidence=gemini_confidence,
     )
     
     # Detect face for face-centered cropping (especially for FULL_CAM)
@@ -2941,7 +3163,9 @@ def detect_layout_with_cache(
             y=inset,
             width=width - 2 * inset,
             height=height - 2 * inset,
-            position='full'
+            position='full',
+            gemini_type='full_cam',
+            gemini_confidence=gemini_confidence,
         )
         print(f"  📐 FULL_CAM effective region: {webcam_region}")
     else:
@@ -2961,6 +3185,8 @@ def detect_layout_with_cache(
         face_center=face_center,
         reason=reason,
         bbox_area_ratio=bbox_area_ratio,
+        gemini_type=gemini_type,
+        confidence=gemini_confidence,
     )
     
     # Cache result
@@ -2971,12 +3197,15 @@ def detect_layout_with_cache(
     print(f"  📊 LAYOUT DETECTION SUMMARY")
     print(f"  ═══════════════════════════════════════")
     print(f"  Layout: {layout}")
+    print(f"  Gemini type: {gemini_type}, confidence: {gemini_confidence:.2f}")
     print(f"  Reason: {reason}")
     print(f"  bbox_area_ratio: {bbox_area_ratio:.2%}")
     print(f"  Webcam region: {webcam_region}")
     print(f"  Face center: {face_center}")
     if layout == 'FULL_CAM' and face_center:
         print(f"  Face-centered crop: YES (face at {face_center.center_x}, {face_center.center_y})")
+    if layout == 'TOP_BAND':
+        print(f"  TOP_BAND detected - source stacked layout, will use simple vertical crop")
     print(f"  ═══════════════════════════════════════\n")
     
     return layout_info

@@ -767,6 +767,221 @@ def render_full_cam_video(
         raise VideoProcessingError(error_msg)
 
 
+def render_top_band_video(
+    input_path: str,
+    output_path: str,
+    webcam_region: WebcamRegion,
+    subtitle_path: str | None = None,
+    width: int = 1080,
+    height: int = 1920,
+) -> str:
+    """
+    Render a TOP_BAND layout video - source already has webcam band + gameplay stacked.
+    
+    For clips where the webcam is a wide band across the top (or bottom), instead of
+    creating a new split overlay, we preserve the source layout and crop to vertical.
+    
+    Strategy:
+    1. Scale source to fill output width (1080px) while maintaining aspect ratio
+    2. Crop to 9:16, anchoring so the webcam band remains visible
+    3. Optionally detect horizontal divider and center crop around it
+    
+    Args:
+        input_path: Path to input video
+        output_path: Path to output video
+        webcam_region: Detected webcam region (used to determine anchor point)
+        subtitle_path: Optional path to subtitle file
+        width: Output width (default 1080)
+        height: Output height (default 1920)
+        
+    Returns:
+        Path to output video
+        
+    Raises:
+        VideoProcessingError: If FFmpeg fails
+    """
+    print(f"🎬 Rendering TOP_BAND video: {input_path} -> {output_path}")
+    print(f"   Webcam region: {webcam_region}")
+    
+    # Get source dimensions
+    src_width, src_height = get_video_dimensions(input_path)
+    print(f"   Source: {src_width}x{src_height}")
+    
+    # Check subtitle file
+    use_subtitles = False
+    if subtitle_path and os.path.exists(subtitle_path):
+        file_size = os.path.getsize(subtitle_path)
+        if file_size > 10:
+            use_subtitles = True
+    
+    # Calculate scale factor to fill output width
+    scale_factor = width / src_width
+    scaled_height = int(src_height * scale_factor)
+    
+    # Calculate crop Y offset to preserve webcam visibility
+    # If webcam is at top (y near 0), anchor crop at top
+    # If webcam is at bottom (y near src_height), anchor crop at bottom
+    webcam_center_y = webcam_region.y + webcam_region.height / 2
+    webcam_y_ratio = webcam_center_y / src_height
+    
+    if scaled_height <= height:
+        # Source is shorter than target - need to letterbox or stretch
+        # Use center crop (no real cropping needed, might have bars)
+        crop_y = 0
+        scale_h = height
+        print(f"   Source shorter than target after scaling, using letterbox")
+    else:
+        # Source is taller - determine crop anchor
+        max_crop_y = scaled_height - height
+        
+        if webcam_y_ratio < 0.35:
+            # Webcam near top - anchor crop at top
+            crop_y = 0
+            print(f"   Webcam near top (y_ratio={webcam_y_ratio:.2f}), anchoring crop at top")
+        elif webcam_y_ratio > 0.65:
+            # Webcam near bottom - anchor crop at bottom
+            crop_y = max_crop_y
+            print(f"   Webcam near bottom (y_ratio={webcam_y_ratio:.2f}), anchoring crop at bottom")
+        else:
+            # Webcam in middle - center the crop
+            crop_y = max_crop_y // 2
+            print(f"   Webcam in middle (y_ratio={webcam_y_ratio:.2f}), centering crop")
+        
+        scale_h = -2  # Auto-calculate preserving aspect ratio
+    
+    # Build filter chain
+    filters = []
+    
+    # Scale to fill width (use -2 for height to maintain aspect ratio and ensure even)
+    filters.append(f"scale={width}:-2:flags=lanczos")
+    
+    # Crop to target dimensions
+    # crop=width:height:x:y - x=0 since we scaled to exact width
+    filters.append(f"crop={width}:{height}:0:{crop_y}")
+    
+    # Add setsar=1 to ensure square pixels
+    filters.append("setsar=1")
+    
+    # Add subtitles if available
+    if use_subtitles:
+        escaped_path = escape_ffmpeg_path(subtitle_path)
+        if subtitle_path.endswith(".ass"):
+            filters.append(f"ass='{escaped_path}'")
+        else:
+            filters.append(f"subtitles='{escaped_path}':force_style='FontSize=28,Bold=1,Alignment=2'")
+    
+    filter_complex = ",".join(filters)
+    
+    # Build FFmpeg command
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-vf", filter_complex,
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    
+    print(f"   Filter: {filter_complex}")
+    print(f"   Running FFmpeg...")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(f"✅ TOP_BAND render complete: {output_path}")
+        return output_path
+        
+    except subprocess.CalledProcessError as e:
+        error_msg = f"FFmpeg failed: {e.stderr}"
+        print(f"❌ {error_msg}")
+        raise VideoProcessingError(error_msg)
+
+
+def apply_subtitles_to_video(
+    input_path: str,
+    output_path: str,
+    subtitle_path: str,
+) -> str:
+    """
+    Apply subtitles to an already-rendered base video.
+    
+    This is an optimization - instead of re-running the full render pipeline
+    twice (once without subs, once with), we render the base once and then
+    apply subtitles in a quick second pass.
+    
+    Args:
+        input_path: Path to base video (already rendered to 9:16)
+        output_path: Path to output video with subtitles
+        subtitle_path: Path to ASS or SRT subtitle file
+        
+    Returns:
+        Path to output video
+        
+    Raises:
+        VideoProcessingError: If FFmpeg fails
+    """
+    print(f"🎬 Applying subtitles: {input_path} -> {output_path}")
+    
+    if not os.path.exists(subtitle_path):
+        print(f"⚠️ Subtitle file not found, copying base video")
+        import shutil
+        shutil.copy(input_path, output_path)
+        return output_path
+    
+    file_size = os.path.getsize(subtitle_path)
+    if file_size <= 10:
+        print(f"⚠️ Subtitle file empty, copying base video")
+        import shutil
+        shutil.copy(input_path, output_path)
+        return output_path
+    
+    escaped_path = escape_ffmpeg_path(subtitle_path)
+    
+    if subtitle_path.endswith(".ass"):
+        sub_filter = f"ass='{escaped_path}'"
+    else:
+        sub_filter = f"subtitles='{escaped_path}':force_style='FontSize=28,Bold=1,Alignment=2'"
+    
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-vf", sub_filter,
+        "-c:v", "libx264",
+        "-preset", "fast",  # Fast since it's just adding subs
+        "-crf", "23",
+        "-c:a", "copy",  # Copy audio stream (no re-encode)
+        "-movflags", "+faststart",
+        output_path
+    ]
+    
+    print(f"   Running subtitle overlay...")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(f"✅ Subtitles applied: {output_path}")
+        return output_path
+        
+    except subprocess.CalledProcessError as e:
+        error_msg = f"FFmpeg subtitle overlay failed: {e.stderr}"
+        print(f"❌ {error_msg}")
+        raise VideoProcessingError(error_msg)
+
+
 def render_video_auto(
     input_path: str,
     output_path: str,
@@ -784,6 +999,7 @@ def render_video_auto(
     
     Layouts:
     - FULL_CAM: Entire clip is webcam. Use face-centered full-frame crop.
+    - TOP_BAND: Source already stacked (webcam band + gameplay). Use smart crop.
     - SPLIT: Webcam + gameplay. Use split layout with webcam on top.
     - NO_WEBCAM: No webcam detected. Use simple center crop.
     
@@ -844,6 +1060,18 @@ def render_video_auto(
             height=height,
             temp_dir=temp_dir,
             enable_face_tracking=True,  # Always enable face tracking for FULL_CAM
+        )
+    
+    elif layout == 'TOP_BAND' and layout_info.webcam_region:
+        # Source is already stacked (webcam band + gameplay) - use smart vertical crop
+        print(f"🎥 Using TOP_BAND layout: {layout_info.reason}")
+        return render_top_band_video(
+            input_path=input_path,
+            output_path=output_path,
+            webcam_region=layout_info.webcam_region,
+            subtitle_path=subtitle_path,
+            width=width,
+            height=height,
         )
     
     elif layout == 'SPLIT' and layout_info.webcam_region:

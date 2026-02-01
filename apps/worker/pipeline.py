@@ -19,7 +19,7 @@ from twitch_api import (
 )
 from transcribe import transcribe_video
 from groq_transcribe import transcribe_with_segments
-from video import render_vertical_video, render_video_auto, VideoProcessingError
+from video import render_vertical_video, render_video_auto, apply_subtitles_to_video, VideoProcessingError
 from storage import upload_file, SharedDriveError
 from diarization import (
     diarize_video,
@@ -346,29 +346,32 @@ def _process_job_stages(
         print(f"🎬 Stage 5: Rendering vertical videos (preset: {render_preset})...")
         log_job_event(job_id, "info", f"Starting render with preset: {render_preset}", "render")
         
-        # Version 1: WITHOUT subtitles (raw vertical crop)
+        # OPTIMIZED RENDERING: Render base once, add subtitles in second pass
+        # This avoids running the full split/crop composition twice
+        
+        # Version 1: WITHOUT subtitles (base render - full composition)
         video_no_subs_path = str(temp_dir / "final_no_subs.mp4")
-        print("🎬 Rendering version WITHOUT subtitles...")
+        print("🎬 Rendering BASE version (without subtitles)...")
+        print("   💡 This does the full layout composition (split/crop/tracking)")
         render_video_auto(
             input_path=raw_video_path,
             output_path=video_no_subs_path,
-            subtitle_path=None,  # No subtitles
+            subtitle_path=None,  # No subtitles for base
             enable_webcam_detection=True,
             temp_dir=str(temp_dir),
         )
-        print(f"✅ Rendered (no subs): {video_no_subs_path}")
+        print(f"✅ Base render complete: {video_no_subs_path}")
         
-        # Version 2: WITH subtitles
+        # Version 2: WITH subtitles (apply to base - quick overlay pass)
         video_with_subs_path = str(temp_dir / "final_with_subs.mp4")
-        print("🎬 Rendering version WITH subtitles...")
-        render_video_auto(
-            input_path=raw_video_path,
+        print("🎬 Applying subtitles to base render...")
+        print("   💡 This is a fast subtitle overlay pass (no re-composition)")
+        apply_subtitles_to_video(
+            input_path=video_no_subs_path,  # Use the already-rendered base
             output_path=video_with_subs_path,
             subtitle_path=subtitle_path,
-            enable_webcam_detection=True,
-            temp_dir=str(temp_dir),
         )
-        print(f"✅ Rendered (with subs): {video_with_subs_path}")
+        print(f"✅ Subtitles applied: {video_with_subs_path}")
         
         update_job(job_id, final_video_path=video_with_subs_path)
         update_last_stage(job_id, "render")
