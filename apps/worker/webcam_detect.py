@@ -46,17 +46,20 @@ class WebcamRegion:
     """Represents a detected webcam region in the video."""
     
     def __init__(self, x: int, y: int, width: int, height: int, position: str,
-                 gemini_type: str = 'unknown', gemini_confidence: float = 0.0):
+                 gemini_type: str = 'unknown', gemini_confidence: float = 0.0,
+                 effective_type: str = None):
         self.x = int(x)
         self.y = int(y)
         self.width = int(width)
         self.height = int(height)
         self.position = position  # 'top-left', 'top-right', 'bottom-left', 'bottom-right', 'full'
-        self.gemini_type = gemini_type  # 'corner_overlay', 'top_band', 'bottom_band', 'center_box', 'full_cam', 'none'
+        self.gemini_type = gemini_type  # 'corner_overlay', 'top_band', 'bottom_band', 'center_box', 'full_cam', 'side_box', 'none'
         self.gemini_confidence = float(gemini_confidence)
+        # effective_type may differ from gemini_type (e.g., side_box reclassified from corner_overlay)
+        self.effective_type = effective_type if effective_type else gemini_type
     
     def __repr__(self):
-        return f"WebcamRegion({self.position}: x={self.x}, y={self.y}, w={self.width}, h={self.height}, type={self.gemini_type})"
+        return f"WebcamRegion({self.position}: x={self.x}, y={self.y}, w={self.width}, h={self.height}, type={self.gemini_type}, effective={self.effective_type})"
     
     def to_ffmpeg_crop(self) -> str:
         """Return FFmpeg crop filter string."""
@@ -72,6 +75,7 @@ class WebcamRegion:
             'position': self.position,
             'gemini_type': self.gemini_type,
             'gemini_confidence': _to_python_scalar(self.gemini_confidence),
+            'effective_type': self.effective_type,
         }
     
     @classmethod
@@ -85,6 +89,7 @@ class WebcamRegion:
             position=data['position'],
             gemini_type=data.get('gemini_type', 'unknown'),
             gemini_confidence=data.get('gemini_confidence', 0.0),
+            effective_type=data.get('effective_type'),
         )
 
 
@@ -182,15 +187,19 @@ def classify_layout(
     video_height: int,
     gemini_type: str = 'unknown',
     gemini_confidence: float = 0.0,
+    effective_type: str = None,
 ) -> Tuple[str, str, float]:
     """
     Classify the video layout based on webcam bbox and frame analysis.
     
     Supports layouts:
     - FULL_CAM: Entire clip is webcam (>70% or Gemini type is full_cam)
-    - TOP_BAND: Wide webcam band at top (width >= 55%, height 18-60%, near top)
-    - SPLIT: Traditional corner overlay (area 3-30%, in a corner zone)
+    - TOP_BAND: Wide webcam band at top (width >= 55%, height 18-60%, near top, MUST touch top)
+    - SPLIT: Webcam overlay (corner_overlay OR side_box), area 3-35%
     - NO_WEBCAM: No webcam detected
+    
+    IMPORTANT: side_box overlays MUST be classified as SPLIT, not TOP_BAND.
+    TOP_BAND is ONLY for true horizontal bands that span most of the width AND touch the top edge.
     
     Args:
         frame_bgr: BGR frame from video
@@ -200,11 +209,15 @@ def classify_layout(
         video_height: Full frame height
         gemini_type: Type from Gemini detection (corner_overlay, top_band, etc.)
         gemini_confidence: Confidence from Gemini detection
+        effective_type: Effective type after reclassification (may differ from gemini_type)
     
     Returns:
         Tuple of (layout, reason, bbox_area_ratio)
         layout: 'FULL_CAM', 'TOP_BAND', 'SPLIT', or 'NO_WEBCAM'
     """
+    # Use effective_type if provided, otherwise fall back to gemini_type
+    if effective_type is None:
+        effective_type = gemini_type
     if webcam_bbox is None:
         return 'NO_WEBCAM', 'No webcam detected', 0.0
     
@@ -253,7 +266,7 @@ def classify_layout(
     is_near_bottom = y_center > video_height * 0.60  # Center in bottom 40%
     
     print(f"  📊 Layout classifier:")
-    print(f"     Gemini type: {gemini_type}, confidence: {gemini_confidence:.2f}")
+    print(f"     Gemini type: {gemini_type}, effective_type: {effective_type}, confidence: {gemini_confidence:.2f}")
     print(f"     bbox: {bw}x{bh} at ({bx},{by})")
     print(f"     width_ratio: {width_ratio:.2%}, height_ratio: {height_ratio:.2%}")
     print(f"     bbox_area_ratio: {bbox_area_ratio:.2%}")
@@ -338,16 +351,35 @@ def classify_layout(
         return 'SPLIT', reason, bbox_area_ratio
     
     # ==========================================================================
-    # FALLBACK: If we have a webcam but it doesn't fit other categories
+    # RULE 7: SPLIT - Side box overlay (NOT corner, NOT band)
+    # This is CRITICAL: side_box MUST be SPLIT, never TOP_BAND!
+    # Conditions: effective_type is side_box, OR gemini_type is side_box
     # ==========================================================================
-    if bbox_area_ratio >= 0.10:
-        # Larger webcams that don't fit other categories -> TOP_BAND
-        reason = f"TOP_BAND (fallback): area={bbox_area_ratio:.2%} >= 10%"
+    is_side_box = (
+        effective_type == 'side_box' or 
+        gemini_type == 'side_box'
+    )
+    
+    if is_side_box:
+        reason = f"SPLIT: side_box overlay, area={bbox_area_ratio:.2%}, corner={corner}, effective_type={effective_type}"
+        print(f"     📐 {reason}")
+        return 'SPLIT', reason, bbox_area_ratio
+    
+    # ==========================================================================
+    # FALLBACK: If we have a webcam but it doesn't fit other categories
+    # IMPORTANT: Default to SPLIT, not TOP_BAND!
+    # TOP_BAND should ONLY be used for true horizontal bands that span the width.
+    # Any overlay-style webcam should be SPLIT to ensure proper top=webcam, bottom=game.
+    # ==========================================================================
+    # Only use TOP_BAND fallback if it truly looks like a band (wide + touches top)
+    if bbox_area_ratio >= 0.10 and width_ratio >= 0.55 and touches_top:
+        reason = f"TOP_BAND (fallback): area={bbox_area_ratio:.2%}, width={width_ratio:.2%}, touches_top=True"
         print(f"     📐 {reason}")
         return 'TOP_BAND', reason, bbox_area_ratio
     
-    # Small webcam not in corner -> treat as SPLIT anyway
-    reason = f"SPLIT (fallback): area={bbox_area_ratio:.2%}"
+    # Default: treat as SPLIT (overlay webcam)
+    # This ensures side-box overlays and other non-standard webcams get proper split rendering
+    reason = f"SPLIT (fallback): area={bbox_area_ratio:.2%}, effective_type={effective_type}"
     print(f"     📐 {reason}")
     return 'SPLIT', reason, bbox_area_ratio
 
@@ -3361,6 +3393,7 @@ def detect_webcam_region(
                                 position=position,
                                 gemini_type=gemini_type,
                                 gemini_confidence=gemini_confidence,
+                                effective_type=effective_type,
                             )
                 else:
                     print(f"  ⚠️ Could not extract frame at {ts}s")
@@ -3589,7 +3622,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 4  # v4: Face-anchored edge refinement for side_box, reduced padding, multi-frame median
+_CACHE_VERSION = 5  # v5: Fixed side_box => SPLIT classification (not TOP_BAND fallback)
 
 
 def _get_cache_path(temp_dir: str) -> str:
@@ -3759,11 +3792,12 @@ def detect_layout_with_cache(
         'height': webcam_region.height,
     }
     
-    # Get gemini type and confidence from webcam_region
+    # Get gemini type, effective type, and confidence from webcam_region
     gemini_type = getattr(webcam_region, 'gemini_type', 'unknown')
     gemini_confidence = getattr(webcam_region, 'gemini_confidence', 0.0)
+    effective_type = getattr(webcam_region, 'effective_type', gemini_type)
     
-    # Classify layout
+    # Classify layout - IMPORTANT: pass effective_type to handle side_box correctly
     layout, reason, bbox_area_ratio = classify_layout(
         frame_bgr=frame,
         webcam_bbox=webcam_bbox,
@@ -3772,6 +3806,7 @@ def detect_layout_with_cache(
         video_height=height,
         gemini_type=gemini_type,
         gemini_confidence=gemini_confidence,
+        effective_type=effective_type,
     )
     
     # Detect face for face-centered cropping (especially for FULL_CAM)
