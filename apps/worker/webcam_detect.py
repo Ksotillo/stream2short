@@ -664,6 +664,203 @@ def check_corner_proximity(
     return True, "near expected corner"
 
 
+def is_true_corner_overlay(
+    bbox: Dict[str, int],
+    frame_width: int,
+    frame_height: int,
+    corner: str,
+    edge_threshold_ratio: float = 0.02,
+) -> Tuple[bool, str]:
+    """
+    Check if a bbox is truly attached to its corner edges.
+    
+    A "true corner" overlay has edges touching or very close to (within 2%) 
+    the frame edges. Mid-right/mid-left overlays are NOT true corners even 
+    if Gemini says "corner_overlay".
+    
+    Args:
+        bbox: Dict with x, y, width, height
+        frame_width: Video frame width
+        frame_height: Video frame height
+        corner: Expected corner ('top-left', 'top-right', etc.)
+        edge_threshold_ratio: Max gap ratio to consider "touching" (0.02 = 2%)
+        
+    Returns:
+        Tuple of (is_true_corner, debug_reason)
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    
+    # Calculate thresholds in pixels (2% of dimension)
+    threshold_x = int(frame_width * edge_threshold_ratio)
+    threshold_y = int(frame_height * edge_threshold_ratio)
+    
+    # Calculate gaps to each edge
+    gap_left = x
+    gap_right = frame_width - (x + w)
+    gap_top = y
+    gap_bottom = frame_height - (y + h)
+    
+    debug_info = f"gaps: L={gap_left}, R={gap_right}, T={gap_top}, B={gap_bottom}, thresh_x={threshold_x}, thresh_y={threshold_y}"
+    
+    if corner == 'top-right':
+        # True top-right: right edge touches right AND top edge touches top
+        touches_right = gap_right <= threshold_x
+        touches_top = gap_top <= threshold_y
+        is_true = touches_right and touches_top
+        reason = f"top-right: touches_right={touches_right} (gap={gap_right}), touches_top={touches_top} (gap={gap_top})"
+        return is_true, f"{reason} | {debug_info}"
+    
+    elif corner == 'top-left':
+        touches_left = gap_left <= threshold_x
+        touches_top = gap_top <= threshold_y
+        is_true = touches_left and touches_top
+        reason = f"top-left: touches_left={touches_left} (gap={gap_left}), touches_top={touches_top} (gap={gap_top})"
+        return is_true, f"{reason} | {debug_info}"
+    
+    elif corner == 'bottom-right':
+        touches_right = gap_right <= threshold_x
+        touches_bottom = gap_bottom <= threshold_y
+        is_true = touches_right and touches_bottom
+        reason = f"bottom-right: touches_right={touches_right}, touches_bottom={touches_bottom}"
+        return is_true, f"{reason} | {debug_info}"
+    
+    elif corner == 'bottom-left':
+        touches_left = gap_left <= threshold_x
+        touches_bottom = gap_bottom <= threshold_y
+        is_true = touches_left and touches_bottom
+        reason = f"bottom-left: touches_left={touches_left}, touches_bottom={touches_bottom}"
+        return is_true, f"{reason} | {debug_info}"
+    
+    # Unknown corner
+    return False, f"unknown corner: {corner}"
+
+
+def tighten_webcam_bbox_contours(
+    frame_bgr: np.ndarray,
+    initial_bbox: Dict[str, int],
+    frame_width: int,
+    frame_height: int,
+    face_center: Optional[Tuple[int, int]] = None,
+    expand_ratio: float = 0.15,
+    debug: bool = False,
+) -> Optional[Dict[str, int]]:
+    """
+    Tighten a webcam bbox using contour/edge detection to find the actual webcam rectangle.
+    
+    This is useful when Gemini returns a rough bbox that includes some game UI.
+    We search for rectangular contours within an expanded search window.
+    
+    Args:
+        frame_bgr: BGR frame image
+        initial_bbox: Initial bbox from Gemini
+        frame_width: Frame width
+        frame_height: Frame height
+        face_center: Optional (x, y) of detected face center (for validation)
+        expand_ratio: How much to expand search window (0.15 = 15%)
+        debug: Enable debug logging
+        
+    Returns:
+        Tightened bbox dict or None if no good candidate found
+    """
+    x, y, w, h = initial_bbox['x'], initial_bbox['y'], initial_bbox['width'], initial_bbox['height']
+    
+    # Expand search window
+    expand_x = int(w * expand_ratio)
+    expand_y = int(h * expand_ratio)
+    
+    search_x = max(0, x - expand_x)
+    search_y = max(0, y - expand_y)
+    search_w = min(frame_width - search_x, w + 2 * expand_x)
+    search_h = min(frame_height - search_y, h + 2 * expand_y)
+    
+    # Extract search region
+    roi = frame_bgr[search_y:search_y+search_h, search_x:search_x+search_w]
+    if roi.size == 0:
+        if debug:
+            print(f"  ⚠️ Empty ROI for contour search")
+        return None
+    
+    # Convert to grayscale and detect edges
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 30, 100)
+    
+    # Morphological closing to connect edge fragments
+    kernel = np.ones((5, 5), np.uint8)
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    
+    # Find contours
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        if debug:
+            print(f"  ⚠️ No contours found in search region")
+        return None
+    
+    # Score candidates
+    candidates = []
+    min_area = w * h * 0.3  # At least 30% of initial bbox area
+    max_area = search_w * search_h * 0.95  # Not the entire search region
+    
+    for contour in contours:
+        # Get bounding rectangle
+        cx, cy, cw, ch = cv2.boundingRect(contour)
+        area = cw * ch
+        
+        # Filter by area
+        if area < min_area or area > max_area:
+            continue
+        
+        # Filter by aspect ratio (webcams are typically 1.2 to 3.0)
+        ar = cw / ch if ch > 0 else 0
+        if ar < 1.2 or ar > 3.0:
+            continue
+        
+        # Convert to full frame coordinates
+        full_x = search_x + cx
+        full_y = search_y + cy
+        
+        # Rectangularity score (contour area vs bounding rect area)
+        contour_area = cv2.contourArea(contour)
+        rectangularity = contour_area / area if area > 0 else 0
+        
+        # Score: prefer rectangular, centered on initial, containing face
+        center_dist = abs((full_x + cw/2) - (x + w/2)) + abs((full_y + ch/2) - (y + h/2))
+        center_score = 1.0 / (1.0 + center_dist / 100)
+        
+        # Face containment bonus
+        face_score = 0.0
+        if face_center:
+            fx, fy = face_center
+            if full_x <= fx <= full_x + cw and full_y <= fy <= full_y + ch:
+                face_score = 0.3  # Bonus for containing face
+        
+        score = rectangularity * 0.4 + center_score * 0.3 + face_score + (area / max_area) * 0.1
+        
+        candidates.append({
+            'x': full_x, 'y': full_y, 'width': cw, 'height': ch,
+            'score': score, 'ar': ar, 'rect': rectangularity
+        })
+    
+    if not candidates:
+        if debug:
+            print(f"  ⚠️ No valid contour candidates")
+        return None
+    
+    # Sort by score and return best
+    candidates.sort(key=lambda c: c['score'], reverse=True)
+    best = candidates[0]
+    
+    if debug:
+        print(f"  📐 Contour refinement: {len(candidates)} candidates, best score={best['score']:.3f}")
+        print(f"     Best: {best['width']}x{best['height']} at ({best['x']},{best['y']}), AR={best['ar']:.2f}")
+    
+    return {
+        'x': best['x'], 'y': best['y'],
+        'width': best['width'], 'height': best['height']
+    }
+
+
 def convert_numpy_to_python(obj):
     """
     Recursively convert numpy types to Python native types for JSON serialization.
@@ -2299,7 +2496,7 @@ def detect_webcam_region(
     gemini_explicitly_no_webcam = False
     
     try:
-        from gemini_vision import detect_webcam_with_gemini, extract_frame_for_analysis, save_debug_frame_with_box
+        from gemini_vision import detect_webcam_with_gemini, extract_frame_for_analysis, save_debug_frame_with_box, save_debug_frame_multi_box
         from config import config
         
         if config.GEMINI_API_KEY:
@@ -2354,6 +2551,15 @@ def detect_webcam_region(
                             gemini_type = result.get('type', 'corner_overlay')
                             gemini_confidence = result.get('confidence', 0.5)
                             
+                            # NEW: Get effective_type (may differ from gemini_type for mid-right overlays)
+                            effective_type = result.get('effective_type', gemini_type)
+                            
+                            # Determine if this is a TRUE corner overlay (for guardrail decisions)
+                            is_true_corner = (effective_type == 'corner_overlay')
+                            if effective_type == 'side_box':
+                                is_true_corner = False
+                                print(f"  ⚠️ SIDE_BOX detected: corner guardrails will be DISABLED")
+                            
                             cam_x, cam_y, cam_w, cam_h = gemini_x, gemini_y, gemini_w, gemini_h
                             
                             # Initialize variables that must always be defined
@@ -2361,7 +2567,8 @@ def detect_webcam_region(
                             detected_face = None
                             is_suspicious = False
                             
-                            print(f"  📐 Gemini detection: type={gemini_type}, conf={gemini_confidence:.2f}")
+                            print(f"  📐 Gemini detection: type={gemini_type}, effective={effective_type}, conf={gemini_confidence:.2f}")
+                            print(f"     is_true_corner={is_true_corner}")
                             
                             print(f"  📐 Gemini bbox: {gemini_w}x{gemini_h} at ({gemini_x},{gemini_y}), AR={gemini_ar:.2f}")
                             
@@ -2536,6 +2743,56 @@ def detect_webcam_region(
                                         refinement_method = "gemini-norefine"
                             
                             # ============================================================
+                            # TIGHT REFINEMENT for SIDE_BOX overlays
+                            # For mid-right webcams, try contour-based tightening to 
+                            # remove game UI bleed from the initial Gemini bbox
+                            # ============================================================
+                            if not is_true_corner and effective_type == 'side_box':
+                                print(f"  🔬 Attempting TIGHT refinement for side_box overlay...")
+                                
+                                # Load frame if needed
+                                frame_for_tight = None
+                                if frame_path and os.path.exists(frame_path):
+                                    frame_for_tight = cv2.imread(frame_path)
+                                if frame_for_tight is None:
+                                    frame_for_tight = extract_frame(video_path, ts)
+                                
+                                if frame_for_tight is not None:
+                                    # Get face center if available
+                                    face_center = None
+                                    if detected_face:
+                                        face_center = (detected_face.center_x, detected_face.center_y)
+                                    
+                                    tight_bbox = tighten_webcam_bbox_contours(
+                                        frame_for_tight,
+                                        {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
+                                        width, height,
+                                        face_center=face_center,
+                                        debug=True
+                                    )
+                                    
+                                    if tight_bbox:
+                                        print(f"  ✅ Tight refinement found: {tight_bbox['width']}x{tight_bbox['height']} at ({tight_bbox['x']},{tight_bbox['y']})")
+                                        
+                                        # Validate: must contain face if we have one
+                                        valid = True
+                                        if detected_face:
+                                            if not bbox_contains_face(tight_bbox, detected_face, margin_ratio=0.05):
+                                                print(f"  ⚠️ Tight bbox doesn't contain face, keeping original")
+                                                valid = False
+                                        
+                                        if valid:
+                                            cam_x = tight_bbox['x']
+                                            cam_y = tight_bbox['y']
+                                            cam_w = tight_bbox['width']
+                                            cam_h = tight_bbox['height']
+                                            refinement_method = f"{refinement_method}+tight"
+                                    else:
+                                        print(f"  ⚠️ Tight refinement failed, keeping current bbox")
+                                else:
+                                    print(f"  ⚠️ Could not load frame for tight refinement")
+                            
+                            # ============================================================
                             # HARD CONSTRAINTS ON FINAL BBOX
                             # 1. Must contain detected face (if any)
                             # 2. Must pass guardrails (not extend into gameplay)
@@ -2678,24 +2935,27 @@ def detect_webcam_region(
                             print(f"  📐 After frame clamp: {new_w}x{new_h} at ({new_x},{new_y})")
                             
                             # ============================================================
-                            # GAME BLEED GUARDRAIL (stricter 60% for right-side)
-                            # For top-right: left edge must be >= 60% of width
-                            # For top-left: right edge must be <= 40% of width
+                            # GAME BLEED GUARDRAIL (ONLY for TRUE corner overlays!)
+                            # For mid-right/side_box overlays, this guardrail would clip
+                            # the actual webcam, so we SKIP it.
                             # ============================================================
-                            if 'right' in position:
-                                min_x = int(width * 0.60)  # 1152 for 1920 width
-                                if new_x < min_x:
-                                    # REDUCE width from LEFT, keep right edge fixed
-                                    old_w = new_w
-                                    old_right_edge = new_x + new_w
-                                    new_w = old_right_edge - min_x
-                                    new_x = min_x
-                                    print(f"  ⚠️ Game bleed guardrail: x {new_x - (old_w - new_w)} -> {new_x}, w {old_w} -> {new_w}")
+                            if is_true_corner:
+                                if 'right' in position:
+                                    min_x = int(width * 0.60)  # 1152 for 1920 width
+                                    if new_x < min_x:
+                                        # REDUCE width from LEFT, keep right edge fixed
+                                        old_w = new_w
+                                        old_right_edge = new_x + new_w
+                                        new_w = old_right_edge - min_x
+                                        new_x = min_x
+                                        print(f"  ⚠️ Game bleed guardrail (corner): x {new_x - (old_w - new_w)} -> {new_x}, w {old_w} -> {new_w}")
+                                else:
+                                    max_right = int(width * 0.40)  # 768 for 1920 width
+                                    if new_x + new_w > max_right:
+                                        new_w = max_right - new_x
+                                        print(f"  ⚠️ Game bleed guardrail (corner): w -> {new_w}")
                             else:
-                                max_right = int(width * 0.40)  # 768 for 1920 width
-                                if new_x + new_w > max_right:
-                                    new_w = max_right - new_x
-                                    print(f"  ⚠️ Game bleed guardrail: w -> {new_w}")
+                                print(f"  ℹ️ Skipping game bleed guardrail (side_box overlay, is_true_corner=False)")
                             
                             # Ensure minimum dimensions
                             new_w = max(100, new_w)
@@ -2704,12 +2964,55 @@ def detect_webcam_region(
                             print(f"  📐 FINAL bbox: {new_w}x{new_h} at ({new_x},{new_y})")
                             print(f"  ═══════════════════════════════════════\n")
                             
-                            # Save debug frame showing where webcam was detected
-                            debug_frame_path = f"{temp_dir}/debug_webcam_detection.jpg"
+                            # ============================================================
+                            # SAVE DEBUG IMAGES (initial + refined)
+                            # ============================================================
+                            # 1. Initial Gemini bbox (RED) - what Gemini detected
+                            debug_initial_path = f"{temp_dir}/debug_webcam_detect_initial.jpg"
                             save_debug_frame_with_box(
-                                frame_path, debug_frame_path,
-                                new_x, new_y, new_w, new_h
+                                frame_path, debug_initial_path,
+                                gemini_x, gemini_y, gemini_w, gemini_h,
+                                label="GEMINI", color=(0, 0, 255)  # Red
                             )
+                            
+                            # 2. Final refined bbox (GREEN) - what we'll actually use
+                            debug_refined_path = f"{temp_dir}/debug_webcam_detect_refined.jpg"
+                            save_debug_frame_with_box(
+                                frame_path, debug_refined_path,
+                                new_x, new_y, new_w, new_h,
+                                label=f"FINAL ({refinement_method})", color=(0, 255, 0)  # Green
+                            )
+                            
+                            # 3. Combined view with all boxes
+                            debug_combined_path = f"{temp_dir}/debug_webcam_detection.jpg"
+                            debug_boxes = [
+                                {'x': gemini_x, 'y': gemini_y, 'w': gemini_w, 'h': gemini_h, 
+                                 'label': 'Gemini', 'color': (0, 0, 255)},  # Red
+                            ]
+                            
+                            # Add pre-padding box if different from Gemini
+                            if (cam_x != gemini_x or cam_y != gemini_y or 
+                                cam_w != gemini_w or cam_h != gemini_h):
+                                debug_boxes.append({
+                                    'x': cam_x, 'y': cam_y, 'w': cam_w, 'h': cam_h,
+                                    'label': 'Refined', 'color': (0, 255, 255)  # Yellow
+                                })
+                            
+                            # Final bbox
+                            debug_boxes.append({
+                                'x': new_x, 'y': new_y, 'w': new_w, 'h': new_h,
+                                'label': 'Final', 'color': (0, 255, 0)  # Green
+                            })
+                            
+                            # Face if detected
+                            if detected_face:
+                                debug_boxes.append({
+                                    'x': detected_face.x, 'y': detected_face.y,
+                                    'w': detected_face.width, 'h': detected_face.height,
+                                    'label': 'Face', 'color': (255, 0, 0)  # Blue
+                                })
+                            
+                            save_debug_frame_multi_box(frame_path, debug_combined_path, debug_boxes)
                             
                             # Clean up the frame file now that we're done
                             try:
@@ -2954,6 +3257,10 @@ def get_video_dimensions(video_path: str) -> Tuple[int, int]:
 
 _CACHE_FILENAME = "layout_detection_cache.json"
 
+# Cache version - increment when detection algorithm changes significantly
+# This ensures old cached bboxes are invalidated when logic changes
+_CACHE_VERSION = 3  # v3: Added side_box support, disabled corner snapping for mid-right overlays
+
 
 def _get_cache_path(temp_dir: str) -> str:
     """Get the path to the cache file in the temp directory."""
@@ -2964,11 +3271,13 @@ def _load_cached_layout(temp_dir: str) -> Optional[LayoutInfo]:
     """
     Load cached layout detection result if available.
     
+    Validates cache version to ensure compatibility with current detection logic.
+    
     Args:
         temp_dir: Job temp directory
         
     Returns:
-        LayoutInfo if cache exists and valid, None otherwise
+        LayoutInfo if cache exists, valid, and version matches, None otherwise
     """
     cache_path = _get_cache_path(temp_dir)
     
@@ -2979,11 +3288,28 @@ def _load_cached_layout(temp_dir: str) -> Optional[LayoutInfo]:
         with open(cache_path, 'r') as f:
             data = json.load(f)
         
+        # Check cache version
+        cached_version = data.get('_cache_version', 1)  # Default to v1 for old caches
+        if cached_version != _CACHE_VERSION:
+            print(f"  ⚠️ Cache version mismatch (cached: v{cached_version}, current: v{_CACHE_VERSION})")
+            print(f"     Invalidating cached result - will re-detect with new algorithm")
+            # Delete stale cache
+            try:
+                os.remove(cache_path)
+            except:
+                pass
+            return None
+        
         layout_info = LayoutInfo.from_dict(data)
-        print(f"  📦 Loaded cached layout: {layout_info.layout}")
+        print(f"  📦 Loaded cached layout (v{_CACHE_VERSION}): {layout_info.layout}")
         return layout_info
     except Exception as e:
         print(f"  ⚠️ Failed to load cache: {e}")
+        # Delete corrupted cache
+        try:
+            os.remove(cache_path)
+        except:
+            pass
         return None
 
 
@@ -2993,6 +3319,7 @@ def _save_layout_cache(temp_dir: str, layout_info: LayoutInfo) -> None:
     
     Uses atomic write (write to temp file, then rename) to avoid corrupted JSON.
     Converts numpy types to Python types for JSON serialization.
+    Includes cache version for compatibility checking.
     
     Args:
         temp_dir: Job temp directory
@@ -3005,7 +3332,11 @@ def _save_layout_cache(temp_dir: str, layout_info: LayoutInfo) -> None:
         # Convert to dict and recursively convert numpy types
         data = layout_info.to_dict()
         data = convert_numpy_to_python(data)
-        print(f"  🔄 Converting numpy types for cache serialization...")
+        
+        # Add cache version
+        data['_cache_version'] = _CACHE_VERSION
+        
+        print(f"  🔄 Saving cache (v{_CACHE_VERSION})...")
         
         # Write to temp file first (atomic)
         with open(temp_path, 'w') as f:

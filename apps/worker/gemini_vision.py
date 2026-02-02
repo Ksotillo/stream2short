@@ -133,6 +133,69 @@ def _to_python_float(val: Any) -> float:
     return float(val)
 
 
+def _is_true_corner_overlay(
+    bbox: dict,
+    frame_width: int,
+    frame_height: int,
+    corner: str,
+    edge_threshold_ratio: float = 0.02,
+) -> bool:
+    """
+    Check if bbox is truly attached to its corner edges (within 2% of frame dimension).
+    
+    For mid-right/mid-left overlays that Gemini incorrectly calls "corner_overlay",
+    this function returns False so we don't snap them to edges.
+    
+    Args:
+        bbox: Dict with x, y, width, height
+        frame_width: Video frame width
+        frame_height: Video frame height
+        corner: Expected corner ('top-left', 'top-right', etc.)
+        edge_threshold_ratio: Max gap ratio to consider "touching" (0.02 = 2%)
+        
+    Returns:
+        True if bbox is actually touching corner edges, False otherwise
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    
+    # Calculate thresholds in pixels (2% of dimension)
+    threshold_x = int(frame_width * edge_threshold_ratio)
+    threshold_y = int(frame_height * edge_threshold_ratio)
+    
+    # Calculate gaps to each edge
+    gap_left = x
+    gap_right = frame_width - (x + w)
+    gap_top = y
+    gap_bottom = frame_height - (y + h)
+    
+    print(f"  🔍 True corner check: corner={corner}")
+    print(f"     Gaps: L={gap_left}, R={gap_right}, T={gap_top}, B={gap_bottom}")
+    print(f"     Thresholds: x={threshold_x}px ({edge_threshold_ratio*100:.0f}%), y={threshold_y}px")
+    
+    if corner == 'top-right':
+        touches_right = gap_right <= threshold_x
+        touches_top = gap_top <= threshold_y
+        print(f"     top-right: touches_right={touches_right}, touches_top={touches_top}")
+        return touches_right and touches_top
+    
+    elif corner == 'top-left':
+        touches_left = gap_left <= threshold_x
+        touches_top = gap_top <= threshold_y
+        return touches_left and touches_top
+    
+    elif corner == 'bottom-right':
+        touches_right = gap_right <= threshold_x
+        touches_bottom = gap_bottom <= threshold_y
+        return touches_right and touches_bottom
+    
+    elif corner == 'bottom-left':
+        touches_left = gap_left <= threshold_x
+        touches_bottom = gap_bottom <= threshold_y
+        return touches_left and touches_bottom
+    
+    return False
+
+
 def detect_webcam_with_gemini(frame_path: str, video_width: int, video_height: int) -> Optional[Dict[str, Any]]:
     """
     Use Gemini to detect the webcam overlay in a video frame.
@@ -315,42 +378,73 @@ Examples:
                 print(f"  📍 Webcam detected: type={webcam_type}, corner={corner}")
                 print(f"  📐 Bbox: x={x}, y={y}, w={width}, h={height}, conf={confidence:.2f}")
                 
-                # Sanity check: verify corner positions touch expected edges
-                adjustment_threshold = max(width, height) * 0.2
+                # =================================================================
+                # TRUE CORNER CHECK: Only snap if bbox is truly edge-attached
+                # =================================================================
+                # For mid-right/mid-left overlays, we should NOT snap to edges
+                # because the webcam genuinely doesn't touch the edges.
+                # =================================================================
+                effective_type = webcam_type  # May be changed if not true corner
                 
                 if webcam_type == 'corner_overlay' and corner:
-                    if corner == 'top-right':
-                        expected_right_edge = video_width
-                        actual_right_edge = x + width
-                        gap = expected_right_edge - actual_right_edge
-                        if gap > adjustment_threshold:
-                            print(f"  ⚠️ top-right webcam ends at x={actual_right_edge}, adjusting to touch right edge")
-                            x = video_width - width
-                    elif corner == 'top-left':
-                        if x > adjustment_threshold:
-                            print(f"  ⚠️ top-left webcam starts at x={x}, adjusting to 0")
-                            x = 0
-                    elif corner == 'bottom-right':
-                        if video_width - (x + width) > adjustment_threshold:
-                            x = video_width - width
-                        if video_height - (y + height) > adjustment_threshold:
-                            y = video_height - height
-                    elif corner == 'bottom-left':
-                        if x > adjustment_threshold:
-                            x = 0
-                        if video_height - (y + height) > adjustment_threshold:
-                            y = video_height - height
+                    # Check if bbox actually touches expected corner edges (2% threshold)
+                    is_true_corner = _is_true_corner_overlay(
+                        {'x': x, 'y': y, 'width': width, 'height': height},
+                        video_width, video_height, corner
+                    )
+                    
+                    if is_true_corner:
+                        print(f"  ✅ TRUE CORNER detected - enabling edge snapping")
+                        # Only snap for true corner overlays
+                        if corner == 'top-right':
+                            gap_right = video_width - (x + width)
+                            gap_top = y
+                            if 0 < gap_right <= max(24, int(video_width * 0.03)):
+                                print(f"  ✅ top-right: snapping x to right edge (small gap={gap_right}px)")
+                                x = video_width - width
+                            if 0 < gap_top <= max(24, int(video_height * 0.03)):
+                                print(f"  ✅ top-right: snapping y to top edge (small gap={gap_top}px)")
+                                y = 0
+                        elif corner == 'top-left':
+                            gap_left = x
+                            gap_top = y
+                            if 0 < gap_left <= max(24, int(video_width * 0.03)):
+                                x = 0
+                            if 0 < gap_top <= max(24, int(video_height * 0.03)):
+                                y = 0
+                        elif corner == 'bottom-right':
+                            gap_right = video_width - (x + width)
+                            gap_bottom = video_height - (y + height)
+                            if 0 < gap_right <= max(24, int(video_width * 0.03)):
+                                x = video_width - width
+                            if 0 < gap_bottom <= max(24, int(video_height * 0.03)):
+                                y = video_height - height
+                        elif corner == 'bottom-left':
+                            gap_left = x
+                            gap_bottom = video_height - (y + height)
+                            if 0 < gap_left <= max(24, int(video_width * 0.03)):
+                                x = 0
+                            if 0 < gap_bottom <= max(24, int(video_height * 0.03)):
+                                y = video_height - height
+                    else:
+                        # NOT a true corner - treat as side_box (mid-right, etc.)
+                        print(f"  ⚠️ NOT a true corner overlay (bbox doesn't touch edges)")
+                        print(f"     Gemini said '{webcam_type}' + '{corner}' but edges don't touch")
+                        print(f"     → Treating as 'side_box' - NO SNAPPING applied")
+                        effective_type = 'side_box'  # Override type for downstream processing
                 
                 # Final validation
                 if width < 50 or height < 50:
                     print(f"⚠️ Gemini webcam too small: {width}x{height}")
                     return None
                 
-                print(f"✅ Gemini detected webcam: type={webcam_type}, corner={corner}, x={x}, y={y}, w={width}, h={height}, conf={confidence:.2f}")
+                print(f"✅ Gemini detected webcam: type={webcam_type}, effective_type={effective_type}, corner={corner}")
+                print(f"   x={x}, y={y}, w={width}, h={height}, conf={confidence:.2f}")
                 
                 return {
                     'found': True,
                     'type': webcam_type,
+                    'effective_type': effective_type,  # May differ from 'type' for mid-right overlays
                     'corner': corner,
                     'x': x,
                     'y': y,
