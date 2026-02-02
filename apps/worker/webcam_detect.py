@@ -1159,24 +1159,26 @@ def ensure_headroom(
     face_center: Optional[Tuple[int, int]],
     frame_height: int,
     min_headroom_ratio: float = 0.15,
+    face_height: int = 60,
     debug: bool = False,
 ) -> Dict[str, int]:
     """
-    Ensure there's enough headroom above the face.
+    Ensure bbox contains the face with enough headroom above.
     
-    If the face is too close to the top edge of the bbox, expand upward
-    to give proper headroom. This prevents the streamer's head from being
-    cut off in the final crop.
+    CRITICAL: If the face is OUTSIDE the bbox (above the top edge), this will
+    expand the bbox upward to include it. This prevents the streamer's head
+    from being cut off.
     
     Args:
         bbox: Current bbox {'x', 'y', 'width', 'height'}
         face_center: (x, y) of detected face center, or None
         frame_height: Full frame height (to clamp expansion)
         min_headroom_ratio: Minimum distance from top as ratio of height (default 15%)
+        face_height: Approximate face height for calculating face top
         debug: Enable debug logging
         
     Returns:
-        Adjusted bbox with proper headroom
+        Adjusted bbox that contains the face with proper headroom
     """
     x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
     
@@ -1185,19 +1187,29 @@ def ensure_headroom(
     
     face_x, face_y = face_center
     
-    # Face should be at least min_headroom_ratio down from top of bbox
-    min_face_y_in_bbox = y + int(h * min_headroom_ratio)
+    # Estimate face top (face_y is center, so top is roughly face_y - face_height/2)
+    face_top = face_y - face_height // 2
     
-    if face_y < min_face_y_in_bbox:
-        # Face is too high in bbox (or bbox top is too low)
-        # Move top edge up to give headroom
-        needed_headroom = int(h * min_headroom_ratio)
-        new_y = max(0, face_y - needed_headroom)
+    # Calculate minimum y to include face with headroom
+    # We want: face_top to be at least min_headroom_ratio down from bbox top
+    # So: new_y + h * min_headroom_ratio <= face_top
+    # new_y <= face_top - h * min_headroom_ratio
+    headroom_pixels = int(h * min_headroom_ratio)
+    min_y = face_top - headroom_pixels
+    
+    if debug:
+        print(f"  👤 Face check: center_y={face_y}, face_top≈{face_top}, bbox_y={y}")
+        print(f"     Needed top: {min_y}, Current top: {y}")
+    
+    if y > min_y:
+        # Bbox top is below where it should be - face may be cut off!
+        # Expand upward to include face
+        new_y = max(0, min_y)
         new_h = (y + h) - new_y  # Keep bottom edge same
         
         if debug:
-            print(f"  👤 Headroom protection: y {y} -> {new_y}, h {h} -> {new_h}")
-            print(f"     Face at y={face_y}, needed headroom={needed_headroom}px")
+            print(f"  👤 FACE CONTAINMENT FIX: y {y} -> {new_y}, h {h} -> {new_h}")
+            print(f"     Face was {y - face_top}px outside bbox top!")
         
         return {'x': x, 'y': new_y, 'width': w, 'height': new_h}
     
@@ -2431,7 +2443,7 @@ def refine_side_box_tight_edges(
         print(f"     Strengths: L={left_strength:.1f}, R={right_strength:.1f}, T={top_strength:.1f}, B={bottom_strength:.1f}")
     
     # ==========================================================================
-    # STEP 2.5: HEADROOM PROTECTION - Never move top edge down (cuts off head)
+    # STEP 2.5: HEADROOM PROTECTION - Ensure face is always included
     # ==========================================================================
     # For side_box overlays: NEVER move top edge down
     # Only allow it to move UP (decrease y) to include more headroom
@@ -2439,6 +2451,23 @@ def refine_side_box_tight_edges(
         if debug:
             print(f"     ⚠️ Preventing top edge from moving down ({sy} -> {best_top}), keeping y={sy}")
         best_top = sy
+    
+    # CRITICAL: If we have a face, ensure the top edge is ABOVE the face
+    # Face should be in the upper portion of the bbox with headroom above
+    if face_center:
+        face_y = face_center[1]
+        # Estimate face top (center minus half face height, roughly 30px)
+        estimated_face_top = face_y - 30
+        # Required headroom above face (10% of bbox height)
+        required_headroom = int(sh * 0.10)
+        # Minimum allowed top edge = face_top - headroom
+        min_allowed_top = estimated_face_top - required_headroom
+        
+        if best_top > min_allowed_top:
+            if debug:
+                print(f"     👤 Face at y={face_y}, face_top≈{estimated_face_top}")
+                print(f"     👤 Adjusting top from {best_top} to {min_allowed_top} to include face")
+            best_top = max(0, min_allowed_top)
     
     # ==========================================================================
     # STEP 3: BUILD REFINED BBOX
@@ -6084,7 +6113,9 @@ def detect_webcam_region(
                         face_center_tuple = (detected_face.center_x, detected_face.center_y)
                         protected = ensure_headroom(
                             current_bbox, face_center_tuple, height,
-                            min_headroom_ratio=0.15, debug=True
+                            min_headroom_ratio=0.15,
+                            face_height=detected_face.height if detected_face.height > 0 else 60,
+                            debug=True
                         )
                         
                         if protected['y'] != cam_y or protected['height'] != cam_h:
@@ -6648,7 +6679,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 15  # v15: Headroom protection - prevent top edge from moving down and cutting off streamer's head
+_CACHE_VERSION = 16  # v16: Face containment fix - ensure face is INSIDE bbox with proper headroom
 
 
 def _get_cache_path(temp_dir: str) -> str:
