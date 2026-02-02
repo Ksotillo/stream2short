@@ -287,12 +287,12 @@ def render_split_layout_video(
     
     # ==========================================================================
     # STEP 1: Expand detected bbox by margin to avoid tight crops
-    # For side_box: use minimal margin (2%) since bbox is already refined tight
+    # For side_box: use ZERO margin since tight_edges refinement already found exact edges
     # For corner overlays: use standard margin (8%)
     # ==========================================================================
     if effective_type == 'side_box':
-        margin = 0.02  # 2% for side_box - bbox is already tight, don't re-introduce bleed
-        print(f"   Using reduced margin ({margin*100:.0f}%) for side_box")
+        margin = 0.0  # ZERO for side_box - bbox is already tight from edge refinement
+        print(f"   Using ZERO margin for side_box (tight bbox already)")
     else:
         margin = 0.08  # 8% for corner overlays
     

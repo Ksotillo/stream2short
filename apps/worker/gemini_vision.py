@@ -308,6 +308,15 @@ Return the FULL webcam rectangle boundary, NOT a face crop:
 CRITICAL: Return the ENTIRE webcam box, including any visible frame/border around it.
 Do NOT return just the face region - we need the full webcam rectangle.
 
+=== FLOATING WEBCAM CASE (VERY IMPORTANT) ===
+When the webcam is FLOATING (not touching edges):
+- The webcam rectangle is FULLY INSIDE the frame
+- You MUST return the rectangle's TRUE BOUNDARIES (exact left/right/top/bottom edges)
+- Do NOT include ANY gameplay pixels in the bounding box
+- Do NOT guess or expand the box - find the actual overlay rectangle edges
+- If the webcam has a border/frame, include it; if borderless, find where webcam content ends
+- The bbox must match the overlay's true rectangle boundary EXACTLY
+
 For corner_overlay (MUST touch edges):
 - top-left: x ≈ 0, y ≈ 0
 - top-right: x + width ≈ {video_width}, y ≈ 0

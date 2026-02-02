@@ -1560,6 +1560,325 @@ def refine_side_box_bbox_raycast(
     }
 
 
+def refine_side_box_tight_edges(
+    frame_bgr: np.ndarray,
+    seed_bbox: Dict[str, int],
+    face_center: Optional[Tuple[int, int]],
+    frame_width: int,
+    frame_height: int,
+    debug: bool = False,
+    debug_dir: str = None,
+) -> Optional[Dict[str, int]]:
+    """
+    Find the true webcam rectangle boundaries using edge projection analysis.
+    
+    This is the PRIMARY refinement method for side_box overlays. It works by:
+    1. Expanding the seed bbox to create a search ROI
+    2. Computing edge maps and projections (column/row sums)
+    3. Finding strong vertical edges (left/right) and horizontal edges (top/bottom)
+    4. Selecting the best rectangle that matches webcam characteristics
+    
+    Args:
+        frame_bgr: BGR frame
+        seed_bbox: Initial bbox from Gemini (used as search center)
+        face_center: (x, y) of face center, or None
+        frame_width: Full frame width  
+        frame_height: Full frame height
+        debug: Enable debug logging
+        debug_dir: Directory to save debug images
+        
+    Returns:
+        Refined tight bbox or None if refinement failed
+    """
+    sx, sy, sw, sh = seed_bbox['x'], seed_bbox['y'], seed_bbox['width'], seed_bbox['height']
+    
+    if debug:
+        print(f"  🔬 tight_edges: seed={sw}x{sh} at ({sx},{sy})")
+    
+    # ==========================================================================
+    # STEP 1: Create expanded ROI (60% expansion in each direction)
+    # ==========================================================================
+    expand_ratio = 0.6
+    expand_x = int(sw * expand_ratio)
+    expand_y = int(sh * expand_ratio)
+    
+    roi_x = max(0, sx - expand_x)
+    roi_y = max(0, sy - expand_y)
+    roi_right = min(frame_width, sx + sw + expand_x)
+    roi_bottom = min(frame_height, sy + sh + expand_y)
+    roi_w = roi_right - roi_x
+    roi_h = roi_bottom - roi_y
+    
+    if roi_w < 100 or roi_h < 100:
+        if debug:
+            print(f"     ⚠️ ROI too small: {roi_w}x{roi_h}")
+        return None
+    
+    # Extract ROI
+    roi = frame_bgr[roi_y:roi_bottom, roi_x:roi_right]
+    
+    # Seed bbox position within ROI
+    seed_left_roi = sx - roi_x
+    seed_right_roi = sx + sw - roi_x
+    seed_top_roi = sy - roi_y
+    seed_bottom_roi = sy + sh - roi_y
+    
+    # Face center in ROI coordinates
+    face_x_roi = face_center[0] - roi_x if face_center else seed_left_roi + sw // 2
+    face_y_roi = face_center[1] - roi_y if face_center else seed_top_roi + sh // 3
+    
+    if debug:
+        print(f"     ROI: {roi_w}x{roi_h} at ({roi_x},{roi_y})")
+        print(f"     Seed in ROI: L={seed_left_roi}, R={seed_right_roi}, T={seed_top_roi}, B={seed_bottom_roi}")
+    
+    # ==========================================================================
+    # STEP 2: Compute edge map and projections
+    # ==========================================================================
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(blurred, 30, 100)
+    
+    # Column sums (for vertical edges - left/right boundaries)
+    col_sum = edges.sum(axis=0).astype(float)
+    # Row sums (for horizontal edges - top/bottom boundaries)
+    row_sum = edges.sum(axis=1).astype(float)
+    
+    # Smooth with moving average
+    smooth_window = 11
+    if len(col_sum) > smooth_window:
+        kernel = np.ones(smooth_window) / smooth_window
+        col_sum_smooth = np.convolve(col_sum, kernel, mode='same')
+    else:
+        col_sum_smooth = col_sum
+    
+    if len(row_sum) > smooth_window:
+        row_sum_smooth = np.convolve(row_sum, kernel, mode='same')
+    else:
+        row_sum_smooth = row_sum
+    
+    # ==========================================================================
+    # STEP 3: Find candidate edges near seed boundaries
+    # ==========================================================================
+    def find_edge_candidates(projection, seed_pos, search_range, is_left_or_top=True):
+        """Find strong edge candidates in a search range around seed position."""
+        candidates = []
+        
+        # Define search window
+        if is_left_or_top:
+            # Search left of seed for left edge, above seed for top edge
+            search_start = max(0, seed_pos - search_range)
+            search_end = min(len(projection), seed_pos + search_range // 4)
+        else:
+            # Search right of seed for right edge, below seed for bottom edge
+            search_start = max(0, seed_pos - search_range // 4)
+            search_end = min(len(projection), seed_pos + search_range)
+        
+        if search_start >= search_end:
+            return candidates
+        
+        # Find local maxima (peaks) in the search region
+        region = projection[search_start:search_end]
+        threshold = np.percentile(region, 70) if len(region) > 10 else 0
+        
+        for i in range(2, len(region) - 2):
+            val = region[i]
+            # Check if it's a local maximum above threshold
+            if (val > threshold and 
+                val >= region[i-1] and val >= region[i+1] and
+                val >= region[i-2] and val >= region[i+2]):
+                global_pos = search_start + i
+                candidates.append((global_pos, val))
+        
+        # Sort by strength
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[:5]  # Top 5 candidates
+    
+    # Search range based on seed size
+    search_x = int(sw * 0.35)
+    search_y = int(sh * 0.35)
+    
+    left_candidates = find_edge_candidates(col_sum_smooth, seed_left_roi, search_x, is_left_or_top=True)
+    right_candidates = find_edge_candidates(col_sum_smooth, seed_right_roi, search_x, is_left_or_top=False)
+    top_candidates = find_edge_candidates(row_sum_smooth, seed_top_roi, search_y, is_left_or_top=True)
+    bottom_candidates = find_edge_candidates(row_sum_smooth, seed_bottom_roi, search_y, is_left_or_top=False)
+    
+    if debug:
+        print(f"     Candidates: L={len(left_candidates)}, R={len(right_candidates)}, T={len(top_candidates)}, B={len(bottom_candidates)}")
+    
+    # ==========================================================================
+    # STEP 4: Evaluate candidate rectangles
+    # ==========================================================================
+    def score_rectangle(left, right, top, bottom, l_strength, r_strength, t_strength, b_strength):
+        """Score a candidate rectangle based on various criteria."""
+        w = right - left
+        h = bottom - top
+        
+        # Basic validity
+        if w < 80 or h < 60:
+            return -1, "too small"
+        
+        ar = w / h if h > 0 else 0
+        if ar < 0.9 or ar > 3.0:
+            return -1, f"bad AR {ar:.2f}"
+        
+        # Must contain face (if provided)
+        if face_center:
+            if not (left <= face_x_roi <= right and top <= face_y_roi <= bottom):
+                return -1, "doesn't contain face"
+        
+        # Score components
+        score = 0
+        
+        # 1. Edge strength (combined strength of all 4 edges)
+        edge_strength = (l_strength + r_strength + t_strength + b_strength) / 4
+        max_strength = max(col_sum_smooth.max(), row_sum_smooth.max()) + 1
+        score += (edge_strength / max_strength) * 30
+        
+        # 2. AR closeness to 16:9 (1.78)
+        ar_diff = abs(ar - 1.78)
+        ar_score = max(0, 20 - ar_diff * 15)
+        score += ar_score
+        
+        # 3. Size similarity to seed (prefer similar size)
+        area = w * h
+        seed_area = sw * sh
+        size_ratio = min(area, seed_area) / max(area, seed_area) if seed_area > 0 else 0
+        score += size_ratio * 20
+        
+        # 4. Position similarity to seed (prefer centered on seed)
+        center_x = (left + right) / 2
+        center_y = (top + bottom) / 2
+        seed_center_x = seed_left_roi + sw / 2
+        seed_center_y = seed_top_roi + sh / 2
+        dist = np.sqrt((center_x - seed_center_x)**2 + (center_y - seed_center_y)**2)
+        max_dist = np.sqrt(search_x**2 + search_y**2) + 1
+        score += (1 - dist / max_dist) * 20
+        
+        # 5. Bonus for containing face near center (face should be in upper portion)
+        if face_center:
+            face_rel_y = (face_y_roi - top) / h if h > 0 else 0.5
+            # Face typically in upper 40% of webcam
+            if 0.15 <= face_rel_y <= 0.50:
+                score += 10
+        
+        return score, f"OK (AR={ar:.2f}, area={area})"
+    
+    # Generate all candidate rectangles
+    best_rect = None
+    best_score = -1
+    best_reason = ""
+    
+    # Add seed edges as fallback candidates
+    if not left_candidates:
+        left_candidates = [(seed_left_roi, 0)]
+    if not right_candidates:
+        right_candidates = [(seed_right_roi, 0)]
+    if not top_candidates:
+        top_candidates = [(seed_top_roi, 0)]
+    if not bottom_candidates:
+        bottom_candidates = [(seed_bottom_roi, 0)]
+    
+    for l_pos, l_str in left_candidates[:3]:
+        for r_pos, r_str in right_candidates[:3]:
+            for t_pos, t_str in top_candidates[:3]:
+                for b_pos, b_str in bottom_candidates[:3]:
+                    if l_pos >= r_pos or t_pos >= b_pos:
+                        continue
+                    
+                    score, reason = score_rectangle(l_pos, r_pos, t_pos, b_pos, l_str, r_str, t_str, b_str)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_rect = (l_pos, r_pos, t_pos, b_pos)
+                        best_reason = reason
+    
+    if best_rect is None or best_score < 10:
+        if debug:
+            print(f"     ⚠️ No valid rectangle found (best_score={best_score:.1f})")
+        return None
+    
+    left, right, top, bottom = best_rect
+    
+    # ==========================================================================
+    # STEP 5: Fine-tune edges with local gradient analysis
+    # ==========================================================================
+    def refine_edge_position(pos, projection, direction, max_adjust=15):
+        """Fine-tune edge position by finding the steepest gradient nearby."""
+        search_start = max(1, pos - max_adjust)
+        search_end = min(len(projection) - 1, pos + max_adjust)
+        
+        best_pos = pos
+        best_grad = 0
+        
+        for i in range(search_start, search_end):
+            # Gradient magnitude
+            grad = abs(projection[i+1] - projection[i-1])
+            if grad > best_grad:
+                best_grad = grad
+                best_pos = i
+        
+        return best_pos
+    
+    # Fine-tune each edge
+    left = refine_edge_position(left, col_sum_smooth, 'left')
+    right = refine_edge_position(right, col_sum_smooth, 'right')
+    top = refine_edge_position(top, row_sum_smooth, 'top')
+    bottom = refine_edge_position(bottom, row_sum_smooth, 'bottom')
+    
+    # ==========================================================================
+    # STEP 6: Convert back to frame coordinates
+    # ==========================================================================
+    ref_x = roi_x + left
+    ref_y = roi_y + top
+    ref_w = right - left
+    ref_h = bottom - top
+    
+    # Final validation
+    if ref_w < 80 or ref_h < 60:
+        if debug:
+            print(f"     ⚠️ Final bbox too small: {ref_w}x{ref_h}")
+        return None
+    
+    ar = ref_w / ref_h
+    if ar < 0.9 or ar > 3.0:
+        if debug:
+            print(f"     ⚠️ Final AR out of range: {ar:.2f}")
+        return None
+    
+    # Must contain face
+    if face_center:
+        if not (ref_x <= face_center[0] <= ref_x + ref_w and ref_y <= face_center[1] <= ref_y + ref_h):
+            if debug:
+                print(f"     ⚠️ Final bbox doesn't contain face")
+            return None
+    
+    if debug:
+        print(f"     ✅ tight_edges: {ref_w}x{ref_h} at ({ref_x},{ref_y}), score={best_score:.1f}, AR={ar:.2f}")
+    
+    # Save debug image if requested
+    if debug_dir:
+        try:
+            debug_img = roi.copy()
+            # Draw seed bbox (red)
+            cv2.rectangle(debug_img, (seed_left_roi, seed_top_roi), (seed_right_roi, seed_bottom_roi), (0, 0, 255), 2)
+            # Draw refined bbox (green)
+            cv2.rectangle(debug_img, (left, top), (right, bottom), (0, 255, 0), 2)
+            # Draw face center (blue circle)
+            if face_center:
+                cv2.circle(debug_img, (int(face_x_roi), int(face_y_roi)), 8, (255, 0, 0), -1)
+            
+            debug_path = os.path.join(debug_dir, 'debug_tight_edges.jpg')
+            cv2.imwrite(debug_path, debug_img)
+            print(f"     📸 Saved debug: {debug_path}")
+        except Exception as e:
+            print(f"     ⚠️ Failed to save debug: {e}")
+    
+    return {
+        'x': ref_x, 'y': ref_y,
+        'width': ref_w, 'height': ref_h
+    }
+
+
 def refine_side_box_bbox(
     frame_bgr: np.ndarray,
     gemini_bbox: Dict[str, int],
@@ -1567,9 +1886,10 @@ def refine_side_box_bbox(
     frame_width: int,
     frame_height: int,
     debug: bool = False,
+    debug_dir: str = None,
 ) -> Optional[Dict[str, int]]:
     """
-    Main side_box refinement: tries contour detection first, then raycast fallback.
+    Main side_box refinement: tries tight edge detection first, then contours, then raycast.
     
     Args:
         frame_bgr: BGR frame
@@ -1578,6 +1898,7 @@ def refine_side_box_bbox(
         frame_width: Full frame width
         frame_height: Full frame height
         debug: Enable debug logging
+        debug_dir: Directory to save debug images
         
     Returns:
         Refined bbox or None if all methods failed
@@ -1588,7 +1909,18 @@ def refine_side_box_bbox(
         if face_center:
             print(f"     Face center: ({face_center[0]}, {face_center[1]})")
     
-    # Method 1: Contour detection (preferred)
+    # Method 1: Tight edge detection (NEW - best for floating webcams)
+    refined = refine_side_box_tight_edges(
+        frame_bgr, gemini_bbox, face_center,
+        frame_width, frame_height, debug, debug_dir
+    )
+    
+    if refined:
+        if debug:
+            print(f"  ✅ side_box: tight_edges method succeeded")
+        return refined
+    
+    # Method 2: Contour detection (fallback)
     refined = refine_side_box_bbox_contours(
         frame_bgr, gemini_bbox, face_center,
         frame_width, frame_height, debug
@@ -1599,7 +1931,7 @@ def refine_side_box_bbox(
             print(f"  ✅ side_box: contour method succeeded")
         return refined
     
-    # Method 2: Raycast (fallback)
+    # Method 3: Raycast (last resort)
     if face_center:
         refined = refine_side_box_bbox_raycast(
             frame_bgr, gemini_bbox, face_center,
@@ -3499,13 +3831,18 @@ def detect_webcam_region(
                                         refinement_method = "gemini-norefine"
                             
                             # ============================================================
-                            # SIDE_BOX REFINEMENT (contour + raycast)
-                            # For inset/floating webcams, use contour detection to find
-                            # the true webcam rectangle. Falls back to raycast if contours fail.
+                            # SIDE_BOX REFINEMENT (tight_edges → contour → raycast)
+                            # For inset/floating webcams, use edge projection to find
+                            # the true webcam rectangle. This is the KEY fix for game bleed.
                             # ============================================================
                             if not is_true_corner or effective_type == 'side_box':
-                                print(f"  🔬 Attempting SIDE_BOX refinement (contour + raycast)...")
+                                print(f"  🔬 Attempting SIDE_BOX refinement (tight_edges → contour → raycast)...")
                                 print(f"     Initial bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
+                                
+                                # Get debug directory for saving debug images
+                                debug_dir = None
+                                if temp_dir:
+                                    debug_dir = temp_dir
                                 
                                 # Load frame for refinement
                                 frame_for_refine = None
@@ -3520,13 +3857,14 @@ def detect_webcam_region(
                                     if detected_face:
                                         face_center_for_refine = (detected_face.center_x, detected_face.center_y)
                                     
-                                    # Run the new side_box refinement (contour first, then raycast fallback)
+                                    # Run side_box refinement (tight_edges first, then contour, then raycast)
                                     refined = refine_side_box_bbox(
                                         frame_for_refine,
                                         {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
                                         face_center_for_refine,
                                         width, height,
-                                        debug=True
+                                        debug=True,
+                                        debug_dir=debug_dir
                                     )
                                     
                                     if refined:
@@ -3642,19 +3980,20 @@ def detect_webcam_region(
                             # - side_box: ASYMMETRIC (tight top/sides, more bottom) to prevent game bleed
                             # - other refined: 8% symmetric
                             if not is_true_corner or effective_type == 'side_box':
-                                # ASYMMETRIC padding for side_box - tight crop to prevent game bleed
-                                pad_left = int(cam_w * 0.02)    # 2% left
-                                pad_right = int(cam_w * 0.02)   # 2% right
-                                pad_top = int(cam_h * 0.01)     # 1% top (very tight)
-                                pad_bottom = int(cam_h * 0.05)  # 5% bottom (breathing room)
+                                # ZERO/MINIMAL padding for side_box - tight refinement already found exact edges
+                                # Any padding here will re-introduce game bleed!
+                                pad_left = 0   # ZERO - tight_edges already found the left edge
+                                pad_right = 0  # ZERO - tight_edges already found the right edge
+                                pad_top = 0    # ZERO - tight_edges already found the top edge
+                                pad_bottom = int(cam_h * 0.02)  # 2% bottom only (minimal breathing room)
                                 
                                 new_x = cam_x - pad_left
                                 new_y = cam_y - pad_top
                                 new_w = cam_w + pad_left + pad_right
                                 new_h = cam_h + pad_top + pad_bottom
                                 
-                                print(f"  ℹ️ Asymmetric padding for side_box: L={pad_left}, R={pad_right}, T={pad_top}, B={pad_bottom}")
-                                print(f"  📐 After asymmetric padding: {new_w}x{new_h} at ({new_x},{new_y})")
+                                print(f"  ℹ️ ZERO padding for side_box (tight bbox): L={pad_left}, R={pad_right}, T={pad_top}, B={pad_bottom}")
+                                print(f"  📐 After minimal padding: {new_w}x{new_h} at ({new_x},{new_y})")
                             elif refinement_method == "gemini-good":
                                 padding_ratio = 0.06  # 6% for good Gemini corners
                                 padding_x = int(cam_w * padding_ratio)
@@ -4043,7 +4382,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 6  # v6: side_box contour+raycast refinement, asymmetric padding, no corner-band clamp
+_CACHE_VERSION = 7  # v7: tight_edges refinement for side_box, ZERO padding on L/R/T
 
 
 def _get_cache_path(temp_dir: str) -> str:
