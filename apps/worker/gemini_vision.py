@@ -228,133 +228,80 @@ def detect_webcam_with_gemini(frame_path: str, video_width: int, video_height: i
         with open(frame_path, 'rb') as f:
             image_bytes = f.read()
         
-        prompt = f"""TASK: Analyze this gaming/streaming screenshot and detect any WEBCAM OVERLAY region.
+        prompt = f"""You are a webcam overlay detector. Analyze this streaming screenshot and return ONLY JSON.
 
-IMAGE SIZE: {video_width} × {video_height} pixels
-COORDINATES: x=0 is LEFT edge, y=0 is TOP edge
+IMAGE: {video_width}×{video_height} pixels. x=0 is LEFT, y=0 is TOP.
 
-=== WHAT IS A WEBCAM OVERLAY? ===
-A webcam overlay is a rectangular region showing a REAL HUMAN PERSON (streamer) overlaid on or alongside gameplay.
-The webcam overlay may be:
-- In a CORNER (touching edges) - traditional corner overlay
-- FLOATING (not touching any edge) - mid-right, mid-left, top-center, etc.
+=== TASK ===
+Find the WEBCAM OVERLAY rectangle (real human person from camera feed) and return its TIGHTEST axis-aligned bounding box.
 
-The webcam region should include:
-- A person's face, head, and/or upper body
-- The ENTIRE webcam frame/border (not just the face)
-- Any background visible in the webcam feed
+=== CRITICAL RULES ===
+1. Return ONLY the webcam overlay rectangle, EXCLUDING all gameplay
+2. Return the TIGHTEST bbox that fully contains the webcam - do NOT over-expand
+3. If uncertain, return {{"found": false}} rather than guessing
+4. Include only keys: found, type, corner, x, y, width, height, confidence, reason
 
-CRITICAL: Return a TIGHT bounding box around ONLY the webcam rectangle.
-Do NOT include any gameplay area in the bounding box.
+=== WHAT IS A WEBCAM ===
+- Contains a HUMAN FACE or BODY (streamer)
+- May have background visible (room, chair, etc.)
+- May have a visible border/frame OR be borderless
 
-=== CRITICAL: WHAT IS NOT A WEBCAM ===
-DO NOT classify these as webcam:
-1. MINIMAP / RADAR - Small map showing game location (usually square, shows terrain/markers)
-2. HUD ELEMENTS - Health bars, ammo counters, ability icons, kill feed
-3. GAME UI - Menus, scoreboards, inventory screens
-4. SPONSOR LOGOS - Static images/banners
-5. CHAT OVERLAYS - Text-only regions showing viewer chat
+=== WHAT IS NOT A WEBCAM ===
+- Minimap/radar (game UI showing terrain/map)
+- HUD elements (health, ammo, abilities)
+- Chat overlay (text only)
+- Sponsor logos
 
-Key test: If the region does NOT contain a HUMAN FACE or HUMAN BODY, it is NOT a webcam.
+=== TYPE CLASSIFICATION (strict thresholds) ===
 
-=== LAYOUT TYPES ===
-Classify the webcam (if found) as one of these types:
+"corner_overlay": Webcam TOUCHES 2 frame edges
+- At least one edge within 2% of frame boundary ({int(video_width * 0.02)}px horizontal, {int(video_height * 0.02)}px vertical)
+- Example: x < {int(video_width * 0.02)} means touches left edge
 
-1. "corner_overlay" - Small webcam TOUCHING a corner of the frame
-   - Typically 15-35% of frame width
-   - MUST touch or nearly touch 2 edges (e.g., right edge + top edge for top-right)
-   - Located in: top-left, top-right, bottom-left, or bottom-right
-   - Edges are within ~2-3% of frame boundary
-   
-2. "side_box" - Webcam FLOATING anywhere, NOT touching edges
-   - Can be mid-right, mid-left, top-center, bottom-center, or anywhere else
-   - Has visible gap between webcam and ALL frame edges
-   - Example: webcam on right side with game behind/around it
-   - This is common for streamers who want a "floating" webcam look
-   - IMPORTANT: Return TIGHT bbox around ONLY the webcam, exclude gameplay
-   
-3. "top_band" - Wide webcam band spanning most of the top
-   - Width >= 55% of frame width
-   - Height between 18% and 60% of frame height
-   - Top edge near y=0 (within top 25% of frame)
-   
-4. "bottom_band" - Wide webcam band spanning most of the bottom
-   - Width >= 55% of frame width
-   - Height between 18% and 60% of frame height
-   - Bottom edge near frame bottom
-   
-5. "center_box" - Large centered webcam block
-   - Not in a corner, more centered horizontally
-   - Typically larger than corner overlays
-   
-6. "full_cam" - Entire frame is webcam (no gameplay visible)
-   - Webcam takes up >70% of frame
-   - Little to no gameplay content visible
-   
-7. "none" - No webcam detected
+"side_box": Webcam is FLOATING (gaps to all edges)
+- All edges are > 2% away from frame boundary
+- Use this if you see clear space between webcam and frame edges
+- VERY IMPORTANT: Return EXACT rectangle edges, not a larger guess
 
-=== IMPORTANT: corner_overlay vs side_box ===
-- Use "corner_overlay" ONLY if the webcam box touches or nearly touches 2 frame edges
-- Use "side_box" if the webcam is on a side but has visible gaps to ALL edges
-- When in doubt, prefer "side_box" - it's safer for refinement
+"top_band": Wide bar at top (width >= 55%, height 18-60%, near y=0)
+"bottom_band": Wide bar at bottom (width >= 55%, height 18-60%, near bottom)
+"center_box": Large centered webcam
+"full_cam": Webcam covers >70% of frame
+"none": No webcam found
 
-=== MEASUREMENT INSTRUCTIONS ===
-Return the FULL webcam rectangle boundary, NOT a face crop:
-- x = LEFT edge of the webcam frame/border
-- y = TOP edge of the webcam frame/border
-- width = FULL width from left to right edge (include any visible border)
-- height = FULL height from top to bottom edge (include any visible border)
+=== PREFERENCE: side_box over corner_overlay ===
+If webcam appears near a corner BUT has visible gaps to edges → use "side_box"
+Only use "corner_overlay" if edges genuinely touch/nearly touch the frame boundary.
 
-CRITICAL: Return the ENTIRE webcam box, including any visible frame/border around it.
-Do NOT return just the face region - we need the full webcam rectangle.
+=== MEASUREMENT ===
+Return the FULL webcam rectangle (not just face):
+- x, y = top-left corner of webcam overlay
+- width, height = full dimensions including any border
 
-=== FLOATING WEBCAM CASE (VERY IMPORTANT) ===
-When the webcam is FLOATING (not touching edges):
-- The webcam rectangle is FULLY INSIDE the frame
-- You MUST return the rectangle's TRUE BOUNDARIES (exact left/right/top/bottom edges)
-- Do NOT include ANY gameplay pixels in the bounding box
-- Do NOT guess or expand the box - find the actual overlay rectangle edges
-- If the webcam has a border/frame, include it; if borderless, find where webcam content ends
-- The bbox must match the overlay's true rectangle boundary EXACTLY
+For floating/side_box webcams:
+- Find the exact pixel boundaries of the overlay rectangle
+- Do NOT include gameplay pixels
+- The webcam usually has sharp edges - find them precisely
 
-For corner_overlay (MUST touch edges):
-- top-left: x ≈ 0, y ≈ 0
-- top-right: x + width ≈ {video_width}, y ≈ 0
-- bottom-left: x ≈ 0, y + height ≈ {video_height}
-- bottom-right: x + width ≈ {video_width}, y + height ≈ {video_height}
+=== CONFIDENCE ===
+0.9-1.0: Clear webcam, sharp boundary
+0.7-0.9: Webcam visible but boundary slightly uncertain
+0.5-0.7: Possible webcam
+<0.5: Do not return as found
 
-For side_box (does NOT touch edges):
-- Has gaps between webcam and frame edges on ALL sides
-- Return TIGHT bbox around ONLY the webcam rectangle (exclude gameplay!)
-- Include the nearest position hint: top-left, top-right, bottom-left, bottom-right, mid-left, mid-right, top-center, bottom-center, or center
-- The webcam border is usually a clean rectangle - find its exact edges
+=== RESPONSE FORMAT (JSON ONLY) ===
+{{"found": true, "type": "side_box", "corner": "top-right", "x": 850, "y": 100, "width": 350, "height": 250, "confidence": 0.92, "reason": "Floating webcam on right, gaps to all edges"}}
 
-=== CONFIDENCE SCORING ===
-Provide confidence (0.0 to 1.0) based on:
-- 0.9-1.0: Clear webcam with visible human, distinct frame boundary
-- 0.7-0.9: Likely webcam, human visible but boundary uncertain
-- 0.5-0.7: Possible webcam, uncertain
-- <0.5: Probably not a webcam
+{{"found": true, "type": "corner_overlay", "corner": "bottom-right", "x": {video_width - 400}, "y": {video_height - 280}, "width": 400, "height": 280, "confidence": 0.95, "reason": "Webcam touching right and bottom edges"}}
 
-=== RESPONSE FORMAT ===
-Respond with ONLY a JSON object (no markdown, no explanation):
-
-If webcam found:
-{{"found": true, "type": "<type>", "corner": "<corner or null>", "x": <int>, "y": <int>, "width": <int>, "height": <int>, "confidence": <float>, "reason": "<brief explanation>"}}
-
-If NO webcam:
-{{"found": false, "type": "none", "confidence": 0.0, "reason": "<what you see instead>"}}
-
-Examples:
-- Corner overlay (touches edges): {{"found": true, "type": "corner_overlay", "corner": "top-left", "x": 0, "y": 0, "width": 450, "height": 280, "confidence": 0.95, "reason": "Clear webcam touching top-left corner"}}
-- Side box (inset, not touching): {{"found": true, "type": "side_box", "corner": "top-right", "x": 800, "y": 100, "width": 350, "height": 250, "confidence": 0.90, "reason": "Floating webcam on right side, not touching edges"}}
-- Top band: {{"found": true, "type": "top_band", "corner": null, "x": 0, "y": 0, "width": 1920, "height": 400, "confidence": 0.85, "reason": "Wide webcam band at top with gameplay below"}}
-- No webcam: {{"found": false, "type": "none", "confidence": 0.0, "reason": "Only gameplay and HUD elements visible, no human face"}}"""
+{{"found": false, "type": "none", "confidence": 0.0, "reason": "Only gameplay visible, no human"}}"""
 
         # Try models in order of preference (most capable first)
         models_to_try = [
-            "gemini-2.5-flash",       # Most capable, try first
-            "gemini-2.0-flash-lite",  # Fast fallback
+            "gemini-2.5-pro",         # Most capable, try first
+            "gemini-2.5-flash",       # Fast and capable
+            "gemini-2.5-flash-lite",  # Lightweight fallback
+            "gemini-2.0-flash-lite",  # Legacy fast fallback
             "gemini-1.5-flash",       # Legacy fallback
         ]
         
@@ -672,8 +619,10 @@ If you cannot find the main streamer or are unsure, respond:
 
         # Try models in order of preference (most capable first)
         models_to_try = [
-            "gemini-2.5-flash",       # Most capable, try first
-            "gemini-2.0-flash-lite",  # Fast fallback
+            "gemini-2.5-pro",         # Most capable, try first
+            "gemini-2.5-flash",       # Fast and capable
+            "gemini-2.5-flash-lite",  # Lightweight fallback
+            "gemini-2.0-flash-lite",  # Legacy fast fallback
             "gemini-1.5-flash",       # Legacy fallback
         ]
         

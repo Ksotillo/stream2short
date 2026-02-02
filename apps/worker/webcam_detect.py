@@ -2418,8 +2418,10 @@ def refine_bbox_edges(
     frame_width: int,
     frame_height: int,
     corner: str = None,
+    face_center: Tuple[int, int] = None,
     debug: bool = False,
     debug_dir: str = None,
+    job_id: str = None,
 ) -> Tuple[Dict[str, int], Dict]:
     """
     General edge-based bbox refinement using HoughLinesP.
@@ -2434,8 +2436,10 @@ def refine_bbox_edges(
         frame_width: Full frame width
         frame_height: Full frame height
         corner: Corner position ('top-left', 'top-right', etc.) for corner_overlay mode
+        face_center: Optional (x, y) tuple for face center (used as soft constraint)
         debug: Enable debug logging
         debug_dir: Directory to save debug images
+        job_id: Optional job ID for debug filenames
         
     Returns:
         Tuple of (refined_bbox, meta_dict)
@@ -2492,9 +2496,18 @@ def refine_bbox_edges(
     roi = frame_bgr[roi_y:roi_bottom, roi_x:roi_right]
     
     # ==========================================================================
-    # STEP 2: Preprocess ROI
+    # STEP 2: Preprocess ROI (grayscale + CLAHE + blur)
     # ==========================================================================
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    
+    # Apply CLAHE for better contrast (helps find edges in varied lighting)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    
+    # Mild bilateral filter to reduce noise while preserving edges
+    gray = cv2.bilateralFilter(gray, 5, 50, 50)
+    
+    # Final Gaussian blur
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     
     # ==========================================================================
@@ -2676,10 +2689,25 @@ def refine_bbox_edges(
         return bbox, meta
     
     ar = ref_w / ref_h if ref_h > 0 else 0
+    
+    # Soft AR validation: allow broader range (1.0 to 3.5) but warn for edge cases
+    if ar < 0.9 or ar > 3.5:
+        if debug:
+            print(f"     ⚠️ Bad AR: {ar:.2f} (outside 0.9-3.5)")
+        return bbox, meta
+    
     if ar < 1.05 or ar > 3.0:
         if debug:
-            print(f"     ⚠️ Bad AR: {ar:.2f}")
-        return bbox, meta
+            print(f"     ⚠️ AR {ar:.2f} outside ideal range (1.05-3.0), but accepting")
+    
+    # Check face_center containment (soft constraint - warn but don't reject)
+    if face_center:
+        fx, fy = face_center
+        if not (ref_x <= fx <= ref_x + ref_w and ref_y <= fy <= ref_y + ref_h):
+            if debug:
+                print(f"     ⚠️ Refined bbox doesn't contain face center ({fx}, {fy})")
+            # Don't hard reject - the caller can decide based on this info
+            meta['face_outside'] = True
     
     # Clamp to frame
     ref_x = max(0, min(ref_x, frame_width - ref_w))
@@ -2693,9 +2721,25 @@ def refine_bbox_edges(
         print(f"     ✅ Refined: {ref_w}x{ref_h} at ({ref_x},{ref_y}), AR={ar:.2f}")
         print(f"     Adjustments: {adjustments}")
     
-    # Save debug image
+    # Save debug images
     if debug_dir:
         try:
+            job_suffix = f"_{job_id}" if job_id else ""
+            
+            # Debug image 1: Original frame with ROI
+            original_debug = frame_bgr.copy()
+            cv2.rectangle(original_debug, (roi_x, roi_y), (roi_right, roi_bottom), (255, 0, 255), 2)
+            cv2.putText(original_debug, "ROI", (roi_x + 5, roi_y + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+            orig_debug_path = os.path.join(debug_dir, f'debug_edge_original{job_suffix}.jpg')
+            cv2.imwrite(orig_debug_path, original_debug)
+            
+            # Debug image 2: Edge detection
+            edge_debug = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+            edge_debug_path = os.path.join(debug_dir, f'debug_edge_canny{job_suffix}.jpg')
+            cv2.imwrite(edge_debug_path, edge_debug)
+            
+            # Debug image 3: ROI with lines and bboxes
             debug_img = roi.copy()
             # Draw detected lines
             for line in horizontal_lines[:10]:
@@ -2710,11 +2754,22 @@ def refine_bbox_edges(
             # Draw refined bbox (green)
             cv2.rectangle(debug_img, (new_left, new_top), 
                          (new_right, new_bottom), (0, 255, 0), 2)
+            # Draw face center if provided
+            if face_center:
+                fc_roi_x = face_center[0] - roi_x
+                fc_roi_y = face_center[1] - roi_y
+                cv2.circle(debug_img, (fc_roi_x, fc_roi_y), 8, (0, 255, 0), -1)
+                cv2.putText(debug_img, "Face", (fc_roi_x + 10, fc_roi_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
             
-            debug_path = os.path.join(debug_dir, 'debug_edge_refinement.jpg')
+            debug_path = os.path.join(debug_dir, f'debug_edge_refinement{job_suffix}.jpg')
             cv2.imwrite(debug_path, debug_img)
+            
+            if debug:
+                print(f"     📸 Debug images saved: {debug_path}")
         except Exception as e:
-            pass
+            if debug:
+                print(f"     ⚠️ Could not save debug images: {e}")
     
     return {
         'x': ref_x, 'y': ref_y,
@@ -3059,6 +3114,134 @@ def aggregate_multiframe_bboxes(
         print(f"     Median bbox: {result['width']}x{result['height']} at ({result['x']},{result['y']})")
     
     return result
+
+
+def run_multiframe_gemini_detection(
+    video_path: str,
+    frame_width: int,
+    frame_height: int,
+    temp_dir: str,
+    timestamps: List[float] = [3.0, 10.0, 15.0],
+    min_confidence: float = 0.5,
+) -> Tuple[Optional[Dict], Optional[str], int]:
+    """
+    Run Gemini detection on multiple frames and aggregate results.
+    
+    This provides more robust detection by:
+    1. Sampling multiple frames (default: 3s, 10s, 15s)
+    2. Running Gemini on each frame
+    3. Filtering low-confidence results
+    4. Using consensus (majority type + median bbox) for final result
+    
+    Args:
+        video_path: Path to the video file
+        frame_width: Video width
+        frame_height: Video height
+        temp_dir: Directory for temporary frame files
+        timestamps: List of timestamps to sample
+        min_confidence: Minimum confidence to accept a detection
+        
+    Returns:
+        Tuple of (aggregated_result, winning_frame_path, winning_timestamp_index)
+        Returns (None, None, -1) if no valid detection
+    """
+    from gemini_vision import detect_webcam_with_gemini, extract_frame_for_analysis
+    
+    print(f"  🎬 Multi-frame Gemini detection: sampling {len(timestamps)} frames...")
+    
+    detections = []
+    frame_paths = []
+    
+    # Run Gemini on all frames (don't break early)
+    for i, ts in enumerate(timestamps):
+        frame_path = f"{temp_dir}/webcam_detect_frame_{int(ts)}.jpg"
+        print(f"  📸 Frame {i+1}/{len(timestamps)} at {ts}s...")
+        
+        if extract_frame_for_analysis(video_path, frame_path, timestamp=ts):
+            frame_paths.append(frame_path)
+            result = detect_webcam_with_gemini(frame_path, frame_width, frame_height)
+            
+            if result:
+                # Store frame index and path with result
+                result['_frame_idx'] = i
+                result['_frame_path'] = frame_path
+                result['_timestamp'] = ts
+                
+                if result.get('no_webcam_confirmed'):
+                    print(f"     ❌ No webcam found at {ts}s")
+                    detections.append(result)
+                else:
+                    conf = result.get('confidence', 0.0)
+                    print(f"     ✅ Found: type={result.get('type')}, conf={conf:.2f}, " +
+                          f"bbox={result.get('width')}x{result.get('height')} at ({result.get('x')},{result.get('y')})")
+                    detections.append(result)
+            else:
+                print(f"     ⚠️ Gemini failed at {ts}s")
+        else:
+            print(f"     ⚠️ Could not extract frame at {ts}s")
+            frame_paths.append(None)
+    
+    if not detections:
+        print("  ❌ No Gemini detections from any frame")
+        return None, None, -1
+    
+    # Filter valid detections (found=true, confidence >= min)
+    valid = [
+        d for d in detections 
+        if d.get('found') and not d.get('no_webcam_confirmed') and d.get('confidence', 0) >= min_confidence
+    ]
+    
+    # Check if majority said no webcam
+    no_webcam_count = sum(1 for d in detections if d.get('no_webcam_confirmed'))
+    if no_webcam_count > len(detections) // 2:
+        print(f"  ℹ️ Majority ({no_webcam_count}/{len(detections)}) said no webcam")
+        return {'no_webcam_confirmed': True, 'type': 'none', 'confidence': 0.0}, None, -1
+    
+    if not valid:
+        print(f"  ❌ No valid detections with confidence >= {min_confidence}")
+        return None, None, -1
+    
+    print(f"  📊 {len(valid)}/{len(detections)} frames have valid detections")
+    
+    if len(valid) == 1:
+        # Only one valid detection
+        result = valid[0]
+        winning_idx = result.get('_frame_idx', 0)
+        winning_path = result.get('_frame_path')
+        print(f"  🏆 Using single valid detection from frame {winning_idx+1}")
+        return result, winning_path, winning_idx
+    
+    # Multiple valid detections: use consensus
+    # Strategy: prefer highest confidence, but use median bbox for stability
+    
+    # Sort by confidence
+    valid_sorted = sorted(valid, key=lambda d: d.get('confidence', 0), reverse=True)
+    highest_conf = valid_sorted[0]
+    
+    # Aggregate using median (more robust)
+    aggregated = aggregate_multiframe_bboxes(valid, debug=True)
+    
+    if aggregated:
+        # Use the highest confidence detection's type/corner but aggregated bbox
+        aggregated['type'] = highest_conf.get('type', aggregated.get('type'))
+        aggregated['effective_type'] = highest_conf.get('effective_type', aggregated.get('effective_type'))
+        aggregated['corner'] = highest_conf.get('corner', aggregated.get('corner'))
+        
+        # Use the frame path from highest confidence detection
+        winning_idx = highest_conf.get('_frame_idx', 0)
+        winning_path = highest_conf.get('_frame_path')
+        
+        print(f"  🏆 Consensus: type={aggregated.get('type')}, " +
+              f"bbox={aggregated['width']}x{aggregated['height']} at ({aggregated['x']},{aggregated['y']})")
+        print(f"  🏆 Winning frame: {winning_idx+1} (highest confidence: {highest_conf.get('confidence', 0):.2f})")
+        
+        return aggregated, winning_path, winning_idx
+    else:
+        # Fallback to highest confidence
+        winning_idx = highest_conf.get('_frame_idx', 0)
+        winning_path = highest_conf.get('_frame_path')
+        print(f"  🏆 Using highest confidence detection from frame {winning_idx+1}")
+        return highest_conf, winning_path, winning_idx
 
 
 def refine_side_box_bbox(
@@ -4797,6 +4980,7 @@ def detect_webcam_region(
     video_path: str,
     sample_times: list[float] = [3.0, 10.0, 15.0],
     temp_dir: str = "/tmp",
+    job_id: str = None,
 ) -> Optional[WebcamRegion]:
     """
     Detect the webcam/facecam region in a video.
@@ -4808,6 +4992,7 @@ def detect_webcam_region(
         video_path: Path to the video file
         sample_times: List of times (in seconds) to sample frames from
         temp_dir: Directory for temporary frame extraction
+        job_id: Optional job ID for debug artifact filenames
         
     Returns:
         WebcamRegion if webcam detected, None otherwise
@@ -4831,27 +5016,25 @@ def detect_webcam_region(
             # Get video dimensions
             width, height = get_video_dimensions(video_path)
             
-            # Try multiple frames for better detection
-            timestamps_to_try = [3.0, 8.0, 15.0]
+            # Use multi-frame consensus for robust detection
+            timestamps_to_try = [3.0, 10.0, 15.0]
             
-            for ts in timestamps_to_try:
-                frame_path = f"{temp_dir}/webcam_detect_frame_{int(ts)}.jpg"
-                print(f"  📸 Analyzing frame at {ts}s...")
-                
-                if extract_frame_for_analysis(video_path, frame_path, timestamp=ts):
-                    result = detect_webcam_with_gemini(frame_path, width, height)
-                    
-                    # DON'T DELETE FRAME YET - we need it for refinement!
-                    # It will be cleaned up after refinement or at the end
-                    
-                    if result:
-                        if result.get('no_webcam_confirmed'):
-                            # Gemini explicitly said there's no webcam - trust it, skip OpenCV
-                            print("  ℹ️ Gemini confirmed: NO webcam in this video")
-                            gemini_explicitly_no_webcam = True
-                            break  # Don't try more frames
-                        else:
-                            print(f"  ✅ Gemini found webcam: {result}")
+            result, frame_path, ts_idx = run_multiframe_gemini_detection(
+                video_path, width, height, temp_dir,
+                timestamps=timestamps_to_try,
+                min_confidence=0.5
+            )
+            
+            # Get timestamp for the winning frame
+            ts = timestamps_to_try[ts_idx] if ts_idx >= 0 else 3.0
+            
+            if result:
+                if result.get('no_webcam_confirmed'):
+                    # Gemini explicitly said there's no webcam - trust it, skip OpenCV
+                    print("  ℹ️ Gemini confirmed: NO webcam in this video")
+                    gemini_explicitly_no_webcam = True
+                else:
+                    print(f"  ✅ Gemini found webcam (multi-frame consensus): {result}")
                             
                             # Use corner from Gemini if available
                             position = result.get('corner', 'top-left')
@@ -4879,8 +5062,31 @@ def detect_webcam_region(
                             # NEW: Get effective_type (may differ from gemini_type for mid-right overlays)
                             effective_type = result.get('effective_type', gemini_type)
                             
+                            # ============================================================
+                            # VERIFY TRUE CORNER: Downgrade to side_box if doesn't touch edges
+                            # ============================================================
+                            edge_threshold = 0.02  # 2% of frame dimension
+                            edge_threshold_x = int(width * edge_threshold)
+                            edge_threshold_y = int(height * edge_threshold)
+                            
+                            # Check which edges the bbox touches
+                            touches_left = gemini_x < edge_threshold_x
+                            touches_right = (gemini_x + gemini_w) > (width - edge_threshold_x)
+                            touches_top = gemini_y < edge_threshold_y
+                            touches_bottom = (gemini_y + gemini_h) > (height - edge_threshold_y)
+                            
+                            # Count how many edges are touched
+                            edges_touched = sum([touches_left, touches_right, touches_top, touches_bottom])
+                            
+                            # True corner overlay must touch AT LEAST 2 edges
+                            if gemini_type == 'corner_overlay' and edges_touched < 2:
+                                print(f"  ⚠️ Gemini said 'corner_overlay' but only touches {edges_touched} edge(s)")
+                                print(f"     Touches: L={touches_left}, R={touches_right}, T={touches_top}, B={touches_bottom}")
+                                print(f"     DOWNGRADING to 'side_box' for safer handling")
+                                effective_type = 'side_box'
+                            
                             # Determine if this is a TRUE corner overlay (for guardrail decisions)
-                            is_true_corner = (effective_type == 'corner_overlay')
+                            is_true_corner = (effective_type == 'corner_overlay' and edges_touched >= 2)
                             if effective_type == 'side_box':
                                 is_true_corner = False
                                 print(f"  ⚠️ SIDE_BOX detected: corner guardrails will be DISABLED")
@@ -4891,6 +5097,7 @@ def detect_webcam_region(
                             refinement_method = "gemini"  # Default: use Gemini as-is
                             detected_face = None
                             is_suspicious = False
+                            frame_for_refine = None  # Will be loaded for refinement/edge detection
                             
                             print(f"  📐 Gemini detection: type={gemini_type}, effective={effective_type}, conf={gemini_confidence:.2f}")
                             print(f"     is_true_corner={is_true_corner}")
@@ -5211,12 +5418,28 @@ def detect_webcam_region(
                                 print(f"  👤 Face: {detected_face.width}x{detected_face.height} at ({detected_face.x},{detected_face.y})")
                             
                             # ============================================================
+                            # ENSURE FRAME IS LOADED FOR REFINEMENT
+                            # Load frame if not already loaded (needed for edge refinement)
+                            # ============================================================
+                            if frame_for_refine is None:
+                                if frame_path and os.path.exists(frame_path):
+                                    frame_for_refine = cv2.imread(frame_path)
+                                if frame_for_refine is None:
+                                    print(f"  📹 Loading frame for refinement...")
+                                    frame_for_refine = extract_frame(video_path, ts)
+                            
+                            # ============================================================
                             # GENERAL EDGE REFINEMENT (Step 3 - layout-aware)
                             # Uses HoughLinesP to find true rectangular boundaries
                             # ============================================================
                             if frame_for_refine is not None:
                                 mode = effective_type if effective_type in ['corner_overlay', 'side_box'] else 'side_box'
                                 print(f"  📐 Running general edge refinement (mode={mode})...")
+                                
+                                # Get face center for edge refinement
+                                face_center_for_edges = None
+                                if detected_face:
+                                    face_center_for_edges = (detected_face.center_x, detected_face.center_y)
                                 
                                 edge_refined, edge_meta = refine_bbox_edges(
                                     frame_for_refine,
@@ -5225,6 +5448,7 @@ def detect_webcam_region(
                                     frame_width=width,
                                     frame_height=height,
                                     corner=position,
+                                    face_center=face_center_for_edges,
                                     debug=True,
                                     debug_dir=temp_dir if temp_dir else None
                                 )
@@ -5390,7 +5614,8 @@ def detect_webcam_region(
                             )
                             
                             # 3. Combined view with all boxes
-                            debug_combined_path = f"{temp_dir}/debug_webcam_detection.jpg"
+                            job_suffix = f"_{job_id}" if job_id else ""
+                            debug_combined_path = f"{temp_dir}/debug_webcam_detection{job_suffix}.jpg"
                             debug_boxes = [
                                 {'x': gemini_x, 'y': gemini_y, 'w': gemini_w, 'h': gemini_h, 
                                  'label': 'Gemini', 'color': (0, 0, 255)},  # Red
@@ -5664,7 +5889,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 9  # v9: General edge refinement (HoughLines) + bleed detection + layout-aware padding
+_CACHE_VERSION = 10  # v10: Multi-frame Gemini consensus + corner-to-sidebox downgrade + stricter prompt + gemini-2.5-pro
 
 
 def _get_cache_path(temp_dir: str) -> str:
