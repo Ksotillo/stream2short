@@ -861,6 +861,345 @@ def tighten_webcam_bbox_contours(
     }
 
 
+def refine_side_box_with_face_edges(
+    frame_bgr: np.ndarray,
+    initial_bbox: Dict[str, int],
+    face_bbox: Optional[Dict[str, int]],
+    frame_width: int,
+    frame_height: int,
+    debug: bool = False,
+) -> Optional[Dict[str, int]]:
+    """
+    Refine a side_box webcam bbox using face-anchored edge projection.
+    
+    This is the key algorithm for inset/floating webcams that don't touch edges.
+    Uses the face position to define a search ROI, then finds the true webcam
+    rectangle by analyzing edge projections (column/row sums of edge map).
+    
+    Algorithm:
+    1. Define ROI centered on face (or initial bbox if no face)
+    2. Compute edge map (Canny) within ROI
+    3. Calculate column sums (vertical edges) and row sums (horizontal edges)
+    4. Find strongest border lines left/right/top/bottom of face center
+    5. Validate the resulting rectangle
+    
+    Args:
+        frame_bgr: BGR frame image
+        initial_bbox: Initial bbox from Gemini (used as fallback and ROI hint)
+        face_bbox: Detected face bbox (x, y, width, height) - critical for accuracy
+        frame_width: Full frame width
+        frame_height: Full frame height
+        debug: Enable debug logging
+        
+    Returns:
+        Refined bbox dict or None if refinement failed
+    """
+    bx, by, bw, bh = initial_bbox['x'], initial_bbox['y'], initial_bbox['width'], initial_bbox['height']
+    
+    # Get face center (use initial bbox center if no face detected)
+    if face_bbox:
+        fx = face_bbox['x'] + face_bbox['width'] // 2
+        fy = face_bbox['y'] + face_bbox['height'] // 2
+        face_w = face_bbox['width']
+        face_h = face_bbox['height']
+    else:
+        # Fallback: assume face is centered in initial bbox, upper portion
+        fx = bx + bw // 2
+        fy = by + int(bh * 0.35)  # Face usually in upper third
+        face_w = int(bw * 0.25)
+        face_h = int(bh * 0.25)
+    
+    if debug:
+        print(f"  🔬 Face-anchored edge refinement:")
+        print(f"     Face center: ({fx}, {fy}), initial bbox: {bw}x{bh} at ({bx},{by})")
+    
+    # Define ROI around face - expand to capture full webcam box
+    # Use larger multipliers to ensure we capture the full webcam frame
+    roi_w = min(frame_width, max(int(bw * 2.2), int(frame_width * 0.5)))
+    roi_h = min(frame_height, max(int(bh * 2.0), int(frame_height * 0.5)))
+    
+    # Center ROI on face
+    roi_x = max(0, fx - roi_w // 2)
+    roi_y = max(0, fy - roi_h // 2)
+    
+    # Clamp ROI to frame
+    roi_x = min(roi_x, frame_width - roi_w)
+    roi_y = min(roi_y, frame_height - roi_h)
+    roi_w = min(roi_w, frame_width - roi_x)
+    roi_h = min(roi_h, frame_height - roi_y)
+    
+    if roi_w < 100 or roi_h < 100:
+        if debug:
+            print(f"     ⚠️ ROI too small: {roi_w}x{roi_h}")
+        return None
+    
+    # Extract ROI
+    roi = frame_bgr[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+    
+    # Convert to grayscale and compute edges
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    
+    # Edge projections
+    col_sum = edges.sum(axis=0).astype(float)  # Vertical edges (left/right borders)
+    row_sum = edges.sum(axis=1).astype(float)  # Horizontal edges (top/bottom borders)
+    
+    # Smooth with moving average (window ~15-21)
+    window_size = min(21, roi_w // 10, roi_h // 10)
+    if window_size > 3:
+        kernel = np.ones(window_size) / window_size
+        col_sum = np.convolve(col_sum, kernel, mode='same')
+        row_sum = np.convolve(row_sum, kernel, mode='same')
+    
+    # Face position in ROI coordinates
+    face_x_roi = fx - roi_x
+    face_y_roi = fy - roi_y
+    
+    # Find borders using peak detection
+    # Left border: strongest peak LEFT of face center
+    left_region = col_sum[:face_x_roi]
+    if len(left_region) > 10:
+        # Find peaks in left region
+        left_peaks = []
+        for i in range(5, len(left_region) - 5):
+            if col_sum[i] > col_sum[i-5] and col_sum[i] > col_sum[i+5]:
+                left_peaks.append((i, col_sum[i]))
+        if left_peaks:
+            # Take the strongest peak
+            left_peaks.sort(key=lambda x: x[1], reverse=True)
+            left_border_roi = left_peaks[0][0]
+        else:
+            # Fallback: use 10% from left
+            left_border_roi = int(face_x_roi * 0.15)
+    else:
+        left_border_roi = 0
+    
+    # Right border: strongest peak RIGHT of face center
+    right_region = col_sum[face_x_roi:]
+    if len(right_region) > 10:
+        right_peaks = []
+        for i in range(5, len(right_region) - 5):
+            idx = face_x_roi + i
+            if col_sum[idx] > col_sum[idx-5] and col_sum[idx] > col_sum[idx+5]:
+                right_peaks.append((idx, col_sum[idx]))
+        if right_peaks:
+            right_peaks.sort(key=lambda x: x[1], reverse=True)
+            right_border_roi = right_peaks[0][0]
+        else:
+            # Fallback: use 85% towards right
+            right_border_roi = face_x_roi + int(len(right_region) * 0.85)
+    else:
+        right_border_roi = roi_w - 1
+    
+    # Top border: strongest peak ABOVE face center
+    top_region = row_sum[:face_y_roi]
+    if len(top_region) > 10:
+        top_peaks = []
+        for i in range(5, len(top_region) - 5):
+            if row_sum[i] > row_sum[i-5] and row_sum[i] > row_sum[i+5]:
+                top_peaks.append((i, row_sum[i]))
+        if top_peaks:
+            top_peaks.sort(key=lambda x: x[1], reverse=True)
+            top_border_roi = top_peaks[0][0]
+        else:
+            top_border_roi = int(face_y_roi * 0.15)
+    else:
+        top_border_roi = 0
+    
+    # Bottom border: strongest peak BELOW face center
+    bottom_region = row_sum[face_y_roi:]
+    if len(bottom_region) > 10:
+        bottom_peaks = []
+        for i in range(5, len(bottom_region) - 5):
+            idx = face_y_roi + i
+            if row_sum[idx] > row_sum[idx-5] and row_sum[idx] > row_sum[idx+5]:
+                bottom_peaks.append((idx, row_sum[idx]))
+        if bottom_peaks:
+            bottom_peaks.sort(key=lambda x: x[1], reverse=True)
+            bottom_border_roi = bottom_peaks[0][0]
+        else:
+            bottom_border_roi = face_y_roi + int(len(bottom_region) * 0.85)
+    else:
+        bottom_border_roi = roi_h - 1
+    
+    # Convert back to full frame coordinates
+    ref_x = roi_x + left_border_roi
+    ref_y = roi_y + top_border_roi
+    ref_w = right_border_roi - left_border_roi
+    ref_h = bottom_border_roi - top_border_roi
+    
+    if debug:
+        print(f"     ROI: {roi_w}x{roi_h} at ({roi_x},{roi_y})")
+        print(f"     Borders (ROI): L={left_border_roi}, R={right_border_roi}, T={top_border_roi}, B={bottom_border_roi}")
+        print(f"     Raw refined: {ref_w}x{ref_h} at ({ref_x},{ref_y})")
+    
+    # Validation
+    # 1. Minimum size: width >= 15% frame_w, height >= 12% frame_h
+    min_width = int(frame_width * 0.15)
+    min_height = int(frame_height * 0.12)
+    
+    if ref_w < min_width or ref_h < min_height:
+        if debug:
+            print(f"     ⚠️ Refined bbox too small: {ref_w}x{ref_h} (min: {min_width}x{min_height})")
+        # Try fallback: face-anchored expansion with target AR
+        return _face_anchored_fallback(fx, fy, face_w, face_h, frame_width, frame_height, debug)
+    
+    # 2. Aspect ratio check: 1.2 <= AR <= 3.5
+    ar = ref_w / ref_h if ref_h > 0 else 0
+    if ar < 1.2 or ar > 3.5:
+        if debug:
+            print(f"     ⚠️ Bad aspect ratio: {ar:.2f} (expected 1.2-3.5)")
+        # Try fallback
+        return _face_anchored_fallback(fx, fy, face_w, face_h, frame_width, frame_height, debug)
+    
+    # 3. Must contain face center
+    if not (ref_x <= fx <= ref_x + ref_w and ref_y <= fy <= ref_y + ref_h):
+        if debug:
+            print(f"     ⚠️ Refined bbox doesn't contain face center")
+        return _face_anchored_fallback(fx, fy, face_w, face_h, frame_width, frame_height, debug)
+    
+    # 4. Clamp to frame
+    ref_x = max(0, min(ref_x, frame_width - ref_w))
+    ref_y = max(0, min(ref_y, frame_height - ref_h))
+    ref_w = min(ref_w, frame_width - ref_x)
+    ref_h = min(ref_h, frame_height - ref_y)
+    
+    if debug:
+        print(f"     ✅ Refined bbox: {ref_w}x{ref_h} at ({ref_x},{ref_y}), AR={ar:.2f}")
+    
+    return {
+        'x': ref_x, 'y': ref_y,
+        'width': ref_w, 'height': ref_h
+    }
+
+
+def _face_anchored_fallback(
+    fx: int, fy: int, 
+    face_w: int, face_h: int,
+    frame_width: int, frame_height: int,
+    debug: bool = False
+) -> Optional[Dict[str, int]]:
+    """
+    Fallback when edge refinement fails: create a box around face with target AR.
+    
+    Uses 16:9-ish aspect ratio (1.78) which is common for webcams.
+    """
+    # Target AR ~1.78 (16:9)
+    target_ar = 1.78
+    
+    # Base size on face (face is typically ~20-35% of webcam height)
+    box_h = int(face_h * 3.5)  # Face ~28% of height
+    box_w = int(box_h * target_ar)
+    
+    # Ensure minimum size
+    box_w = max(box_w, int(frame_width * 0.20))
+    box_h = max(box_h, int(frame_height * 0.15))
+    
+    # Recalculate with AR
+    box_w = int(box_h * target_ar)
+    
+    # Center on face (face usually in upper portion)
+    box_x = fx - box_w // 2
+    box_y = fy - int(box_h * 0.30)  # Face at ~30% from top
+    
+    # Clamp to frame
+    box_x = max(0, min(box_x, frame_width - box_w))
+    box_y = max(0, min(box_y, frame_height - box_h))
+    box_w = min(box_w, frame_width - box_x)
+    box_h = min(box_h, frame_height - box_y)
+    
+    if debug:
+        print(f"     📐 Fallback face-anchored: {box_w}x{box_h} at ({box_x},{box_y})")
+    
+    return {
+        'x': box_x, 'y': box_y,
+        'width': box_w, 'height': box_h
+    }
+
+
+def refine_side_box_multiframe(
+    video_path: str,
+    initial_bbox: Dict[str, int],
+    frame_width: int,
+    frame_height: int,
+    timestamps: List[float] = [3.0, 10.0, 15.0],
+    debug: bool = False,
+) -> Optional[Dict[str, int]]:
+    """
+    Run face-anchored edge refinement on multiple frames and take median.
+    
+    This provides more stable results by averaging out frame-specific noise.
+    
+    Args:
+        video_path: Path to video file
+        initial_bbox: Initial bbox from Gemini
+        frame_width: Frame width
+        frame_height: Frame height
+        timestamps: List of timestamps to sample
+        debug: Enable debug logging
+        
+    Returns:
+        Median-refined bbox or None if all frames failed
+    """
+    refined_boxes = []
+    
+    for ts in timestamps:
+        frame = extract_frame(video_path, ts)
+        if frame is None:
+            continue
+        
+        # Detect face in frame
+        roi_x = max(0, initial_bbox['x'] - 50)
+        roi_y = max(0, initial_bbox['y'] - 50)
+        roi_w = min(frame_width - roi_x, initial_bbox['width'] + 100)
+        roi_h = min(frame_height - roi_y, initial_bbox['height'] + 100)
+        
+        face = detect_face_dnn(frame, roi_x, roi_y, roi_w, roi_h)
+        face_bbox = None
+        if face:
+            face_bbox = {
+                'x': face.x, 'y': face.y,
+                'width': face.width, 'height': face.height
+            }
+        
+        # Run refinement
+        refined = refine_side_box_with_face_edges(
+            frame, initial_bbox, face_bbox,
+            frame_width, frame_height,
+            debug=debug and ts == timestamps[0]  # Only debug first frame
+        )
+        
+        if refined:
+            refined_boxes.append(refined)
+            if debug:
+                print(f"     Frame {ts}s: {refined['width']}x{refined['height']} at ({refined['x']},{refined['y']})")
+    
+    if not refined_boxes:
+        if debug:
+            print(f"  ⚠️ Multi-frame refinement failed on all {len(timestamps)} frames")
+        return None
+    
+    # Take median of x, y, width, height
+    xs = [b['x'] for b in refined_boxes]
+    ys = [b['y'] for b in refined_boxes]
+    ws = [b['width'] for b in refined_boxes]
+    hs = [b['height'] for b in refined_boxes]
+    
+    median_bbox = {
+        'x': int(np.median(xs)),
+        'y': int(np.median(ys)),
+        'width': int(np.median(ws)),
+        'height': int(np.median(hs))
+    }
+    
+    if debug:
+        print(f"  ✅ Multi-frame median ({len(refined_boxes)}/{len(timestamps)} frames): " +
+              f"{median_bbox['width']}x{median_bbox['height']} at ({median_bbox['x']},{median_bbox['y']})")
+    
+    return median_bbox
+
+
 def convert_numpy_to_python(obj):
     """
     Recursively convert numpy types to Python native types for JSON serialization.
@@ -2743,54 +3082,40 @@ def detect_webcam_region(
                                         refinement_method = "gemini-norefine"
                             
                             # ============================================================
-                            # TIGHT REFINEMENT for SIDE_BOX overlays
-                            # For mid-right webcams, try contour-based tightening to 
-                            # remove game UI bleed from the initial Gemini bbox
+                            # FACE-ANCHORED EDGE REFINEMENT for SIDE_BOX overlays
+                            # For inset/floating webcams, use edge projection to find
+                            # the true webcam rectangle. Uses multi-frame median for stability.
                             # ============================================================
-                            if not is_true_corner and effective_type == 'side_box':
-                                print(f"  🔬 Attempting TIGHT refinement for side_box overlay...")
+                            if not is_true_corner or effective_type == 'side_box':
+                                print(f"  🔬 Attempting FACE-ANCHORED EDGE refinement for side_box overlay...")
+                                print(f"     Initial bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
                                 
-                                # Load frame if needed
-                                frame_for_tight = None
-                                if frame_path and os.path.exists(frame_path):
-                                    frame_for_tight = cv2.imread(frame_path)
-                                if frame_for_tight is None:
-                                    frame_for_tight = extract_frame(video_path, ts)
+                                # Use multi-frame refinement for stability
+                                edge_refined = refine_side_box_multiframe(
+                                    video_path,
+                                    {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
+                                    width, height,
+                                    timestamps=[3.0, 10.0, 15.0],
+                                    debug=True
+                                )
                                 
-                                if frame_for_tight is not None:
-                                    # Get face center if available
-                                    face_center = None
+                                if edge_refined:
+                                    # Validate: must contain face if we have one
+                                    valid = True
                                     if detected_face:
-                                        face_center = (detected_face.center_x, detected_face.center_y)
+                                        if not bbox_contains_face(edge_refined, detected_face, margin_ratio=0.05):
+                                            print(f"  ⚠️ Edge-refined bbox doesn't contain face, keeping original")
+                                            valid = False
                                     
-                                    tight_bbox = tighten_webcam_bbox_contours(
-                                        frame_for_tight,
-                                        {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
-                                        width, height,
-                                        face_center=face_center,
-                                        debug=True
-                                    )
-                                    
-                                    if tight_bbox:
-                                        print(f"  ✅ Tight refinement found: {tight_bbox['width']}x{tight_bbox['height']} at ({tight_bbox['x']},{tight_bbox['y']})")
-                                        
-                                        # Validate: must contain face if we have one
-                                        valid = True
-                                        if detected_face:
-                                            if not bbox_contains_face(tight_bbox, detected_face, margin_ratio=0.05):
-                                                print(f"  ⚠️ Tight bbox doesn't contain face, keeping original")
-                                                valid = False
-                                        
-                                        if valid:
-                                            cam_x = tight_bbox['x']
-                                            cam_y = tight_bbox['y']
-                                            cam_w = tight_bbox['width']
-                                            cam_h = tight_bbox['height']
-                                            refinement_method = f"{refinement_method}+tight"
-                                    else:
-                                        print(f"  ⚠️ Tight refinement failed, keeping current bbox")
+                                    if valid:
+                                        print(f"  ✅ Edge refinement accepted: {edge_refined['width']}x{edge_refined['height']} at ({edge_refined['x']},{edge_refined['y']})")
+                                        cam_x = edge_refined['x']
+                                        cam_y = edge_refined['y']
+                                        cam_w = edge_refined['width']
+                                        cam_h = edge_refined['height']
+                                        refinement_method = f"{refinement_method}+edge"
                                 else:
-                                    print(f"  ⚠️ Could not load frame for tight refinement")
+                                    print(f"  ⚠️ Edge refinement failed, keeping current bbox")
                             
                             # ============================================================
                             # HARD CONSTRAINTS ON FINAL BBOX
@@ -2875,12 +3200,19 @@ def detect_webcam_region(
                             # ============================================================
                             # APPLY PADDING (relative to refined bbox ONLY)
                             # ============================================================
-                            # Use smaller padding (6%) for good Gemini bboxes
-                            # Use larger padding (12%) for refined/suspicious bboxes
+                            # Padding strategy by type:
+                            # - good Gemini corner: 6% (already touching edges)
+                            # - side_box (edge-refined): 4-5% (minimal - edge refinement is precise)
+                            # - other refined: 8-10% (moderate)
                             if refinement_method == "gemini-good":
-                                padding_ratio = 0.06  # 6% for good Gemini
+                                padding_ratio = 0.06  # 6% for good Gemini corners
+                            elif not is_true_corner or effective_type == 'side_box':
+                                # SMALLER padding for side_box - refinement is more precise
+                                # and padding is what causes game bleed
+                                padding_ratio = 0.04  # 4% for side_box
+                                print(f"  ℹ️ Using minimal padding (4%) for side_box to prevent bleed")
                             else:
-                                padding_ratio = 0.12  # 12% for refined bboxes
+                                padding_ratio = 0.08  # 8% for other refined bboxes
                             
                             padding_x = int(cam_w * padding_ratio)
                             padding_y = int(cam_h * padding_ratio)
@@ -3257,7 +3589,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 3  # v3: Added side_box support, disabled corner snapping for mid-right overlays
+_CACHE_VERSION = 4  # v4: Face-anchored edge refinement for side_box, reduced padding, multi-frame median
 
 
 def _get_cache_path(temp_dir: str) -> str:

@@ -253,43 +253,63 @@ Key test: If the region does NOT contain a HUMAN FACE or HUMAN BODY, it is NOT a
 === LAYOUT TYPES ===
 Classify the webcam (if found) as one of these types:
 
-1. "corner_overlay" - Small webcam in a CORNER of the frame
+1. "corner_overlay" - Small webcam TOUCHING a corner of the frame
    - Typically 15-35% of frame width
+   - MUST touch or nearly touch 2 edges (e.g., right edge + top edge for top-right)
    - Located in: top-left, top-right, bottom-left, or bottom-right
-   - Has clear boundary where it meets gameplay
+   - Edges are within ~2-3% of frame boundary
    
-2. "top_band" - Wide webcam band spanning most of the top
+2. "side_box" - Webcam on one side but NOT touching edges (inset/floating)
+   - On the right or left side of the frame, but NOT touching corners
+   - Has visible gap between webcam and frame edges
+   - Example: webcam on right side with game behind/around it
+   - This is common for streamers who want a "floating" webcam look
+   
+3. "top_band" - Wide webcam band spanning most of the top
    - Width >= 55% of frame width
    - Height between 18% and 60% of frame height
    - Top edge near y=0 (within top 25% of frame)
    
-3. "bottom_band" - Wide webcam band spanning most of the bottom
+4. "bottom_band" - Wide webcam band spanning most of the bottom
    - Width >= 55% of frame width
    - Height between 18% and 60% of frame height
    - Bottom edge near frame bottom
    
-4. "center_box" - Large centered webcam block
+5. "center_box" - Large centered webcam block
    - Not in a corner, more centered horizontally
    - Typically larger than corner overlays
    
-5. "full_cam" - Entire frame is webcam (no gameplay visible)
+6. "full_cam" - Entire frame is webcam (no gameplay visible)
    - Webcam takes up >70% of frame
    - Little to no gameplay content visible
    
-6. "none" - No webcam detected
+7. "none" - No webcam detected
+
+=== IMPORTANT: corner_overlay vs side_box ===
+- Use "corner_overlay" ONLY if the webcam box touches or nearly touches 2 frame edges
+- Use "side_box" if the webcam is on a side but has visible gaps to ALL edges
+- When in doubt, prefer "side_box" - it's safer for refinement
 
 === MEASUREMENT INSTRUCTIONS ===
 Return the FULL webcam rectangle boundary, NOT a face crop:
-- x = LEFT edge of the webcam frame
-- y = TOP edge of the webcam frame
-- width = FULL width from left to right edge
-- height = FULL height from top to bottom edge
+- x = LEFT edge of the webcam frame/border
+- y = TOP edge of the webcam frame/border
+- width = FULL width from left to right edge (include any visible border)
+- height = FULL height from top to bottom edge (include any visible border)
 
-For corner overlays, the webcam typically TOUCHES or nearly touches 2 edges:
+CRITICAL: Return the ENTIRE webcam box, including any visible frame/border around it.
+Do NOT return just the face region - we need the full webcam rectangle.
+
+For corner_overlay (MUST touch edges):
 - top-left: x ≈ 0, y ≈ 0
 - top-right: x + width ≈ {video_width}, y ≈ 0
 - bottom-left: x ≈ 0, y + height ≈ {video_height}
 - bottom-right: x + width ≈ {video_width}, y + height ≈ {video_height}
+
+For side_box (does NOT touch edges):
+- Has gaps between webcam and frame edges
+- Still return the full webcam rectangle (outer boundary)
+- Include the corner hint (e.g., "top-right" meaning right side, upper area)
 
 === CONFIDENCE SCORING ===
 Provide confidence (0.0 to 1.0) based on:
@@ -308,7 +328,8 @@ If NO webcam:
 {{"found": false, "type": "none", "confidence": 0.0, "reason": "<what you see instead>"}}
 
 Examples:
-- Corner overlay: {{"found": true, "type": "corner_overlay", "corner": "top-left", "x": 0, "y": 0, "width": 450, "height": 280, "confidence": 0.95, "reason": "Clear webcam with streamer in top-left corner"}}
+- Corner overlay (touches edges): {{"found": true, "type": "corner_overlay", "corner": "top-left", "x": 0, "y": 0, "width": 450, "height": 280, "confidence": 0.95, "reason": "Clear webcam touching top-left corner"}}
+- Side box (inset, not touching): {{"found": true, "type": "side_box", "corner": "top-right", "x": 800, "y": 100, "width": 350, "height": 250, "confidence": 0.90, "reason": "Floating webcam on right side, not touching edges"}}
 - Top band: {{"found": true, "type": "top_band", "corner": null, "x": 0, "y": 0, "width": 1920, "height": 400, "confidence": 0.85, "reason": "Wide webcam band at top with gameplay below"}}
 - No webcam: {{"found": false, "type": "none", "confidence": 0.0, "reason": "Only gameplay and HUD elements visible, no human face"}}"""
 
