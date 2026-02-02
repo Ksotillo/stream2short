@@ -818,46 +818,62 @@ def render_top_band_video(
     scale_factor = width / src_width
     scaled_height = int(src_height * scale_factor)
     
-    # Calculate crop Y offset to preserve webcam visibility
-    # If webcam is at top (y near 0), anchor crop at top
-    # If webcam is at bottom (y near src_height), anchor crop at bottom
+    # Calculate crop/pad offset to preserve webcam visibility
+    # If webcam is at top (y near 0), anchor at top
+    # If webcam is at bottom (y near src_height), anchor at bottom
     webcam_center_y = webcam_region.y + webcam_region.height / 2
     webcam_y_ratio = webcam_center_y / src_height
-    
-    if scaled_height <= height:
-        # Source is shorter than target - need to letterbox or stretch
-        # Use center crop (no real cropping needed, might have bars)
-        crop_y = 0
-        scale_h = height
-        print(f"   Source shorter than target after scaling, using letterbox")
-    else:
-        # Source is taller - determine crop anchor
-        max_crop_y = scaled_height - height
-        
-        if webcam_y_ratio < 0.35:
-            # Webcam near top - anchor crop at top
-            crop_y = 0
-            print(f"   Webcam near top (y_ratio={webcam_y_ratio:.2f}), anchoring crop at top")
-        elif webcam_y_ratio > 0.65:
-            # Webcam near bottom - anchor crop at bottom
-            crop_y = max_crop_y
-            print(f"   Webcam near bottom (y_ratio={webcam_y_ratio:.2f}), anchoring crop at bottom")
-        else:
-            # Webcam in middle - center the crop
-            crop_y = max_crop_y // 2
-            print(f"   Webcam in middle (y_ratio={webcam_y_ratio:.2f}), centering crop")
-        
-        scale_h = -2  # Auto-calculate preserving aspect ratio
     
     # Build filter chain
     filters = []
     
-    # Scale to fill width (use -2 for height to maintain aspect ratio and ensure even)
+    # Scale to fill output width (use -2 for height to maintain aspect ratio and ensure even)
     filters.append(f"scale={width}:-2:flags=lanczos")
     
-    # Crop to target dimensions
-    # crop=width:height:x:y - x=0 since we scaled to exact width
-    filters.append(f"crop={width}:{height}:0:{crop_y}")
+    if scaled_height < height:
+        # Source is SHORTER than target after scaling - need to PAD (letterbox)
+        # Use pad filter to add black bars
+        pad_total = height - scaled_height
+        
+        # Determine where to place the video content based on webcam position
+        if webcam_y_ratio < 0.35:
+            # Webcam near top - put video at top, pad bottom
+            pad_y = 0
+            print(f"   Source shorter ({scaled_height}px < {height}px), padding bottom (webcam at top)")
+        elif webcam_y_ratio > 0.65:
+            # Webcam near bottom - put video at bottom, pad top
+            pad_y = pad_total
+            print(f"   Source shorter ({scaled_height}px < {height}px), padding top (webcam at bottom)")
+        else:
+            # Webcam in middle - center the video
+            pad_y = pad_total // 2
+            print(f"   Source shorter ({scaled_height}px < {height}px), centering with padding")
+        
+        # pad=width:height:x:y - adds padding around video
+        filters.append(f"pad={width}:{height}:0:{pad_y}:black")
+    else:
+        # Source is TALLER than or equal to target - CROP
+        if scaled_height > height:
+            max_crop_y = scaled_height - height
+            
+            if webcam_y_ratio < 0.35:
+                # Webcam near top - anchor crop at top
+                crop_y = 0
+                print(f"   Webcam near top (y_ratio={webcam_y_ratio:.2f}), anchoring crop at top")
+            elif webcam_y_ratio > 0.65:
+                # Webcam near bottom - anchor crop at bottom
+                crop_y = max_crop_y
+                print(f"   Webcam near bottom (y_ratio={webcam_y_ratio:.2f}), anchoring crop at bottom")
+            else:
+                # Webcam in middle - center the crop
+                crop_y = max_crop_y // 2
+                print(f"   Webcam in middle (y_ratio={webcam_y_ratio:.2f}), centering crop")
+            
+            # crop=width:height:x:y - x=0 since we scaled to exact width
+            filters.append(f"crop={width}:{height}:0:{crop_y}")
+        else:
+            # Exact height match after scaling - no crop/pad needed
+            print(f"   Scaled height matches target exactly")
     
     # Add setsar=1 to ensure square pixels
     filters.append("setsar=1")

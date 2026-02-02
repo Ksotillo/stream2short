@@ -3016,7 +3016,6 @@ def detect_webcam_region(
                             
                             # Clean up the frame file now that we're done
                             try:
-                                import os
                                 if frame_path and os.path.exists(frame_path):
                                     os.remove(frame_path)
                             except:
@@ -3072,7 +3071,6 @@ def detect_webcam_region(
             # Clean up temp frame
             if frame_path_temp:
                 try:
-                    import os
                     os.unlink(frame_path_temp)
                 except:
                     pass
