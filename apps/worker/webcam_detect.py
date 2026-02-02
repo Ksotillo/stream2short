@@ -1572,14 +1572,16 @@ def refine_side_box_tight_edges(
     """
     Find the true webcam rectangle boundaries using COMBINED edge detection.
     
-    IMPROVED VERSION: Uses 3 edge methods combined for robustness:
-    1. Canny edges
-    2. Sobel gradient magnitude
-    3. Local texture variance
+    VERSION 3: Fixed over-zoom issue. Changes from v2:
+    - Removed tightness bonus (was causing over-shrinking)
+    - Max 15% shrink from seed size
+    - Search for true overlay boundary (leftmost edge), not internal edges
+    - Reward size SIMILARITY to seed, not tightness
     
-    PRIORITIZES LEFT EDGE: For right-side webcams, the left edge is the critical
-    gameplay/webcam boundary. We specifically look for edges TIGHTER than the seed
-    (to the right of seed_left) that still contain the face.
+    Uses 3 edge methods combined for robustness:
+    1. Canny edges
+    2. Sobel gradient magnitude  
+    3. Local texture variance
     
     Args:
         frame_bgr: BGR frame
@@ -1683,16 +1685,17 @@ def refine_side_box_tight_edges(
     # STEP 3: PRIORITIZE LEFT EDGE SEARCH (critical for right-side webcams)
     # Look for edges TIGHTER (to the RIGHT of seed_left) that still contain face
     # ==========================================================================
-    def find_left_edge_tight(col_projection, seed_left, face_x, search_range):
+    def find_left_edge(col_projection, seed_left, face_x, search_range):
         """
-        Find the LEFT edge of the webcam, prioritizing TIGHTER edges.
+        Find the LEFT edge of the webcam overlay.
         
-        For right-side webcams, the left edge is the gameplay/webcam boundary.
-        We want the RIGHTMOST strong edge that is still LEFT of the face.
+        For right-side webcams, we want the LEFTMOST strong edge near the seed
+        (the actual overlay boundary), NOT internal edges like furniture.
+        Search LEFT of seed to find the true boundary.
         """
-        # Search from seed_left to the RIGHT (toward face), looking for strong edges
-        search_start = max(0, seed_left - search_range // 3)  # Small search to the left
-        search_end = min(len(col_projection), int(face_x) - 10)  # Stop before face
+        # Search LEFT of seed to find the true overlay boundary
+        search_start = max(0, seed_left - search_range)
+        search_end = seed_left + search_range // 4  # Small search to the right
         
         if search_start >= search_end:
             return seed_left, 0
@@ -1704,17 +1707,18 @@ def refine_side_box_tight_edges(
         # Threshold: top 30% of edge strengths in this region
         threshold = np.percentile(region, 70)
         
-        # Find the RIGHTMOST strong edge (closest to face = tightest crop)
+        # Find the LEFTMOST strong edge (actual overlay boundary)
         best_pos = seed_left
         best_strength = 0
         
-        for i in range(len(region) - 1, 1, -1):  # Search right-to-left
+        for i in range(0, len(region) - 2):  # Search left-to-right
             val = region[i]
-            if val >= threshold and val >= region[i-1] and val >= region[i+1] if i+1 < len(region) else val >= region[i-1]:
+            if val >= threshold and val >= region[i+1]:
                 global_pos = search_start + i
-                # Prefer edges to the RIGHT of seed (tighter)
-                tightness_bonus = 1.0 + (global_pos - seed_left) / search_range if global_pos > seed_left else 1.0
-                score = val * tightness_bonus
+                # Prefer edges NEAR seed (not too far left or right)
+                dist_from_seed = abs(global_pos - seed_left)
+                proximity_bonus = 1.0 - (dist_from_seed / search_range) * 0.5
+                score = val * proximity_bonus
                 
                 if score > best_strength:
                     best_strength = score
@@ -1751,8 +1755,8 @@ def refine_side_box_tight_edges(
     search_x = int(sw * 0.30)
     search_y = int(sh * 0.30)
     
-    # SPECIAL handling for LEFT edge
-    left_edge, left_strength = find_left_edge_tight(col_sum_smooth, seed_left_roi, face_x_roi, search_x)
+    # Find left edge (don't over-tighten)
+    left_edge, left_strength = find_left_edge(col_sum_smooth, seed_left_roi, face_x_roi, search_x)
     
     # Standard edge finding for other edges
     right_candidates = find_edge_candidates(col_sum_smooth, seed_right_roi, search_x, is_left_or_top=False)
@@ -1778,8 +1782,13 @@ def refine_side_box_tight_edges(
                 w = r_pos - left_edge
                 h = b_pos - t_pos
                 
-                # Validate size
-                if w < 80 or h < 60:
+                # CRITICAL: Prevent over-shrinking (max 15% smaller than seed)
+                max_shrink = 0.15
+                if w < sw * (1 - max_shrink) or h < sh * (1 - max_shrink):
+                    continue
+                
+                # Minimum size must be at least 85% of seed
+                if w < sw * 0.85 or h < sh * 0.85:
                     continue
                 
                 ar = w / h
@@ -1794,25 +1803,29 @@ def refine_side_box_tight_edges(
                 # Score the rectangle
                 score = 0
                 
-                # Edge strength
+                # Edge strength (25 points)
                 edge_strength = (left_strength + r_str + t_str + b_str) / 4
                 max_strength = col_sum_smooth.max() + 1
                 score += (edge_strength / max_strength) * 25
                 
-                # AR bonus (prefer 16:9 = 1.78)
+                # AR bonus - prefer 16:9 = 1.78 (25 points)
                 ar_diff = abs(ar - 1.78)
                 score += max(0, 25 - ar_diff * 20)
                 
-                # TIGHTNESS BONUS: prefer smaller width (tighter left edge)
-                seed_w = seed_right_roi - seed_left_roi
-                tightness = 1.0 - (w / seed_w) if w < seed_w else 0
-                score += tightness * 30
+                # SIZE SIMILARITY: prefer similar size to seed (30 points)
+                # Don't reward tightness - reward staying close to Gemini's bbox
+                w_ratio = min(w, sw) / max(w, sw) if sw > 0 else 0
+                h_ratio = min(h, sh) / max(h, sh) if sh > 0 else 0
+                score += ((w_ratio + h_ratio) / 2) * 30
                 
-                # Size similarity
-                area = w * h
-                seed_area = sw * sh
-                size_ratio = min(area, seed_area) / max(area, seed_area) if seed_area > 0 else 0
-                score += size_ratio * 20
+                # Position similarity - prefer centered on seed (20 points)
+                center_x = (left_edge + r_pos) / 2
+                center_y = (t_pos + b_pos) / 2
+                seed_center_x = seed_left_roi + sw / 2
+                seed_center_y = seed_top_roi + sh / 2
+                dist = np.sqrt((center_x - seed_center_x)**2 + (center_y - seed_center_y)**2)
+                max_dist = np.sqrt(search_x**2 + search_y**2) + 1
+                score += (1 - dist / max_dist) * 20
                 
                 if score > best_score:
                     best_score = score
@@ -1853,9 +1866,10 @@ def refine_side_box_tight_edges(
             return None
     
     if debug:
-        tighter = ref_w < sw
-        print(f"     ✅ tight_edges (v2): {ref_w}x{ref_h} at ({ref_x},{ref_y}), score={best_score:.1f}, AR={ar:.2f}")
-        print(f"     {'🎯 TIGHTER' if tighter else '⚠️ LOOSER'} than seed by {abs(sw - ref_w)}px")
+        w_diff = ref_w - sw
+        h_diff = ref_h - sh
+        print(f"     ✅ tight_edges (v3): {ref_w}x{ref_h} at ({ref_x},{ref_y}), score={best_score:.1f}, AR={ar:.2f}")
+        print(f"     Δ from seed: width {w_diff:+d}px, height {h_diff:+d}px")
     
     # Save debug image if requested
     if debug_dir:
@@ -5892,7 +5906,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 11  # v11: Fixed OTSU threshold bug + improved tight_edges with combined edge detection + prioritize left edge
+_CACHE_VERSION = 12  # v12: Fix over-zoom - max 15% shrink, reward size similarity not tightness
 
 
 def _get_cache_path(temp_dir: str) -> str:
