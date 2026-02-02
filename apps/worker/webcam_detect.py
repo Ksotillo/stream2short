@@ -2407,6 +2407,660 @@ def refine_edge_scan_from_face(
     }
 
 
+# =============================================================================
+# GENERAL EDGE-BASED REFINEMENT (Step 3)
+# =============================================================================
+
+def refine_bbox_edges(
+    frame_bgr: np.ndarray,
+    bbox: Dict[str, int],
+    mode: str,
+    frame_width: int,
+    frame_height: int,
+    corner: str = None,
+    debug: bool = False,
+    debug_dir: str = None,
+) -> Tuple[Dict[str, int], Dict]:
+    """
+    General edge-based bbox refinement using HoughLinesP.
+    
+    This is a game-agnostic refinement that finds the true rectangular boundary
+    of the webcam overlay by detecting strong horizontal/vertical edges.
+    
+    Args:
+        frame_bgr: BGR frame
+        bbox: Initial bbox {'x', 'y', 'width', 'height'}
+        mode: 'corner_overlay' or 'side_box'
+        frame_width: Full frame width
+        frame_height: Full frame height
+        corner: Corner position ('top-left', 'top-right', etc.) for corner_overlay mode
+        debug: Enable debug logging
+        debug_dir: Directory to save debug images
+        
+    Returns:
+        Tuple of (refined_bbox, meta_dict)
+        meta_dict contains: {'success': bool, 'method': str, 'adjustments': dict}
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    meta = {'success': False, 'method': 'none', 'adjustments': {}}
+    
+    if debug:
+        print(f"  📐 refine_bbox_edges: mode={mode}, corner={corner}")
+        print(f"     Input bbox: {w}x{h} at ({x},{y})")
+    
+    # ==========================================================================
+    # STEP 1: Define ROI with expansion
+    # ==========================================================================
+    roi_pad = 0.25  # 25% expansion on each side
+    
+    # For corner_overlay, expand more toward the anchored corner
+    if mode == 'corner_overlay' and corner:
+        expand_x = int(w * roi_pad)
+        expand_y = int(h * roi_pad)
+        
+        # Expand more in the direction away from the corner
+        if 'right' in corner:
+            left_expand = int(w * roi_pad * 1.5)
+            right_expand = int(w * roi_pad * 0.5)
+        else:
+            left_expand = int(w * roi_pad * 0.5)
+            right_expand = int(w * roi_pad * 1.5)
+        
+        if 'bottom' in corner:
+            top_expand = int(h * roi_pad * 1.5)
+            bottom_expand = int(h * roi_pad * 0.5)
+        else:
+            top_expand = int(h * roi_pad * 0.5)
+            bottom_expand = int(h * roi_pad * 1.5)
+    else:
+        left_expand = right_expand = int(w * roi_pad)
+        top_expand = bottom_expand = int(h * roi_pad)
+    
+    roi_x = max(0, x - left_expand)
+    roi_y = max(0, y - top_expand)
+    roi_right = min(frame_width, x + w + right_expand)
+    roi_bottom = min(frame_height, y + h + bottom_expand)
+    roi_w = roi_right - roi_x
+    roi_h = roi_bottom - roi_y
+    
+    if roi_w < 50 or roi_h < 50:
+        if debug:
+            print(f"     ⚠️ ROI too small: {roi_w}x{roi_h}")
+        return bbox, meta
+    
+    # Extract ROI
+    roi = frame_bgr[roi_y:roi_bottom, roi_x:roi_right]
+    
+    # ==========================================================================
+    # STEP 2: Preprocess ROI
+    # ==========================================================================
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    
+    # ==========================================================================
+    # STEP 3: Edge detection with adaptive thresholds
+    # ==========================================================================
+    median_val = np.median(gray)
+    lower_thresh = int(max(0, 0.66 * median_val))
+    upper_thresh = int(min(255, 1.33 * median_val))
+    
+    # Ensure reasonable range
+    lower_thresh = max(lower_thresh, 30)
+    upper_thresh = max(upper_thresh, lower_thresh + 30)
+    
+    edges = cv2.Canny(gray, lower_thresh, upper_thresh)
+    
+    # ==========================================================================
+    # STEP 4: Detect lines using HoughLinesP
+    # ==========================================================================
+    min_line_length = max(30, min(roi_w, roi_h) // 6)
+    max_line_gap = 10
+    
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi/180,
+        threshold=30,
+        minLineLength=min_line_length,
+        maxLineGap=max_line_gap
+    )
+    
+    if lines is None or len(lines) == 0:
+        if debug:
+            print(f"     ⚠️ No lines detected")
+        return bbox, meta
+    
+    # ==========================================================================
+    # STEP 5: Classify lines as horizontal or vertical
+    # ==========================================================================
+    horizontal_lines = []
+    vertical_lines = []
+    
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        length = np.sqrt(dx**2 + dy**2)
+        
+        if length < min_line_length:
+            continue
+        
+        # Horizontal: abs(dy) <= 0.1 * abs(dx)
+        if dx > 0 and abs(dy) <= 0.15 * abs(dx):
+            avg_y = (y1 + y2) // 2
+            horizontal_lines.append({
+                'y': avg_y, 'x1': min(x1, x2), 'x2': max(x1, x2),
+                'length': length, 'line': (x1, y1, x2, y2)
+            })
+        
+        # Vertical: abs(dx) <= 0.1 * abs(dy)
+        elif dy > 0 and abs(dx) <= 0.15 * abs(dy):
+            avg_x = (x1 + x2) // 2
+            vertical_lines.append({
+                'x': avg_x, 'y1': min(y1, y2), 'y2': max(y1, y2),
+                'length': length, 'line': (x1, y1, x2, y2)
+            })
+    
+    if debug:
+        print(f"     Lines: {len(horizontal_lines)} horizontal, {len(vertical_lines)} vertical")
+    
+    # ==========================================================================
+    # STEP 6: Find best candidates for each border
+    # ==========================================================================
+    # Current bbox position in ROI coordinates
+    bbox_left_roi = x - roi_x
+    bbox_right_roi = x + w - roi_x
+    bbox_top_roi = y - roi_y
+    bbox_bottom_roi = y + h - roi_y
+    
+    def score_horizontal_line(line, target_y, is_anchor=False):
+        """Score a horizontal line as potential top/bottom border."""
+        y_diff = abs(line['y'] - target_y)
+        length_score = line['length'] / roi_w
+        proximity_score = 1.0 / (1.0 + y_diff / 20)
+        
+        # Anchor edges should be closer to current position
+        if is_anchor:
+            proximity_score *= 2.0
+        
+        return length_score * 0.4 + proximity_score * 0.6
+    
+    def score_vertical_line(line, target_x, is_anchor=False):
+        """Score a vertical line as potential left/right border."""
+        x_diff = abs(line['x'] - target_x)
+        length_score = line['length'] / roi_h
+        proximity_score = 1.0 / (1.0 + x_diff / 20)
+        
+        if is_anchor:
+            proximity_score *= 2.0
+        
+        return length_score * 0.4 + proximity_score * 0.6
+    
+    # Determine which edges are "anchored" for corner_overlay
+    anchored_edges = set()
+    if mode == 'corner_overlay' and corner:
+        if 'top' in corner:
+            anchored_edges.add('top')
+        if 'bottom' in corner:
+            anchored_edges.add('bottom')
+        if 'left' in corner:
+            anchored_edges.add('left')
+        if 'right' in corner:
+            anchored_edges.add('right')
+    
+    # Find best lines for each border
+    new_top = bbox_top_roi
+    new_bottom = bbox_bottom_roi
+    new_left = bbox_left_roi
+    new_right = bbox_right_roi
+    
+    adjustments = {}
+    
+    # TOP border
+    top_candidates = [l for l in horizontal_lines 
+                      if l['y'] < bbox_top_roi + h * 0.4]  # Within upper portion
+    if top_candidates:
+        is_anchor = 'top' in anchored_edges
+        top_candidates.sort(key=lambda l: score_horizontal_line(l, bbox_top_roi, is_anchor), reverse=True)
+        best_top = top_candidates[0]
+        if abs(best_top['y'] - bbox_top_roi) < h * 0.3:
+            new_top = best_top['y']
+            adjustments['top'] = new_top - bbox_top_roi
+    
+    # BOTTOM border
+    bottom_candidates = [l for l in horizontal_lines 
+                         if l['y'] > bbox_bottom_roi - h * 0.4]
+    if bottom_candidates:
+        is_anchor = 'bottom' in anchored_edges
+        bottom_candidates.sort(key=lambda l: score_horizontal_line(l, bbox_bottom_roi, is_anchor), reverse=True)
+        best_bottom = bottom_candidates[0]
+        if abs(best_bottom['y'] - bbox_bottom_roi) < h * 0.3:
+            new_bottom = best_bottom['y']
+            adjustments['bottom'] = new_bottom - bbox_bottom_roi
+    
+    # LEFT border
+    left_candidates = [l for l in vertical_lines 
+                       if l['x'] < bbox_left_roi + w * 0.4]
+    if left_candidates:
+        is_anchor = 'left' in anchored_edges
+        left_candidates.sort(key=lambda l: score_vertical_line(l, bbox_left_roi, is_anchor), reverse=True)
+        best_left = left_candidates[0]
+        if abs(best_left['x'] - bbox_left_roi) < w * 0.3:
+            new_left = best_left['x']
+            adjustments['left'] = new_left - bbox_left_roi
+    
+    # RIGHT border
+    right_candidates = [l for l in vertical_lines 
+                        if l['x'] > bbox_right_roi - w * 0.4]
+    if right_candidates:
+        is_anchor = 'right' in anchored_edges
+        right_candidates.sort(key=lambda l: score_vertical_line(l, bbox_right_roi, is_anchor), reverse=True)
+        best_right = right_candidates[0]
+        if abs(best_right['x'] - bbox_right_roi) < w * 0.3:
+            new_right = best_right['x']
+            adjustments['right'] = new_right - bbox_right_roi
+    
+    # ==========================================================================
+    # STEP 7: Construct refined bbox
+    # ==========================================================================
+    # Convert back to frame coordinates
+    ref_x = roi_x + new_left
+    ref_y = roi_y + new_top
+    ref_w = new_right - new_left
+    ref_h = new_bottom - new_top
+    
+    # Validate
+    if ref_w < 60 or ref_h < 40:
+        if debug:
+            print(f"     ⚠️ Refined bbox too small: {ref_w}x{ref_h}")
+        return bbox, meta
+    
+    ar = ref_w / ref_h if ref_h > 0 else 0
+    if ar < 1.05 or ar > 3.0:
+        if debug:
+            print(f"     ⚠️ Bad AR: {ar:.2f}")
+        return bbox, meta
+    
+    # Clamp to frame
+    ref_x = max(0, min(ref_x, frame_width - ref_w))
+    ref_y = max(0, min(ref_y, frame_height - ref_h))
+    
+    meta['success'] = True
+    meta['method'] = 'hough_lines'
+    meta['adjustments'] = adjustments
+    
+    if debug:
+        print(f"     ✅ Refined: {ref_w}x{ref_h} at ({ref_x},{ref_y}), AR={ar:.2f}")
+        print(f"     Adjustments: {adjustments}")
+    
+    # Save debug image
+    if debug_dir:
+        try:
+            debug_img = roi.copy()
+            # Draw detected lines
+            for line in horizontal_lines[:10]:
+                x1, y1, x2, y2 = line['line']
+                cv2.line(debug_img, (x1, y1), (x2, y2), (0, 255, 255), 1)
+            for line in vertical_lines[:10]:
+                x1, y1, x2, y2 = line['line']
+                cv2.line(debug_img, (x1, y1), (x2, y2), (255, 255, 0), 1)
+            # Draw original bbox (red)
+            cv2.rectangle(debug_img, (bbox_left_roi, bbox_top_roi), 
+                         (bbox_right_roi, bbox_bottom_roi), (0, 0, 255), 2)
+            # Draw refined bbox (green)
+            cv2.rectangle(debug_img, (new_left, new_top), 
+                         (new_right, new_bottom), (0, 255, 0), 2)
+            
+            debug_path = os.path.join(debug_dir, 'debug_edge_refinement.jpg')
+            cv2.imwrite(debug_path, debug_img)
+        except Exception as e:
+            pass
+    
+    return {
+        'x': ref_x, 'y': ref_y,
+        'width': ref_w, 'height': ref_h
+    }, meta
+
+
+# =============================================================================
+# BLEED DETECTION SANITY CHECK (Step 5)
+# =============================================================================
+
+def detect_and_fix_bleed(
+    frame_bgr: np.ndarray,
+    bbox: Dict[str, int],
+    mode: str,
+    corner: str = None,
+    debug: bool = False,
+) -> Tuple[Dict[str, int], Dict]:
+    """
+    Detect and fix bbox bleed into gameplay using edge density analysis.
+    
+    This is a game-agnostic sanity check that detects when a bbox border
+    likely contains non-webcam content (high edge density = HUD/text/lines).
+    
+    Args:
+        frame_bgr: BGR frame
+        bbox: Current bbox
+        mode: 'corner_overlay' or 'side_box'
+        corner: Corner position for corner_overlay mode
+        debug: Enable debug logging
+        
+    Returns:
+        Tuple of (fixed_bbox, meta_dict)
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    meta = {'fixed': False, 'shrinks': {}}
+    
+    if w < 80 or h < 60:
+        return bbox, meta
+    
+    # Convert to grayscale and compute edges
+    roi = frame_bgr[y:y+h, x:x+w]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # Define strip width for edge density sampling
+    strip_width = min(12, h // 10, w // 10)
+    
+    def compute_edge_density(region):
+        """Compute edge density (percentage of edge pixels)."""
+        if region.size == 0:
+            return 0.0
+        return np.mean(region > 0) * 100
+    
+    # Sample strips
+    top_strip = edges[:strip_width, :]
+    bottom_strip = edges[-strip_width:, :]
+    left_strip = edges[:, :strip_width]
+    right_strip = edges[:, -strip_width:]
+    
+    # Middle reference strip (should have lower edge density in webcam region)
+    mid_y_start = int(h * 0.4)
+    mid_y_end = int(h * 0.6)
+    mid_strip = edges[mid_y_start:mid_y_end, :]
+    
+    top_density = compute_edge_density(top_strip)
+    bottom_density = compute_edge_density(bottom_strip)
+    left_density = compute_edge_density(left_strip)
+    right_density = compute_edge_density(right_strip)
+    mid_density = compute_edge_density(mid_strip)
+    
+    if debug:
+        print(f"  🔍 Bleed check: top={top_density:.1f}%, bottom={bottom_density:.1f}%, " +
+              f"left={left_density:.1f}%, right={right_density:.1f}%, mid={mid_density:.1f}%")
+    
+    # Threshold: if border density > 1.8x mid density, flag it
+    threshold_ratio = 1.8
+    min_mid_density = max(mid_density, 2.0)  # Avoid division issues
+    
+    # Determine which edges are "anchored" (shouldn't shrink much)
+    anchored = set()
+    if mode == 'corner_overlay' and corner:
+        if 'top' in corner:
+            anchored.add('top')
+        if 'bottom' in corner:
+            anchored.add('bottom')
+        if 'left' in corner:
+            anchored.add('left')
+        if 'right' in corner:
+            anchored.add('right')
+    
+    # Check each border and shrink if needed
+    max_shrink = 40  # Maximum pixels to shrink
+    step = 4
+    new_x, new_y, new_w, new_h = x, y, w, h
+    
+    # TOP border
+    if 'top' not in anchored and top_density > min_mid_density * threshold_ratio:
+        # Shrink from top
+        shrink = 0
+        for _ in range(max_shrink // step):
+            if new_h <= 60:
+                break
+            test_y = new_y + step
+            test_h = new_h - step
+            if test_h < 60:
+                break
+            # Recompute density
+            test_strip = edges[test_y - y:test_y - y + strip_width, :]
+            test_density = compute_edge_density(test_strip)
+            if test_density <= min_mid_density * threshold_ratio:
+                break
+            new_y = test_y
+            new_h = test_h
+            shrink += step
+        
+        if shrink > 0:
+            meta['shrinks']['top'] = shrink
+            if debug:
+                print(f"     🔧 Shrunk top by {shrink}px")
+    
+    # LEFT border
+    if 'left' not in anchored and left_density > min_mid_density * threshold_ratio:
+        shrink = 0
+        for _ in range(max_shrink // step):
+            if new_w <= 80:
+                break
+            test_x = new_x + step
+            test_w = new_w - step
+            if test_w < 80:
+                break
+            test_strip = edges[:, test_x - x:test_x - x + strip_width]
+            test_density = compute_edge_density(test_strip)
+            if test_density <= min_mid_density * threshold_ratio:
+                break
+            new_x = test_x
+            new_w = test_w
+            shrink += step
+        
+        if shrink > 0:
+            meta['shrinks']['left'] = shrink
+            if debug:
+                print(f"     🔧 Shrunk left by {shrink}px")
+    
+    # RIGHT border (similar logic)
+    if 'right' not in anchored and right_density > min_mid_density * threshold_ratio:
+        shrink = 0
+        for _ in range(max_shrink // step):
+            if new_w <= 80:
+                break
+            new_w -= step
+            shrink += step
+            test_strip = edges[:, new_w - strip_width:new_w]
+            test_density = compute_edge_density(test_strip)
+            if test_density <= min_mid_density * threshold_ratio:
+                break
+        
+        if shrink > 0:
+            meta['shrinks']['right'] = shrink
+            if debug:
+                print(f"     🔧 Shrunk right by {shrink}px")
+    
+    # BOTTOM border
+    if 'bottom' not in anchored and bottom_density > min_mid_density * threshold_ratio:
+        shrink = 0
+        for _ in range(max_shrink // step):
+            if new_h <= 60:
+                break
+            new_h -= step
+            shrink += step
+            test_strip = edges[new_h - strip_width:new_h, :]
+            test_density = compute_edge_density(test_strip)
+            if test_density <= min_mid_density * threshold_ratio:
+                break
+        
+        if shrink > 0:
+            meta['shrinks']['bottom'] = shrink
+            if debug:
+                print(f"     🔧 Shrunk bottom by {shrink}px")
+    
+    if meta['shrinks']:
+        meta['fixed'] = True
+        if debug:
+            print(f"     ✅ Bleed fixed: {new_w}x{new_h} at ({new_x},{new_y})")
+    
+    return {
+        'x': new_x, 'y': new_y,
+        'width': new_w, 'height': new_h
+    }, meta
+
+
+# =============================================================================
+# LAYOUT-AWARE PADDING (Step 4)
+# =============================================================================
+
+def apply_layout_aware_padding(
+    bbox: Dict[str, int],
+    mode: str,
+    corner: str,
+    frame_width: int,
+    frame_height: int,
+    debug: bool = False,
+) -> Dict[str, int]:
+    """
+    Apply layout-aware padding that doesn't cause bleed.
+    
+    For corner_overlay: asymmetric padding that doesn't expand toward gameplay.
+    For side_box: minimal symmetric padding.
+    
+    Args:
+        bbox: Current bbox
+        mode: 'corner_overlay' or 'side_box'
+        corner: Corner position
+        frame_width: Full frame width
+        frame_height: Full frame height
+        debug: Enable debug logging
+        
+    Returns:
+        Padded bbox
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    
+    if mode == 'corner_overlay' and corner:
+        # Asymmetric padding: don't expand away from anchored edges
+        if 'top' in corner:
+            top_pad = 0
+            bottom_pad = int(h * 0.02)
+        else:  # bottom
+            top_pad = int(h * 0.02)
+            bottom_pad = 0
+        
+        if 'left' in corner:
+            left_pad = 0
+            right_pad = int(w * 0.02)
+        else:  # right
+            left_pad = int(w * 0.02)
+            right_pad = 0
+        
+        if debug:
+            print(f"  📐 Corner padding: L={left_pad}, R={right_pad}, T={top_pad}, B={bottom_pad}")
+    
+    else:  # side_box or unknown
+        # Minimal symmetric padding
+        pad = int(min(w, h) * 0.02)  # 2%
+        left_pad = right_pad = top_pad = bottom_pad = pad
+        
+        if debug:
+            print(f"  📐 Side_box padding: {pad}px all sides")
+    
+    # Apply padding
+    new_x = max(0, x - left_pad)
+    new_y = max(0, y - top_pad)
+    new_w = min(frame_width - new_x, w + left_pad + right_pad)
+    new_h = min(frame_height - new_y, h + top_pad + bottom_pad)
+    
+    return {
+        'x': new_x, 'y': new_y,
+        'width': new_w, 'height': new_h
+    }
+
+
+# =============================================================================
+# MULTI-FRAME AGGREGATION (Step 2)
+# =============================================================================
+
+def aggregate_multiframe_bboxes(
+    detections: List[Dict],
+    debug: bool = False,
+) -> Optional[Dict]:
+    """
+    Aggregate multiple frame detections into a single stable bbox.
+    
+    Uses median aggregation for robustness against outliers.
+    
+    Args:
+        detections: List of detection results from Gemini
+        debug: Enable debug logging
+        
+    Returns:
+        Aggregated detection result or None
+    """
+    if not detections:
+        return None
+    
+    # Filter valid detections
+    valid = [d for d in detections if d and d.get('found') and not d.get('no_webcam_confirmed')]
+    
+    if not valid:
+        # Check if any explicitly said no webcam
+        no_webcam = [d for d in detections if d and d.get('no_webcam_confirmed')]
+        if no_webcam:
+            return no_webcam[0]
+        return None
+    
+    if len(valid) == 1:
+        return valid[0]
+    
+    if debug:
+        print(f"  📊 Aggregating {len(valid)} detections...")
+    
+    # Check for type/corner agreement
+    types = [d.get('type', 'unknown') for d in valid]
+    corners = [d.get('corner', 'unknown') for d in valid]
+    
+    # Majority vote on type
+    from collections import Counter
+    type_counts = Counter(types)
+    corner_counts = Counter(corners)
+    
+    majority_type = type_counts.most_common(1)[0][0]
+    majority_corner = corner_counts.most_common(1)[0][0]
+    
+    # Filter to detections matching majority
+    matching = [d for d in valid if d.get('type') == majority_type]
+    if not matching:
+        matching = valid
+    
+    # Median aggregation of bbox
+    xs = [d['x'] for d in matching]
+    ys = [d['y'] for d in matching]
+    ws = [d['width'] for d in matching]
+    hs = [d['height'] for d in matching]
+    confs = [d.get('confidence', 0.5) for d in matching]
+    
+    result = {
+        'found': True,
+        'type': majority_type,
+        'effective_type': matching[0].get('effective_type', majority_type),
+        'corner': majority_corner,
+        'x': int(np.median(xs)),
+        'y': int(np.median(ys)),
+        'width': int(np.median(ws)),
+        'height': int(np.median(hs)),
+        'confidence': float(np.mean(confs)),
+        'reason': f"Aggregated from {len(matching)} frames",
+        '_aggregated': True,
+        '_frame_count': len(matching),
+    }
+    
+    if debug:
+        print(f"     Majority type: {majority_type}, corner: {majority_corner}")
+        print(f"     Median bbox: {result['width']}x{result['height']} at ({result['x']},{result['y']})")
+    
+    return result
+
+
 def refine_side_box_bbox(
     frame_bgr: np.ndarray,
     gemini_bbox: Dict[str, int],
@@ -4557,49 +5211,93 @@ def detect_webcam_region(
                                 print(f"  👤 Face: {detected_face.width}x{detected_face.height} at ({detected_face.x},{detected_face.y})")
                             
                             # ============================================================
-                            # APPLY PADDING (relative to refined bbox ONLY)
+                            # GENERAL EDGE REFINEMENT (Step 3 - layout-aware)
+                            # Uses HoughLinesP to find true rectangular boundaries
                             # ============================================================
-                            # Padding strategy by type:
-                            # - good Gemini corner: 6% symmetric
-                            # - side_box: ASYMMETRIC (tight top/sides, more bottom) to prevent game bleed
-                            # - other refined: 8% symmetric
-                            if not is_true_corner or effective_type == 'side_box':
-                                # ZERO/MINIMAL padding for side_box - tight refinement already found exact edges
-                                # Any padding here will re-introduce game bleed!
-                                pad_left = 0   # ZERO - tight_edges already found the left edge
-                                pad_right = 0  # ZERO - tight_edges already found the right edge
-                                pad_top = 0    # ZERO - tight_edges already found the top edge
-                                pad_bottom = int(cam_h * 0.02)  # 2% bottom only (minimal breathing room)
+                            if frame_for_refine is not None:
+                                mode = effective_type if effective_type in ['corner_overlay', 'side_box'] else 'side_box'
+                                print(f"  📐 Running general edge refinement (mode={mode})...")
                                 
-                                new_x = cam_x - pad_left
-                                new_y = cam_y - pad_top
-                                new_w = cam_w + pad_left + pad_right
-                                new_h = cam_h + pad_top + pad_bottom
+                                edge_refined, edge_meta = refine_bbox_edges(
+                                    frame_for_refine,
+                                    {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
+                                    mode=mode,
+                                    frame_width=width,
+                                    frame_height=height,
+                                    corner=position,
+                                    debug=True,
+                                    debug_dir=temp_dir if temp_dir else None
+                                )
                                 
-                                print(f"  ℹ️ ZERO padding for side_box (tight bbox): L={pad_left}, R={pad_right}, T={pad_top}, B={pad_bottom}")
-                                print(f"  📐 After minimal padding: {new_w}x{new_h} at ({new_x},{new_y})")
-                            elif refinement_method == "gemini-good":
-                                padding_ratio = 0.06  # 6% for good Gemini corners
-                                padding_x = int(cam_w * padding_ratio)
-                                padding_y = int(cam_h * padding_ratio)
+                                if edge_meta.get('success'):
+                                    # Validate refined bbox
+                                    valid_edge = True
+                                    if detected_face:
+                                        if not bbox_contains_face(edge_refined, detected_face, margin_ratio=0.05):
+                                            print(f"  ⚠️ Edge-refined bbox doesn't contain face, skipping")
+                                            valid_edge = False
+                                    
+                                    if valid_edge:
+                                        cam_x = edge_refined['x']
+                                        cam_y = edge_refined['y']
+                                        cam_w = edge_refined['width']
+                                        cam_h = edge_refined['height']
+                                        refinement_method = f"{refinement_method}+edges"
+                                        print(f"  ✅ Edge refinement applied: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
+                            
+                            # ============================================================
+                            # BLEED DETECTION & FIX (Step 5 - layout-aware)
+                            # Shrinks borders with high edge density (likely HUD/text)
+                            # ============================================================
+                            if frame_for_refine is not None:
+                                mode = effective_type if effective_type in ['corner_overlay', 'side_box'] else 'side_box'
+                                print(f"  🔍 Running bleed detection (mode={mode})...")
                                 
-                                new_x = cam_x - padding_x
-                                new_y = cam_y - padding_y
-                                new_w = cam_w + (padding_x * 2)
-                                new_h = cam_h + (padding_y * 2)
+                                bleed_fixed, bleed_meta = detect_and_fix_bleed(
+                                    frame_for_refine,
+                                    {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
+                                    mode=mode,
+                                    corner=position,
+                                    debug=True
+                                )
                                 
-                                print(f"  📐 After padding (+{int(padding_ratio*100)}%): {new_w}x{new_h} at ({new_x},{new_y})")
-                            else:
-                                padding_ratio = 0.08  # 8% for other refined bboxes
-                                padding_x = int(cam_w * padding_ratio)
-                                padding_y = int(cam_h * padding_ratio)
-                                
-                                new_x = cam_x - padding_x
-                                new_y = cam_y - padding_y
-                                new_w = cam_w + (padding_x * 2)
-                                new_h = cam_h + (padding_y * 2)
-                                
-                                print(f"  📐 After padding (+{int(padding_ratio*100)}%): {new_w}x{new_h} at ({new_x},{new_y})")
+                                if bleed_meta.get('fixed'):
+                                    # Validate fixed bbox
+                                    valid_fix = True
+                                    if detected_face:
+                                        if not bbox_contains_face(bleed_fixed, detected_face, margin_ratio=0.05):
+                                            print(f"  ⚠️ Bleed-fixed bbox doesn't contain face, skipping")
+                                            valid_fix = False
+                                    
+                                    if valid_fix:
+                                        cam_x = bleed_fixed['x']
+                                        cam_y = bleed_fixed['y']
+                                        cam_w = bleed_fixed['width']
+                                        cam_h = bleed_fixed['height']
+                                        refinement_method = f"{refinement_method}+bleed"
+                                        print(f"  ✅ Bleed fix applied: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
+                            
+                            # ============================================================
+                            # APPLY PADDING (Step 4 - layout-aware)
+                            # Uses conservative asymmetric padding to avoid bleed
+                            # ============================================================
+                            mode = effective_type if effective_type in ['corner_overlay', 'side_box'] else 'side_box'
+                            
+                            padded_bbox = apply_layout_aware_padding(
+                                {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
+                                mode=mode,
+                                corner=position,
+                                frame_width=width,
+                                frame_height=height,
+                                debug=True
+                            )
+                            
+                            new_x = padded_bbox['x']
+                            new_y = padded_bbox['y']
+                            new_w = padded_bbox['width']
+                            new_h = padded_bbox['height']
+                            
+                            print(f"  📐 After layout-aware padding: {new_w}x{new_h} at ({new_x},{new_y})")
                             
                             # ============================================================
                             # CLAMP TO VIDEO BOUNDS (DO NOT shift position for good/refined bbox)
@@ -4966,7 +5664,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 8  # v8: temporal_stability + edge_scan refinement, max 35% expansion limit
+_CACHE_VERSION = 9  # v9: General edge refinement (HoughLines) + bleed detection + layout-aware padding
 
 
 def _get_cache_path(temp_dir: str) -> str:
