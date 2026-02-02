@@ -403,7 +403,7 @@ Replaced fixed "3-word chunks" with intelligent rules in `smart_chunker.py`:
 - [ ] Background music enhances without overpowering speech
 
 ---
-
+{"cost":["Cost per item","cost_per_item","Unit Cost"],"price":["Shell Lumber Pricing","shell_lumber_pricing","price"],"compare_at":["Suggested Retail / Compare At Price","Compare At Price","compare_at_price"],"product_id":["Shell Lumber Product ID","shell_lumber_product_id"],"variant_id":["Shell Lumber Variant ID","shell_lumber_variant_id"],"inventory_id":["Shell Lumber Variant Inventory Item ID","shell_lumber_variant_inventory_item_id"],"shipping_flag":["SHIP BY UPS FEDEX USPS Override","SHIP BY UPS FEDEX USPS","canShip","shipByParcel"]}
 ## 🆕 Unplanned Features (Added Since Roadmap)
 
 These features were implemented outside the original roadmap:

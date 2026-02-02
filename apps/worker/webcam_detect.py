@@ -1570,13 +1570,16 @@ def refine_side_box_tight_edges(
     debug_dir: str = None,
 ) -> Optional[Dict[str, int]]:
     """
-    Find the true webcam rectangle boundaries using edge projection analysis.
+    Find the true webcam rectangle boundaries using COMBINED edge detection.
     
-    This is the PRIMARY refinement method for side_box overlays. It works by:
-    1. Expanding the seed bbox to create a search ROI
-    2. Computing edge maps and projections (column/row sums)
-    3. Finding strong vertical edges (left/right) and horizontal edges (top/bottom)
-    4. Selecting the best rectangle that matches webcam characteristics
+    IMPROVED VERSION: Uses 3 edge methods combined for robustness:
+    1. Canny edges
+    2. Sobel gradient magnitude
+    3. Local texture variance
+    
+    PRIORITIZES LEFT EDGE: For right-side webcams, the left edge is the critical
+    gameplay/webcam boundary. We specifically look for edges TIGHTER than the seed
+    (to the right of seed_left) that still contain the face.
     
     Args:
         frame_bgr: BGR frame
@@ -1593,12 +1596,12 @@ def refine_side_box_tight_edges(
     sx, sy, sw, sh = seed_bbox['x'], seed_bbox['y'], seed_bbox['width'], seed_bbox['height']
     
     if debug:
-        print(f"  🔬 tight_edges: seed={sw}x{sh} at ({sx},{sy})")
+        print(f"  🔬 tight_edges (v2): seed={sw}x{sh} at ({sx},{sy})")
     
     # ==========================================================================
-    # STEP 1: Create expanded ROI (60% expansion in each direction)
+    # STEP 1: Create expanded ROI (40% expansion - smaller than before)
     # ==========================================================================
-    expand_ratio = 0.6
+    expand_ratio = 0.4  # Reduced from 0.6 to focus more locally
     expand_x = int(sw * expand_ratio)
     expand_y = int(sh * expand_ratio)
     
@@ -1630,203 +1633,200 @@ def refine_side_box_tight_edges(
     if debug:
         print(f"     ROI: {roi_w}x{roi_h} at ({roi_x},{roi_y})")
         print(f"     Seed in ROI: L={seed_left_roi}, R={seed_right_roi}, T={seed_top_roi}, B={seed_bottom_roi}")
+        print(f"     Face in ROI: ({face_x_roi}, {face_y_roi})")
     
     # ==========================================================================
-    # STEP 2: Compute edge map and projections
+    # STEP 2: COMBINED EDGE DETECTION (3 methods)
     # ==========================================================================
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    
+    # Method 1: Canny edges
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges = cv2.Canny(blurred, 30, 100)
+    canny_edges = cv2.Canny(blurred, 30, 100)
+    
+    # Method 2: Sobel gradient magnitude
+    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    sobel_mag = np.sqrt(sobel_x**2 + sobel_y**2)
+    sobel_mag = (sobel_mag / sobel_mag.max() * 255).astype(np.uint8) if sobel_mag.max() > 0 else sobel_mag.astype(np.uint8)
+    
+    # Method 3: Local texture variance (high variance = edge/texture)
+    kernel_size = 7
+    local_mean = cv2.blur(gray.astype(np.float32), (kernel_size, kernel_size))
+    local_sqmean = cv2.blur((gray.astype(np.float32))**2, (kernel_size, kernel_size))
+    local_var = local_sqmean - local_mean**2
+    local_var = np.clip(local_var, 0, None)
+    texture_edges = (local_var / (local_var.max() + 1) * 255).astype(np.uint8)
+    
+    # COMBINE all 3 methods (weighted sum)
+    combined_edges = (
+        canny_edges.astype(np.float32) * 0.4 +
+        sobel_mag.astype(np.float32) * 0.4 +
+        texture_edges.astype(np.float32) * 0.2
+    ).astype(np.uint8)
     
     # Column sums (for vertical edges - left/right boundaries)
-    col_sum = edges.sum(axis=0).astype(float)
+    col_sum = combined_edges.sum(axis=0).astype(float)
     # Row sums (for horizontal edges - top/bottom boundaries)
-    row_sum = edges.sum(axis=1).astype(float)
+    row_sum = combined_edges.sum(axis=1).astype(float)
     
     # Smooth with moving average
-    smooth_window = 11
-    if len(col_sum) > smooth_window:
-        kernel = np.ones(smooth_window) / smooth_window
-        col_sum_smooth = np.convolve(col_sum, kernel, mode='same')
-    else:
-        col_sum_smooth = col_sum
+    smooth_window = 7  # Smaller window for sharper edge detection
+    kernel = np.ones(smooth_window) / smooth_window
+    col_sum_smooth = np.convolve(col_sum, kernel, mode='same') if len(col_sum) > smooth_window else col_sum
+    row_sum_smooth = np.convolve(row_sum, kernel, mode='same') if len(row_sum) > smooth_window else row_sum
     
-    if len(row_sum) > smooth_window:
-        row_sum_smooth = np.convolve(row_sum, kernel, mode='same')
-    else:
-        row_sum_smooth = row_sum
+    if debug:
+        print(f"     Combined edges: col_sum range=[{col_sum_smooth.min():.0f}, {col_sum_smooth.max():.0f}]")
     
     # ==========================================================================
-    # STEP 3: Find candidate edges near seed boundaries
+    # STEP 3: PRIORITIZE LEFT EDGE SEARCH (critical for right-side webcams)
+    # Look for edges TIGHTER (to the RIGHT of seed_left) that still contain face
     # ==========================================================================
+    def find_left_edge_tight(col_projection, seed_left, face_x, search_range):
+        """
+        Find the LEFT edge of the webcam, prioritizing TIGHTER edges.
+        
+        For right-side webcams, the left edge is the gameplay/webcam boundary.
+        We want the RIGHTMOST strong edge that is still LEFT of the face.
+        """
+        # Search from seed_left to the RIGHT (toward face), looking for strong edges
+        search_start = max(0, seed_left - search_range // 3)  # Small search to the left
+        search_end = min(len(col_projection), int(face_x) - 10)  # Stop before face
+        
+        if search_start >= search_end:
+            return seed_left, 0
+        
+        region = col_projection[search_start:search_end]
+        if len(region) < 5:
+            return seed_left, 0
+        
+        # Threshold: top 30% of edge strengths in this region
+        threshold = np.percentile(region, 70)
+        
+        # Find the RIGHTMOST strong edge (closest to face = tightest crop)
+        best_pos = seed_left
+        best_strength = 0
+        
+        for i in range(len(region) - 1, 1, -1):  # Search right-to-left
+            val = region[i]
+            if val >= threshold and val >= region[i-1] and val >= region[i+1] if i+1 < len(region) else val >= region[i-1]:
+                global_pos = search_start + i
+                # Prefer edges to the RIGHT of seed (tighter)
+                tightness_bonus = 1.0 + (global_pos - seed_left) / search_range if global_pos > seed_left else 1.0
+                score = val * tightness_bonus
+                
+                if score > best_strength:
+                    best_strength = score
+                    best_pos = global_pos
+        
+        return best_pos, best_strength
+    
     def find_edge_candidates(projection, seed_pos, search_range, is_left_or_top=True):
         """Find strong edge candidates in a search range around seed position."""
         candidates = []
         
-        # Define search window
         if is_left_or_top:
-            # Search left of seed for left edge, above seed for top edge
             search_start = max(0, seed_pos - search_range)
-            search_end = min(len(projection), seed_pos + search_range // 4)
+            search_end = min(len(projection), seed_pos + search_range // 3)
         else:
-            # Search right of seed for right edge, below seed for bottom edge
-            search_start = max(0, seed_pos - search_range // 4)
+            search_start = max(0, seed_pos - search_range // 3)
             search_end = min(len(projection), seed_pos + search_range)
         
         if search_start >= search_end:
-            return candidates
+            return [(seed_pos, 0)]
         
-        # Find local maxima (peaks) in the search region
         region = projection[search_start:search_end]
-        threshold = np.percentile(region, 70) if len(region) > 10 else 0
+        threshold = np.percentile(region, 60) if len(region) > 10 else 0
         
         for i in range(2, len(region) - 2):
             val = region[i]
-            # Check if it's a local maximum above threshold
-            if (val > threshold and 
-                val >= region[i-1] and val >= region[i+1] and
-                val >= region[i-2] and val >= region[i+2]):
+            if val > threshold and val >= region[i-1] and val >= region[i+1]:
                 global_pos = search_start + i
                 candidates.append((global_pos, val))
         
-        # Sort by strength
         candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates[:5]  # Top 5 candidates
+        return candidates[:5] if candidates else [(seed_pos, 0)]
     
-    # Search range based on seed size
-    search_x = int(sw * 0.35)
-    search_y = int(sh * 0.35)
+    search_x = int(sw * 0.30)
+    search_y = int(sh * 0.30)
     
-    left_candidates = find_edge_candidates(col_sum_smooth, seed_left_roi, search_x, is_left_or_top=True)
+    # SPECIAL handling for LEFT edge
+    left_edge, left_strength = find_left_edge_tight(col_sum_smooth, seed_left_roi, face_x_roi, search_x)
+    
+    # Standard edge finding for other edges
     right_candidates = find_edge_candidates(col_sum_smooth, seed_right_roi, search_x, is_left_or_top=False)
     top_candidates = find_edge_candidates(row_sum_smooth, seed_top_roi, search_y, is_left_or_top=True)
     bottom_candidates = find_edge_candidates(row_sum_smooth, seed_bottom_roi, search_y, is_left_or_top=False)
     
     if debug:
-        print(f"     Candidates: L={len(left_candidates)}, R={len(right_candidates)}, T={len(top_candidates)}, B={len(bottom_candidates)}")
+        print(f"     Left edge: pos={left_edge}, strength={left_strength:.0f}")
+        print(f"     Candidates: R={len(right_candidates)}, T={len(top_candidates)}, B={len(bottom_candidates)}")
     
     # ==========================================================================
-    # STEP 4: Evaluate candidate rectangles
+    # STEP 4: Build and validate the rectangle
     # ==========================================================================
-    def score_rectangle(left, right, top, bottom, l_strength, r_strength, t_strength, b_strength):
-        """Score a candidate rectangle based on various criteria."""
-        w = right - left
-        h = bottom - top
-        
-        # Basic validity
-        if w < 80 or h < 60:
-            return -1, "too small"
-        
-        ar = w / h if h > 0 else 0
-        if ar < 0.9 or ar > 3.0:
-            return -1, f"bad AR {ar:.2f}"
-        
-        # Must contain face (if provided)
-        if face_center:
-            if not (left <= face_x_roi <= right and top <= face_y_roi <= bottom):
-                return -1, "doesn't contain face"
-        
-        # Score components
-        score = 0
-        
-        # 1. Edge strength (combined strength of all 4 edges)
-        edge_strength = (l_strength + r_strength + t_strength + b_strength) / 4
-        max_strength = max(col_sum_smooth.max(), row_sum_smooth.max()) + 1
-        score += (edge_strength / max_strength) * 30
-        
-        # 2. AR closeness to 16:9 (1.78)
-        ar_diff = abs(ar - 1.78)
-        ar_score = max(0, 20 - ar_diff * 15)
-        score += ar_score
-        
-        # 3. Size similarity to seed (prefer similar size)
-        area = w * h
-        seed_area = sw * sh
-        size_ratio = min(area, seed_area) / max(area, seed_area) if seed_area > 0 else 0
-        score += size_ratio * 20
-        
-        # 4. Position similarity to seed (prefer centered on seed)
-        center_x = (left + right) / 2
-        center_y = (top + bottom) / 2
-        seed_center_x = seed_left_roi + sw / 2
-        seed_center_y = seed_top_roi + sh / 2
-        dist = np.sqrt((center_x - seed_center_x)**2 + (center_y - seed_center_y)**2)
-        max_dist = np.sqrt(search_x**2 + search_y**2) + 1
-        score += (1 - dist / max_dist) * 20
-        
-        # 5. Bonus for containing face near center (face should be in upper portion)
-        if face_center:
-            face_rel_y = (face_y_roi - top) / h if h > 0 else 0.5
-            # Face typically in upper 40% of webcam
-            if 0.15 <= face_rel_y <= 0.50:
-                score += 10
-        
-        return score, f"OK (AR={ar:.2f}, area={area})"
-    
-    # Generate all candidate rectangles
     best_rect = None
     best_score = -1
-    best_reason = ""
     
-    # Add seed edges as fallback candidates
-    if not left_candidates:
-        left_candidates = [(seed_left_roi, 0)]
-    if not right_candidates:
-        right_candidates = [(seed_right_roi, 0)]
-    if not top_candidates:
-        top_candidates = [(seed_top_roi, 0)]
-    if not bottom_candidates:
-        bottom_candidates = [(seed_bottom_roi, 0)]
-    
-    for l_pos, l_str in left_candidates[:3]:
-        for r_pos, r_str in right_candidates[:3]:
-            for t_pos, t_str in top_candidates[:3]:
-                for b_pos, b_str in bottom_candidates[:3]:
-                    if l_pos >= r_pos or t_pos >= b_pos:
+    for r_pos, r_str in right_candidates[:3]:
+        for t_pos, t_str in top_candidates[:3]:
+            for b_pos, b_str in bottom_candidates[:3]:
+                if left_edge >= r_pos or t_pos >= b_pos:
+                    continue
+                
+                w = r_pos - left_edge
+                h = b_pos - t_pos
+                
+                # Validate size
+                if w < 80 or h < 60:
+                    continue
+                
+                ar = w / h
+                if ar < 0.9 or ar > 3.0:
+                    continue
+                
+                # Must contain face
+                if face_center:
+                    if not (left_edge <= face_x_roi <= r_pos and t_pos <= face_y_roi <= b_pos):
                         continue
-                    
-                    score, reason = score_rectangle(l_pos, r_pos, t_pos, b_pos, l_str, r_str, t_str, b_str)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_rect = (l_pos, r_pos, t_pos, b_pos)
-                        best_reason = reason
+                
+                # Score the rectangle
+                score = 0
+                
+                # Edge strength
+                edge_strength = (left_strength + r_str + t_str + b_str) / 4
+                max_strength = col_sum_smooth.max() + 1
+                score += (edge_strength / max_strength) * 25
+                
+                # AR bonus (prefer 16:9 = 1.78)
+                ar_diff = abs(ar - 1.78)
+                score += max(0, 25 - ar_diff * 20)
+                
+                # TIGHTNESS BONUS: prefer smaller width (tighter left edge)
+                seed_w = seed_right_roi - seed_left_roi
+                tightness = 1.0 - (w / seed_w) if w < seed_w else 0
+                score += tightness * 30
+                
+                # Size similarity
+                area = w * h
+                seed_area = sw * sh
+                size_ratio = min(area, seed_area) / max(area, seed_area) if seed_area > 0 else 0
+                score += size_ratio * 20
+                
+                if score > best_score:
+                    best_score = score
+                    best_rect = (left_edge, r_pos, t_pos, b_pos)
     
-    if best_rect is None or best_score < 10:
+    if best_rect is None:
         if debug:
-            print(f"     ⚠️ No valid rectangle found (best_score={best_score:.1f})")
+            print(f"     ⚠️ No valid rectangle found")
         return None
     
     left, right, top, bottom = best_rect
     
     # ==========================================================================
-    # STEP 5: Fine-tune edges with local gradient analysis
-    # ==========================================================================
-    def refine_edge_position(pos, projection, direction, max_adjust=15):
-        """Fine-tune edge position by finding the steepest gradient nearby."""
-        search_start = max(1, pos - max_adjust)
-        search_end = min(len(projection) - 1, pos + max_adjust)
-        
-        best_pos = pos
-        best_grad = 0
-        
-        for i in range(search_start, search_end):
-            # Gradient magnitude
-            grad = abs(projection[i+1] - projection[i-1])
-            if grad > best_grad:
-                best_grad = grad
-                best_pos = i
-        
-        return best_pos
-    
-    # Fine-tune each edge
-    left = refine_edge_position(left, col_sum_smooth, 'left')
-    right = refine_edge_position(right, col_sum_smooth, 'right')
-    top = refine_edge_position(top, row_sum_smooth, 'top')
-    bottom = refine_edge_position(bottom, row_sum_smooth, 'bottom')
-    
-    # ==========================================================================
-    # STEP 6: Convert back to frame coordinates
+    # STEP 5: Convert back to frame coordinates
     # ==========================================================================
     ref_x = roi_x + left
     ref_y = roi_y + top
@@ -1853,7 +1853,9 @@ def refine_side_box_tight_edges(
             return None
     
     if debug:
-        print(f"     ✅ tight_edges: {ref_w}x{ref_h} at ({ref_x},{ref_y}), score={best_score:.1f}, AR={ar:.2f}")
+        tighter = ref_w < sw
+        print(f"     ✅ tight_edges (v2): {ref_w}x{ref_h} at ({ref_x},{ref_y}), score={best_score:.1f}, AR={ar:.2f}")
+        print(f"     {'🎯 TIGHTER' if tighter else '⚠️ LOOSER'} than seed by {abs(sw - ref_w)}px")
     
     # Save debug image if requested
     if debug_dir:
@@ -1866,6 +1868,8 @@ def refine_side_box_tight_edges(
             # Draw face center (blue circle)
             if face_center:
                 cv2.circle(debug_img, (int(face_x_roi), int(face_y_roi)), 8, (255, 0, 0), -1)
+            # Draw left edge search area (yellow line)
+            cv2.line(debug_img, (left, 0), (left, roi_h), (0, 255, 255), 2)
             
             debug_path = os.path.join(debug_dir, 'debug_tight_edges.jpg')
             cv2.imwrite(debug_path, debug_img)
@@ -2000,7 +2004,8 @@ def refine_temporal_stability(
     # ==========================================================================
     # Use Otsu's method to find threshold, but bias toward lower threshold
     # to capture more of the webcam region
-    _, otsu_thresh = cv2.threshold(variance_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # NOTE: cv2.threshold with THRESH_OTSU returns (threshold_value, thresholded_image)
+    otsu_thresh, _ = cv2.threshold(variance_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
     # Also try percentile-based threshold (lower 40% variance = stable)
     percentile_thresh = np.percentile(variance_norm, 40)
@@ -5887,7 +5892,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 10  # v10: Multi-frame Gemini consensus + corner-to-sidebox downgrade + stricter prompt + gemini-2.5-pro
+_CACHE_VERSION = 11  # v11: Fixed OTSU threshold bug + improved tight_edges with combined edge detection + prioritize left edge
 
 
 def _get_cache_path(temp_dir: str) -> str:
