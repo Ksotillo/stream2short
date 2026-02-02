@@ -1879,6 +1879,534 @@ def refine_side_box_tight_edges(
     }
 
 
+def refine_temporal_stability(
+    video_path: str,
+    gemini_bbox: Dict[str, int],
+    frame_width: int,
+    frame_height: int,
+    timestamps: List[float] = [3.0, 10.0, 15.0],
+    debug: bool = False,
+    debug_dir: str = None,
+) -> Optional[Dict[str, int]]:
+    """
+    Refine side_box bbox using temporal stability analysis.
+    
+    Key insight: Gameplay changes rapidly frame-to-frame, but the webcam overlay
+    background is relatively stable. By computing per-pixel variance across multiple
+    frames, we can identify the stable webcam region.
+    
+    Algorithm:
+    1. Extract 3 frames at different timestamps
+    2. Create expanded ROI around Gemini bbox
+    3. Compute per-pixel variance across frames (stability map)
+    4. Threshold to get "stable" pixels mask
+    5. Find connected component containing face center
+    6. Return bounding rect of that component
+    
+    Args:
+        video_path: Path to video file
+        gemini_bbox: Initial bbox from Gemini
+        frame_width: Full frame width
+        frame_height: Full frame height
+        timestamps: List of timestamps to sample
+        debug: Enable debug logging
+        debug_dir: Directory to save debug images
+        
+    Returns:
+        Refined bbox or None if method failed
+    """
+    gx, gy, gw, gh = gemini_bbox['x'], gemini_bbox['y'], gemini_bbox['width'], gemini_bbox['height']
+    
+    if debug:
+        print(f"  🕐 temporal_stability: analyzing {len(timestamps)} frames...")
+    
+    # ==========================================================================
+    # STEP 1: Define expanded ROI (1.8x expansion to capture true edges)
+    # ==========================================================================
+    expand_ratio = 0.9  # Expand by 90% on each side (total 1.8x)
+    expand_x = int(gw * expand_ratio)
+    expand_y = int(gh * expand_ratio)
+    
+    roi_x = max(0, gx - expand_x)
+    roi_y = max(0, gy - expand_y)
+    roi_right = min(frame_width, gx + gw + expand_x)
+    roi_bottom = min(frame_height, gy + gh + expand_y)
+    roi_w = roi_right - roi_x
+    roi_h = roi_bottom - roi_y
+    
+    if roi_w < 100 or roi_h < 100:
+        if debug:
+            print(f"     ⚠️ ROI too small: {roi_w}x{roi_h}")
+        return None
+    
+    if debug:
+        print(f"     ROI: {roi_w}x{roi_h} at ({roi_x},{roi_y})")
+    
+    # ==========================================================================
+    # STEP 2: Extract frames and ROI regions
+    # ==========================================================================
+    roi_frames = []
+    face_in_roi = None
+    
+    for ts in timestamps:
+        frame = extract_frame(video_path, ts)
+        if frame is None:
+            continue
+        
+        # Extract ROI
+        roi = frame[roi_y:roi_bottom, roi_x:roi_right]
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        roi_frames.append(gray_roi)
+        
+        # Detect face in ROI (use first frame with face)
+        if face_in_roi is None:
+            face = detect_face_dnn(frame, roi_x, roi_y, roi_w, roi_h)
+            if face:
+                # Convert to ROI-relative coordinates
+                face_in_roi = {
+                    'x': face.x - roi_x,
+                    'y': face.y - roi_y,
+                    'width': face.width,
+                    'height': face.height,
+                    'center_x': face.center_x - roi_x,
+                    'center_y': face.center_y - roi_y
+                }
+    
+    if len(roi_frames) < 2:
+        if debug:
+            print(f"     ⚠️ Not enough frames extracted ({len(roi_frames)})")
+        return None
+    
+    if face_in_roi is None:
+        if debug:
+            print(f"     ⚠️ No face detected in any frame")
+        return None
+    
+    if debug:
+        print(f"     Extracted {len(roi_frames)} frames, face at ({face_in_roi['center_x']},{face_in_roi['center_y']}) in ROI")
+    
+    # ==========================================================================
+    # STEP 3: Compute stability map (per-pixel variance)
+    # ==========================================================================
+    # Stack frames and compute variance
+    frames_stack = np.stack(roi_frames, axis=0).astype(np.float32)
+    variance = np.var(frames_stack, axis=0)
+    
+    # Normalize to 0-255
+    variance_norm = cv2.normalize(variance, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    
+    # ==========================================================================
+    # STEP 4: Create stable pixels mask (low variance = stable)
+    # ==========================================================================
+    # Use Otsu's method to find threshold, but bias toward lower threshold
+    # to capture more of the webcam region
+    _, otsu_thresh = cv2.threshold(variance_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Also try percentile-based threshold (lower 40% variance = stable)
+    percentile_thresh = np.percentile(variance_norm, 40)
+    
+    # Use the lower of the two thresholds to be more inclusive
+    threshold = min(otsu_thresh, percentile_thresh)
+    
+    # Create mask: stable pixels have LOW variance
+    stable_mask = (variance_norm < threshold).astype(np.uint8) * 255
+    
+    # Morphological operations to clean up
+    kernel = np.ones((5, 5), np.uint8)
+    stable_mask = cv2.morphologyEx(stable_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    stable_mask = cv2.morphologyEx(stable_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    
+    if debug:
+        print(f"     Variance range: {variance.min():.1f}-{variance.max():.1f}, threshold: {threshold:.1f}")
+    
+    # ==========================================================================
+    # STEP 5: Find connected component containing face center
+    # ==========================================================================
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(stable_mask, connectivity=8)
+    
+    # Find which label contains the face center
+    face_cx, face_cy = int(face_in_roi['center_x']), int(face_in_roi['center_y'])
+    
+    # Clamp to ROI bounds
+    face_cx = max(0, min(face_cx, roi_w - 1))
+    face_cy = max(0, min(face_cy, roi_h - 1))
+    
+    face_label = labels[face_cy, face_cx]
+    
+    if face_label == 0:
+        # Face center is in background, find nearest component
+        if debug:
+            print(f"     ⚠️ Face center not in stable region, searching nearby...")
+        
+        # Search in a small neighborhood
+        search_radius = 20
+        best_label = 0
+        best_dist = float('inf')
+        
+        for dy in range(-search_radius, search_radius + 1, 5):
+            for dx in range(-search_radius, search_radius + 1, 5):
+                ny, nx = face_cy + dy, face_cx + dx
+                if 0 <= ny < roi_h and 0 <= nx < roi_w:
+                    label = labels[ny, nx]
+                    if label > 0:
+                        dist = abs(dx) + abs(dy)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_label = label
+        
+        face_label = best_label
+    
+    if face_label == 0:
+        if debug:
+            print(f"     ⚠️ No stable component near face")
+        return None
+    
+    # Get bounding rect of the component
+    x_stat = stats[face_label, cv2.CC_STAT_LEFT]
+    y_stat = stats[face_label, cv2.CC_STAT_TOP]
+    w_stat = stats[face_label, cv2.CC_STAT_WIDTH]
+    h_stat = stats[face_label, cv2.CC_STAT_HEIGHT]
+    area_stat = stats[face_label, cv2.CC_STAT_AREA]
+    
+    if debug:
+        print(f"     Component {face_label}: {w_stat}x{h_stat} at ({x_stat},{y_stat}), area={area_stat}")
+    
+    # ==========================================================================
+    # STEP 6: Validate the candidate bbox
+    # ==========================================================================
+    # Convert to frame coordinates
+    ref_x = roi_x + x_stat
+    ref_y = roi_y + y_stat
+    ref_w = w_stat
+    ref_h = h_stat
+    
+    # Check aspect ratio (webcams are typically 1.1-2.2)
+    ar = ref_w / ref_h if ref_h > 0 else 0
+    if ar < 1.0 or ar > 2.5:
+        if debug:
+            print(f"     ⚠️ Bad aspect ratio: {ar:.2f}")
+        return None
+    
+    # Check minimum size
+    if ref_w < 80 or ref_h < 60:
+        if debug:
+            print(f"     ⚠️ Too small: {ref_w}x{ref_h}")
+        return None
+    
+    # Check that face is fully contained
+    face_frame_x = roi_x + face_in_roi['x']
+    face_frame_y = roi_y + face_in_roi['y']
+    face_frame_w = face_in_roi['width']
+    face_frame_h = face_in_roi['height']
+    
+    if not (ref_x <= face_frame_x and 
+            ref_y <= face_frame_y and
+            ref_x + ref_w >= face_frame_x + face_frame_w and
+            ref_y + ref_h >= face_frame_y + face_frame_h):
+        if debug:
+            print(f"     ⚠️ Face not fully contained")
+        return None
+    
+    # Check that we didn't expand too much beyond Gemini bbox
+    gemini_area = gw * gh
+    ref_area = ref_w * ref_h
+    area_ratio = ref_area / gemini_area if gemini_area > 0 else 1
+    
+    if area_ratio > 1.5:
+        if debug:
+            print(f"     ⚠️ Expanded too much: {area_ratio:.2f}x Gemini area")
+        return None
+    
+    # ==========================================================================
+    # STEP 7: Validate edges using variance contrast
+    # ==========================================================================
+    # The region just outside our bbox should have HIGHER variance than inside
+    # (gameplay is more chaotic than webcam background)
+    border_width = 10
+    
+    # Sample inside variance (near edges but inside)
+    inside_samples = []
+    if x_stat + border_width < x_stat + w_stat - border_width:
+        inside_left = variance[y_stat:y_stat+h_stat, x_stat:x_stat+border_width]
+        inside_right = variance[y_stat:y_stat+h_stat, x_stat+w_stat-border_width:x_stat+w_stat]
+        inside_top = variance[y_stat:y_stat+border_width, x_stat:x_stat+w_stat]
+        inside_samples.extend([inside_left.mean(), inside_right.mean(), inside_top.mean()])
+    
+    # Sample outside variance (just outside edges)
+    outside_samples = []
+    if x_stat >= border_width:
+        outside_left = variance[y_stat:y_stat+h_stat, x_stat-border_width:x_stat]
+        outside_samples.append(outside_left.mean())
+    if x_stat + w_stat + border_width <= roi_w:
+        outside_right = variance[y_stat:y_stat+h_stat, x_stat+w_stat:x_stat+w_stat+border_width]
+        outside_samples.append(outside_right.mean())
+    if y_stat >= border_width:
+        outside_top = variance[y_stat-border_width:y_stat, x_stat:x_stat+w_stat]
+        outside_samples.append(outside_top.mean())
+    
+    if inside_samples and outside_samples:
+        inside_avg = np.mean(inside_samples)
+        outside_avg = np.mean(outside_samples)
+        
+        if debug:
+            print(f"     Variance: inside={inside_avg:.1f}, outside={outside_avg:.1f}")
+        
+        # Outside should have higher variance (more gameplay activity)
+        if outside_avg < inside_avg * 0.8:
+            if debug:
+                print(f"     ⚠️ Edge contrast check failed (outside not more active)")
+            # Don't fail hard, just note it
+    
+    if debug:
+        print(f"     ✅ temporal_stability: {ref_w}x{ref_h} at ({ref_x},{ref_y}), AR={ar:.2f}")
+    
+    # Save debug image
+    if debug_dir:
+        try:
+            # Create debug visualization
+            debug_img = np.zeros((roi_h, roi_w * 3, 3), dtype=np.uint8)
+            
+            # Panel 1: Original ROI with boxes
+            panel1 = roi_frames[0].copy() if roi_frames else np.zeros((roi_h, roi_w), dtype=np.uint8)
+            panel1 = cv2.cvtColor(panel1, cv2.COLOR_GRAY2BGR)
+            # Draw Gemini bbox (red)
+            g_rel_x, g_rel_y = gx - roi_x, gy - roi_y
+            cv2.rectangle(panel1, (g_rel_x, g_rel_y), (g_rel_x + gw, g_rel_y + gh), (0, 0, 255), 2)
+            # Draw refined bbox (green)
+            cv2.rectangle(panel1, (x_stat, y_stat), (x_stat + w_stat, y_stat + h_stat), (0, 255, 0), 2)
+            # Draw face (blue)
+            cv2.rectangle(panel1, 
+                         (int(face_in_roi['x']), int(face_in_roi['y'])),
+                         (int(face_in_roi['x'] + face_in_roi['width']), int(face_in_roi['y'] + face_in_roi['height'])),
+                         (255, 0, 0), 2)
+            debug_img[:, :roi_w] = panel1
+            
+            # Panel 2: Variance map
+            variance_color = cv2.applyColorMap(variance_norm, cv2.COLORMAP_JET)
+            debug_img[:, roi_w:roi_w*2] = variance_color
+            
+            # Panel 3: Stable mask
+            mask_color = cv2.cvtColor(stable_mask, cv2.COLOR_GRAY2BGR)
+            debug_img[:, roi_w*2:] = mask_color
+            
+            debug_path = os.path.join(debug_dir, 'debug_temporal_stability.jpg')
+            cv2.imwrite(debug_path, debug_img)
+            print(f"     📸 Saved: {debug_path}")
+        except Exception as e:
+            print(f"     ⚠️ Failed to save debug: {e}")
+    
+    return {
+        'x': ref_x, 'y': ref_y,
+        'width': ref_w, 'height': ref_h
+    }
+
+
+def refine_edge_scan_from_face(
+    frame_bgr: np.ndarray,
+    gemini_bbox: Dict[str, int],
+    face_center: Tuple[int, int],
+    frame_width: int,
+    frame_height: int,
+    debug: bool = False,
+    debug_dir: str = None,
+) -> Optional[Dict[str, int]]:
+    """
+    Refine bbox by scanning outward from face center to find edges.
+    
+    This is a deterministic fallback that scans from the known face position
+    to find the webcam rectangle edges using gradient analysis.
+    
+    Algorithm:
+    1. Compute Sobel gradient magnitude
+    2. From face center, scan left/right to find strong vertical edges
+    3. Scan up/down to find strong horizontal edges
+    4. Build bbox from detected edges
+    
+    Args:
+        frame_bgr: BGR frame
+        gemini_bbox: Initial bbox from Gemini (for bounds)
+        face_center: (x, y) of face center (REQUIRED)
+        frame_width: Full frame width
+        frame_height: Full frame height
+        debug: Enable debug logging
+        debug_dir: Directory to save debug images
+        
+    Returns:
+        Refined bbox or None if method failed
+    """
+    if face_center is None:
+        return None
+    
+    gx, gy, gw, gh = gemini_bbox['x'], gemini_bbox['y'], gemini_bbox['width'], gemini_bbox['height']
+    fx, fy = face_center
+    
+    if debug:
+        print(f"  📏 edge_scan: face at ({fx},{fy}), gemini={gw}x{gh} at ({gx},{gy})")
+    
+    # Create search ROI (expanded Gemini bbox)
+    expand_ratio = 0.5
+    roi_x = max(0, gx - int(gw * expand_ratio))
+    roi_y = max(0, gy - int(gh * expand_ratio))
+    roi_right = min(frame_width, gx + gw + int(gw * expand_ratio))
+    roi_bottom = min(frame_height, gy + gh + int(gh * expand_ratio))
+    roi_w = roi_right - roi_x
+    roi_h = roi_bottom - roi_y
+    
+    # Extract ROI and convert to grayscale
+    roi = frame_bgr[roi_y:roi_bottom, roi_x:roi_right]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    
+    # Compute gradient magnitude (Sobel)
+    grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+    
+    # Face position in ROI coordinates
+    fx_roi = fx - roi_x
+    fy_roi = fy - roi_y
+    
+    # Vertical band height for horizontal scanning (around face y)
+    band_h = max(30, int(gh * 0.3))
+    band_top = max(0, fy_roi - band_h // 2)
+    band_bottom = min(roi_h, fy_roi + band_h // 2)
+    
+    # Horizontal band width for vertical scanning (around face x)
+    band_w = max(30, int(gw * 0.3))
+    band_left = max(0, fx_roi - band_w // 2)
+    band_right = min(roi_w, fx_roi + band_w // 2)
+    
+    def find_edge_left(start_x, min_x=0):
+        """Scan left from start_x to find a strong vertical edge."""
+        best_edge = start_x
+        best_strength = 0
+        
+        for x in range(start_x, min_x, -1):
+            if x < 0 or x >= roi_w:
+                continue
+            # Get median gradient along vertical band at this x
+            col_grad = grad_mag[band_top:band_bottom, x]
+            strength = np.median(col_grad)
+            
+            # Check for consistent edge (high gradient)
+            if strength > best_strength * 1.5 and strength > 20:
+                best_strength = strength
+                best_edge = x
+        
+        return best_edge if best_strength > 15 else start_x
+    
+    def find_edge_right(start_x, max_x=None):
+        """Scan right from start_x to find a strong vertical edge."""
+        if max_x is None:
+            max_x = roi_w
+        best_edge = start_x
+        best_strength = 0
+        
+        for x in range(start_x, max_x):
+            if x < 0 or x >= roi_w:
+                continue
+            col_grad = grad_mag[band_top:band_bottom, x]
+            strength = np.median(col_grad)
+            
+            if strength > best_strength * 1.5 and strength > 20:
+                best_strength = strength
+                best_edge = x
+        
+        return best_edge if best_strength > 15 else start_x
+    
+    def find_edge_top(start_y, min_y=0):
+        """Scan up from start_y to find a strong horizontal edge."""
+        best_edge = start_y
+        best_strength = 0
+        
+        for y in range(start_y, min_y, -1):
+            if y < 0 or y >= roi_h:
+                continue
+            row_grad = grad_mag[y, band_left:band_right]
+            strength = np.median(row_grad)
+            
+            if strength > best_strength * 1.5 and strength > 20:
+                best_strength = strength
+                best_edge = y
+        
+        return best_edge if best_strength > 15 else start_y
+    
+    def find_edge_bottom(start_y, max_y=None):
+        """Scan down from start_y to find a strong horizontal edge."""
+        if max_y is None:
+            max_y = roi_h
+        best_edge = start_y
+        best_strength = 0
+        
+        for y in range(start_y, max_y):
+            if y < 0 or y >= roi_h:
+                continue
+            row_grad = grad_mag[y, band_left:band_right]
+            strength = np.median(row_grad)
+            
+            if strength > best_strength * 1.5 and strength > 20:
+                best_strength = strength
+                best_edge = y
+        
+        return best_edge if best_strength > 15 else start_y
+    
+    # Gemini bbox in ROI coordinates
+    g_left_roi = gx - roi_x
+    g_right_roi = gx + gw - roi_x
+    g_top_roi = gy - roi_y
+    g_bottom_roi = gy + gh - roi_y
+    
+    # Search for edges, starting near Gemini edges
+    left_edge = find_edge_left(g_left_roi + int(gw * 0.2), max(0, g_left_roi - int(gw * 0.3)))
+    right_edge = find_edge_right(g_right_roi - int(gw * 0.2), min(roi_w, g_right_roi + int(gw * 0.3)))
+    top_edge = find_edge_top(g_top_roi + int(gh * 0.2), max(0, g_top_roi - int(gh * 0.3)))
+    bottom_edge = find_edge_bottom(g_bottom_roi - int(gh * 0.2), min(roi_h, g_bottom_roi + int(gh * 0.3)))
+    
+    # Convert to frame coordinates
+    ref_x = roi_x + left_edge
+    ref_y = roi_y + top_edge
+    ref_w = right_edge - left_edge
+    ref_h = bottom_edge - top_edge
+    
+    if debug:
+        print(f"     Edges (ROI): L={left_edge}, R={right_edge}, T={top_edge}, B={bottom_edge}")
+        print(f"     Raw result: {ref_w}x{ref_h} at ({ref_x},{ref_y})")
+    
+    # Validation
+    if ref_w < 80 or ref_h < 60:
+        if debug:
+            print(f"     ⚠️ Too small: {ref_w}x{ref_h}")
+        return None
+    
+    ar = ref_w / ref_h if ref_h > 0 else 0
+    if ar < 1.0 or ar > 2.5:
+        if debug:
+            print(f"     ⚠️ Bad AR: {ar:.2f}")
+        return None
+    
+    # Must contain face
+    if not (ref_x <= fx <= ref_x + ref_w and ref_y <= fy <= ref_y + ref_h):
+        if debug:
+            print(f"     ⚠️ Doesn't contain face")
+        return None
+    
+    # Check that we didn't expand too much beyond Gemini
+    gemini_area = gw * gh
+    ref_area = ref_w * ref_h
+    if ref_area > gemini_area * 1.35:
+        if debug:
+            print(f"     ⚠️ Expanded too much: {ref_area/gemini_area:.2f}x")
+        return None
+    
+    if debug:
+        print(f"     ✅ edge_scan: {ref_w}x{ref_h} at ({ref_x},{ref_y}), AR={ar:.2f}")
+    
+    return {
+        'x': ref_x, 'y': ref_y,
+        'width': ref_w, 'height': ref_h
+    }
+
+
 def refine_side_box_bbox(
     frame_bgr: np.ndarray,
     gemini_bbox: Dict[str, int],
@@ -1887,9 +2415,20 @@ def refine_side_box_bbox(
     frame_height: int,
     debug: bool = False,
     debug_dir: str = None,
+    video_path: str = None,
 ) -> Optional[Dict[str, int]]:
     """
-    Main side_box refinement: tries tight edge detection first, then contours, then raycast.
+    Main side_box refinement: tries multiple methods in order of reliability.
+    
+    Priority order (most reliable first):
+    1. temporal_stability - uses multi-frame variance (best for floating webcams)
+    2. edge_scan_from_face - gradient-based edge detection from face
+    3. tight_edges - edge projection analysis
+    4. contours - contour detection
+    5. raycast - ray casting from face
+    
+    IMPORTANT: If a refinement EXPANDS the bbox by >35% vs Gemini, we reject it
+    and try the next method. This prevents gameplay bleed from over-expansion.
     
     Args:
         frame_bgr: BGR frame
@@ -1899,6 +2438,7 @@ def refine_side_box_bbox(
         frame_height: Full frame height
         debug: Enable debug logging
         debug_dir: Directory to save debug images
+        video_path: Path to video (needed for temporal stability)
         
     Returns:
         Refined bbox or None if all methods failed
@@ -1909,34 +2449,77 @@ def refine_side_box_bbox(
         if face_center:
             print(f"     Face center: ({face_center[0]}, {face_center[1]})")
     
-    # Method 1: Tight edge detection (NEW - best for floating webcams)
+    gemini_area = gemini_bbox['width'] * gemini_bbox['height']
+    max_allowed_area = gemini_area * 1.35  # Don't allow >35% expansion
+    
+    def validate_no_expansion(bbox, method_name):
+        """Check that refined bbox didn't expand too much."""
+        if bbox is None:
+            return None
+        area = bbox['width'] * bbox['height']
+        if area > max_allowed_area:
+            if debug:
+                print(f"     ⚠️ {method_name} expanded too much ({area/gemini_area:.2f}x), rejecting")
+            return None
+        return bbox
+    
+    # Method 1: Temporal stability (BEST - uses multi-frame variance)
+    if video_path:
+        refined = refine_temporal_stability(
+            video_path, gemini_bbox, frame_width, frame_height,
+            timestamps=[3.0, 10.0, 15.0], debug=debug, debug_dir=debug_dir
+        )
+        refined = validate_no_expansion(refined, "temporal_stability")
+        
+        if refined:
+            if debug:
+                print(f"  ✅ side_box: temporal_stability method succeeded")
+            return refined
+    
+    # Method 2: Edge scan from face (deterministic, fast)
+    if face_center:
+        refined = refine_edge_scan_from_face(
+            frame_bgr, gemini_bbox, face_center,
+            frame_width, frame_height, debug, debug_dir
+        )
+        refined = validate_no_expansion(refined, "edge_scan")
+        
+        if refined:
+            if debug:
+                print(f"  ✅ side_box: edge_scan method succeeded")
+            return refined
+    
+    # Method 3: Tight edge projection
     refined = refine_side_box_tight_edges(
         frame_bgr, gemini_bbox, face_center,
         frame_width, frame_height, debug, debug_dir
     )
+    refined = validate_no_expansion(refined, "tight_edges")
     
     if refined:
         if debug:
             print(f"  ✅ side_box: tight_edges method succeeded")
         return refined
     
-    # Method 2: Contour detection (fallback)
+    # Method 4: Contour detection
     refined = refine_side_box_bbox_contours(
         frame_bgr, gemini_bbox, face_center,
         frame_width, frame_height, debug
     )
+    refined = validate_no_expansion(refined, "contours")
     
     if refined:
         if debug:
             print(f"  ✅ side_box: contour method succeeded")
         return refined
     
-    # Method 3: Raycast (last resort)
+    # Method 5: Raycast (last resort)
     if face_center:
         refined = refine_side_box_bbox_raycast(
             frame_bgr, gemini_bbox, face_center,
             frame_width, frame_height, debug
         )
+        refined = validate_no_expansion(refined, "raycast")
         
         if refined:
             if debug:
@@ -3857,14 +4440,15 @@ def detect_webcam_region(
                                     if detected_face:
                                         face_center_for_refine = (detected_face.center_x, detected_face.center_y)
                                     
-                                    # Run side_box refinement (tight_edges first, then contour, then raycast)
+                                    # Run side_box refinement (temporal_stability → edge_scan → tight_edges → contour → raycast)
                                     refined = refine_side_box_bbox(
                                         frame_for_refine,
                                         {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
                                         face_center_for_refine,
                                         width, height,
                                         debug=True,
-                                        debug_dir=debug_dir
+                                        debug_dir=debug_dir,
+                                        video_path=video_path  # Enable temporal stability refinement
                                     )
                                     
                                     if refined:
@@ -4382,7 +4966,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 7  # v7: tight_edges refinement for side_box, ZERO padding on L/R/T
+_CACHE_VERSION = 8  # v8: temporal_stability + edge_scan refinement, max 35% expansion limit
 
 
 def _get_cache_path(temp_dir: str) -> str:
