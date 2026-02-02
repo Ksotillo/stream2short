@@ -351,11 +351,14 @@ Examples:
 - Top band: {{"found": true, "type": "top_band", "corner": null, "x": 0, "y": 0, "width": 1920, "height": 400, "confidence": 0.85, "reason": "Wide webcam band at top with gameplay below"}}
 - No webcam: {{"found": false, "type": "none", "confidence": 0.0, "reason": "Only gameplay and HUD elements visible, no human face"}}"""
 
-        # Try models in order of preference (free tier)
+        # Try models in order of preference (most capable first)
         models_to_try = [
-            "gemini-2.0-flash-lite",  # Free tier, fast
-            "gemini-1.5-flash",       # Free tier fallback
+            "gemini-2.5-flash",       # Most capable, try first
+            "gemini-2.0-flash-lite",  # Fast fallback
+            "gemini-1.5-flash",       # Legacy fallback
         ]
+        
+        print(f"  🤖 Gemini models to try: {models_to_try}")
         
         last_error = None
         for model_name in models_to_try:
@@ -477,8 +480,8 @@ Examples:
                     print(f"⚠️ Gemini webcam too small: {width}x{height}")
                     return None
                 
-                print(f"✅ Gemini detected webcam: type={webcam_type}, effective_type={effective_type}, corner={corner}")
-                print(f"   x={x}, y={y}, w={width}, h={height}, conf={confidence:.2f}")
+                print(f"✅ Gemini SUCCESS using {model_name}: type={webcam_type}, confidence={confidence:.2f}")
+                print(f"   effective_type={effective_type}, corner={corner}, bbox=({x},{y},{width}x{height})")
                 
                 return {
                     'found': True,
@@ -667,11 +670,14 @@ RESPOND WITH ONLY JSON (no markdown, no explanation):
 If you cannot find the main streamer or are unsure, respond:
 {{"error": "reason"}}"""
 
-        # Try models in order of preference
+        # Try models in order of preference (most capable first)
         models_to_try = [
-            "gemini-2.0-flash-lite",
-            "gemini-1.5-flash",
+            "gemini-2.5-flash",       # Most capable, try first
+            "gemini-2.0-flash-lite",  # Fast fallback
+            "gemini-1.5-flash",       # Legacy fallback
         ]
+        
+        print(f"  🤖 Gemini anchor models to try: {models_to_try}")
         
         last_error = None
         for model_name in models_to_try:
