@@ -714,6 +714,543 @@ def validate_bbox_no_gameplay(frame: np.ndarray, bbox: Tuple[int, int, int, int]
     return ratio < threshold, ratio
 
 
+# =============================================================================
+# UNIVERSAL WEBCAM BOUNDARY DETECTION
+# =============================================================================
+# These functions implement a universal approach that works for ANY webcam position
+# (left, right, top, corner, floating) by detecting the actual edge between 
+# gameplay texture and webcam content, rather than relying on Gemini coordinates.
+#
+# CORE PRINCIPLE:
+#   Gemini = Layout Classifier (WHAT type: corner/side/top/floating)
+#   CV = Boundary Finder (WHERE: find the actual edge using texture analysis)
+# =============================================================================
+
+
+def is_likely_gameplay_region(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Tuple[bool, float]:
+    """
+    Detect if a region contains gameplay using universal heuristics.
+    
+    Works for ANY game, not just Valorant, by analyzing:
+    1. High local contrast (HUD elements, game textures)
+    2. Saturated colors (game UIs are colorful, rooms are muted)
+    3. Edge density patterns (UI layouts vs natural scenes)
+    
+    Args:
+        frame: BGR frame
+        bbox: (x, y, w, h) region to check
+        
+    Returns:
+        Tuple of (is_gameplay, confidence_score)
+    """
+    x, y, w, h = bbox
+    if w <= 0 or h <= 0:
+        return False, 0.0
+    
+    # Clamp to frame bounds
+    x = max(0, x)
+    y = max(0, y)
+    x2 = min(x + w, frame.shape[1])
+    y2 = min(y + h, frame.shape[0])
+    
+    if x2 <= x or y2 <= y:
+        return False, 0.0
+    
+    roi = frame[y:y2, x:x2]
+    if roi.size == 0:
+        return False, 0.0
+    
+    # Metric 1: Local contrast (Laplacian variance)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    high_contrast = laplacian_var > 500  # Threshold for game UI
+    
+    # Metric 2: Color saturation
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mean_sat = np.mean(hsv[:, :, 1])
+    high_saturation = mean_sat > 100
+    
+    # Metric 3: Edge density uniformity (gameplay has structured edges)
+    edges = cv2.Canny(gray, 50, 150)
+    edge_density = np.count_nonzero(edges) / edges.size
+    structured = 0.05 < edge_density < 0.3  # Not too noisy, not too empty
+    
+    # Combined score
+    score = sum([high_contrast, high_saturation, structured]) / 3.0
+    
+    return score > 0.6, score
+
+
+def aggregate_detections_universal(
+    detections: List[Dict],
+    frame_shape: Tuple[int, int],
+    debug: bool = False,
+) -> Optional[Dict]:
+    """
+    Universal aggregation that works for ANY webcam layout (left/right/top/center/corner).
+    
+    Instead of trusting Gemini's coordinates directly, this uses conservative anchoring:
+    - For right-side webcams: use MAX x (rightmost detection) to avoid left-bleed
+    - For left-side webcams: use MIN x (leftmost detection) to avoid right-bleed
+    - For top/bottom: similar logic for y-coordinate
+    - For floating/center: use median (safest)
+    
+    Args:
+        detections: List of detection results from Gemini
+        frame_shape: (height, width) of frame
+        debug: Enable debug logging
+        
+    Returns:
+        Aggregated detection result or None
+    """
+    if not detections:
+        return None
+    
+    h, w = frame_shape[:2]
+    
+    # Filter valid detections
+    valid = [d for d in detections if d and d.get('found') and not d.get('no_webcam_confirmed')]
+    
+    if not valid:
+        no_webcam = [d for d in detections if d and d.get('no_webcam_confirmed')]
+        if no_webcam:
+            return no_webcam[0]
+        return None
+    
+    if len(valid) == 1:
+        return valid[0]
+    
+    # Get type consensus
+    from collections import Counter
+    types = [d.get('type', 'unknown') for d in valid]
+    corners = [d.get('corner', 'unknown') for d in valid]
+    type_counts = Counter(types)
+    corner_counts = Counter(corners)
+    majority_type = type_counts.most_common(1)[0][0]
+    majority_corner = corner_counts.most_common(1)[0][0]
+    
+    # Filter to matching detections
+    matching = [d for d in valid if d.get('type') == majority_type]
+    if not matching:
+        matching = valid
+    
+    # Extract coordinates
+    all_x = [d['x'] for d in matching]
+    all_y = [d['y'] for d in matching]
+    all_w = [d['width'] for d in matching]
+    all_h = [d['height'] for d in matching]
+    confs = [d.get('confidence', 0.5) for d in matching]
+    
+    # Calculate center of mass to determine position
+    avg_x = np.mean(all_x) + np.mean(all_w) / 2
+    avg_y = np.mean(all_y) + np.mean(all_h) / 2
+    
+    # Determine which edge is "sacred" (the one toward gameplay)
+    # and use conservative anchoring
+    is_right_side = avg_x > w * 0.6
+    is_left_side = avg_x < w * 0.4
+    is_top = avg_y < h * 0.4
+    is_bottom = avg_y > h * 0.6
+    
+    if majority_type in ['side_box', 'corner_overlay']:
+        if is_right_side:
+            # RIGHT-SIDE: Use MAX x (rightmost) to avoid left-bleed into gameplay
+            anchor_x = int(max(all_x))
+            bias_reason = f"right-side: max(x)={anchor_x}"
+        elif is_left_side:
+            # LEFT-SIDE: Use MIN x (leftmost) to avoid right-bleed
+            anchor_x = int(min(all_x))
+            bias_reason = f"left-side: min(x)={anchor_x}"
+        else:
+            # CENTER: Use median (safest for floating)
+            anchor_x = int(np.median(all_x))
+            bias_reason = f"center: median(x)={anchor_x}"
+        
+        if is_top:
+            anchor_y = int(min(all_y))  # Topmost
+        elif is_bottom:
+            anchor_y = int(max(all_y))  # Bottommost
+        else:
+            anchor_y = int(np.median(all_y))
+    else:
+        # For top_band/full_cam, use median (no directional bias needed)
+        anchor_x = int(np.median(all_x))
+        anchor_y = int(np.median(all_y))
+        bias_reason = "median (top_band/full_cam)"
+    
+    width = int(np.median(all_w))
+    height = int(np.median(all_h))
+    
+    if debug:
+        print(f"  📊 Universal aggregation: {len(matching)} detections")
+        print(f"     Position: {'RIGHT' if is_right_side else 'LEFT' if is_left_side else 'CENTER'}")
+        print(f"     Anchor: ({anchor_x}, {anchor_y}), {bias_reason}")
+    
+    return {
+        'found': True,
+        'type': majority_type,
+        'effective_type': matching[0].get('effective_type', majority_type),
+        'corner': majority_corner,
+        'x': anchor_x,
+        'y': anchor_y,
+        'width': width,
+        'height': height,
+        'confidence': float(np.mean(confs)),
+        'reason': f"Universal aggregation ({bias_reason})",
+        '_aggregated': True,
+        '_frame_count': len(matching),
+        '_is_right_side': is_right_side,
+        '_is_left_side': is_left_side,
+    }
+
+
+def find_webcam_boundary_universal(
+    frame: np.ndarray,
+    seed_bbox: Tuple[int, int, int, int],
+    layout_type: str,
+    debug: bool = False,
+) -> Tuple[int, int, int, int]:
+    """
+    Universal boundary detection using texture analysis.
+    
+    Gameplay = high edge density, high saturation, sharp texture changes
+    Webcam = lower edge density, natural colors, smoother gradients
+    
+    This finds the actual boundary between gameplay and webcam by scanning
+    for the transition point where texture characteristics change.
+    
+    Args:
+        frame: BGR frame
+        seed_bbox: (x, y, w, h) initial bbox from Gemini
+        layout_type: 'side_box', 'corner_overlay', 'top_band', etc.
+        debug: Enable debug logging
+        
+    Returns:
+        Refined (x, y, w, h) bbox
+    """
+    x, y, w, h = seed_bbox
+    h_frame, w_frame = frame.shape[:2]
+    cx = x + w // 2
+    cy = y + h // 2
+    
+    # Determine search strategy based on layout position
+    is_right_side = cx > w_frame * 0.6
+    is_left_side = cx < w_frame * 0.4
+    is_top = cy < h_frame * 0.4
+    is_bottom = cy > h_frame * 0.6
+    
+    # Convert to grayscale and get edge density
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # Get saturation (gameplay is more saturated than natural webcam backgrounds)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    
+    # Height sample for scanning
+    h_sample = max(20, h // 3)
+    y_center = max(h_sample, min(y + h // 2, h_frame - h_sample))
+    
+    def get_texture_score(scan_x: int) -> float:
+        """Get combined texture score at x position (high = gameplay, low = webcam)."""
+        if scan_x < 0 or scan_x >= w_frame:
+            return 0.0
+        
+        y_start = max(0, y_center - h_sample)
+        y_end = min(h_frame, y_center + h_sample)
+        
+        if y_end <= y_start:
+            return 0.0
+        
+        # Edge density
+        edge_col = edges[y_start:y_end, scan_x]
+        edge_density = np.mean(edge_col > 0) if len(edge_col) > 0 else 0
+        
+        # Saturation level
+        sat_col = saturation[y_start:y_end, scan_x]
+        sat_level = np.mean(sat_col) / 255.0 if len(sat_col) > 0 else 0
+        
+        # Combined score (weighted toward edge density)
+        return edge_density * 2.0 + sat_level
+    
+    # Search margin (don't search too far from seed)
+    search_margin = int(w * 0.3)  # ±30% of width
+    
+    new_x, new_w = x, w
+    
+    if is_right_side:
+        # RIGHT-SIDE WEBCAM: Search leftward from seed to find gameplay boundary
+        # The boundary is where edge density/saturation increases (entering gameplay)
+        search_start = max(0, x - search_margin)
+        search_end = x + w // 4  # Don't search too far right
+        
+        if search_end > search_start:
+            # Build texture profile
+            profile = np.array([get_texture_score(sx) for sx in range(search_start, search_end)])
+            
+            if len(profile) > 10:
+                # Smooth the profile
+                kernel_size = min(9, len(profile) // 3)
+                if kernel_size > 1:
+                    profile_smooth = np.convolve(profile, np.ones(kernel_size)/kernel_size, mode='same')
+                else:
+                    profile_smooth = profile
+                
+                # Find steepest drop (gameplay → webcam transition)
+                gradient = np.gradient(profile_smooth)
+                
+                # Look for negative gradient (drop) in the profile
+                # The webcam boundary is where texture score drops significantly
+                min_grad_idx = np.argmin(gradient)
+                
+                # Only accept if it's a significant drop
+                if gradient[min_grad_idx] < -0.05:
+                    boundary_x = search_start + min_grad_idx
+                    # The webcam starts AFTER the drop
+                    new_x = min(boundary_x + 5, x)  # Don't expand past seed
+                    new_w = (x + w) - new_x
+                    
+                    if debug:
+                        print(f"  🎯 Right-side boundary found at x={new_x} (gradient={gradient[min_grad_idx]:.3f})")
+                else:
+                    if debug:
+                        print(f"  ⚠️ No clear boundary found, using seed x={x}")
+    
+    elif is_left_side:
+        # LEFT-SIDE WEBCAM: Search rightward from seed to find gameplay boundary
+        search_start = x + w * 3 // 4  # Start from right portion of seed
+        search_end = min(w_frame, x + w + search_margin)
+        
+        if search_end > search_start:
+            profile = np.array([get_texture_score(sx) for sx in range(search_start, search_end)])
+            
+            if len(profile) > 10:
+                kernel_size = min(9, len(profile) // 3)
+                if kernel_size > 1:
+                    profile_smooth = np.convolve(profile, np.ones(kernel_size)/kernel_size, mode='same')
+                else:
+                    profile_smooth = profile
+                
+                gradient = np.gradient(profile_smooth)
+                
+                # For left-side, look for positive gradient (webcam → gameplay)
+                max_grad_idx = np.argmax(gradient)
+                
+                if gradient[max_grad_idx] > 0.05:
+                    boundary_x = search_start + max_grad_idx
+                    # The webcam ends BEFORE the rise
+                    new_right_edge = max(boundary_x - 5, x + w)  # Don't shrink past seed
+                    new_w = new_right_edge - x
+                    
+                    if debug:
+                        print(f"  🎯 Left-side boundary found at x={boundary_x} (gradient={gradient[max_grad_idx]:.3f})")
+                else:
+                    if debug:
+                        print(f"  ⚠️ No clear boundary found, using seed width={w}")
+    else:
+        # CENTER or FLOATING: Keep seed, don't expand
+        if debug:
+            print(f"  🎯 Center/floating webcam, using seed bbox")
+    
+    # Ensure we don't expand beyond seed (safety constraint)
+    if new_x < x:
+        new_x = x
+        new_w = w
+    if new_w > w * 1.1:  # Max 10% expansion
+        new_w = int(w * 1.1)
+    
+    return (new_x, y, new_w, h)
+
+
+def apply_layout_constraints(
+    bbox: Tuple[int, int, int, int],
+    seed_bbox: Tuple[int, int, int, int],
+    layout_type: str,
+    frame_shape: Tuple[int, int],
+    debug: bool = False,
+) -> Tuple[int, int, int, int]:
+    """
+    Universal constraints that prevent expansion toward gameplay.
+    
+    Rules:
+    - side_box on right: x can only increase (move right), never decrease
+    - side_box on left: x+w can only decrease (move left), never increase
+    - corner_overlay: snap to edges if within 2% of frame edge
+    - floating: shrink only, no expansion beyond seed
+    - Universal: never expand area > 110% of seed
+    
+    Args:
+        bbox: (x, y, w, h) proposed bbox
+        seed_bbox: (x, y, w, h) original seed from Gemini
+        layout_type: 'side_box', 'corner_overlay', etc.
+        frame_shape: (height, width) of frame
+        debug: Enable debug logging
+        
+    Returns:
+        Constrained (x, y, w, h) bbox
+    """
+    sx, sy, sw, sh = seed_bbox
+    x, y, w, h = bbox
+    frame_h, frame_w = frame_shape[:2]
+    
+    # Determine position
+    seed_cx = sx + sw // 2
+    is_right_side = seed_cx > frame_w * 0.6
+    is_left_side = seed_cx < frame_w * 0.4
+    
+    if layout_type == 'side_box':
+        if is_right_side:
+            # RIGHT SIDE: Left edge is sacred (toward gameplay)
+            # x can only INCREASE (move right), never decrease
+            if x < sx:
+                if debug:
+                    print(f"  ⚠️ Constraint: x={x} < seed x={sx}, forcing x={sx}")
+                x = sx
+            # Maintain right edge if we moved left edge
+            right_edge = sx + sw
+            if x + w < right_edge:
+                w = right_edge - x
+        elif is_left_side:
+            # LEFT SIDE: Right edge is sacred
+            # x+w can only DECREASE, never increase
+            seed_right = sx + sw
+            if x + w > seed_right:
+                if debug:
+                    print(f"  ⚠️ Constraint: right edge {x+w} > seed {seed_right}, clamping")
+                w = seed_right - x
+    
+    elif layout_type == 'corner_overlay':
+        # Snap to edges if close (within 2%)
+        snap_thresh_x = int(frame_w * 0.02)
+        snap_thresh_y = int(frame_h * 0.02)
+        
+        if x < snap_thresh_x:
+            w = w + x  # Expand width to compensate
+            x = 0
+        if y < snap_thresh_y:
+            h = h + y
+            y = 0
+        if (x + w) > (frame_w - snap_thresh_x):
+            w = frame_w - x
+        if (y + h) > (frame_h - snap_thresh_y):
+            h = frame_h - y
+    
+    # Universal: never expand area > 110% of seed
+    seed_area = sw * sh
+    new_area = w * h
+    if new_area > seed_area * 1.1:
+        # Scale down to 110%
+        scale = np.sqrt(1.1 * seed_area / new_area)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        # Center on original
+        x = x + (w - new_w) // 2
+        y = y + (h - new_h) // 2
+        w, h = new_w, new_h
+        
+        if debug:
+            print(f"  ⚠️ Area constraint: scaled down to {w}x{h}")
+    
+    return (int(x), int(y), int(w), int(h))
+
+
+def refine_bbox_universal(
+    frame: np.ndarray,
+    seed_bbox: Tuple[int, int, int, int],
+    layout_type: str,
+    face_center: Optional[Tuple[int, int]] = None,
+    debug: bool = False,
+    debug_dir: str = None,
+) -> Tuple[int, int, int, int]:
+    """
+    Universal bbox refinement pipeline.
+    
+    Combines texture-based boundary detection with layout constraints
+    and gameplay validation.
+    
+    Args:
+        frame: BGR frame
+        seed_bbox: (x, y, w, h) initial bbox from Gemini
+        layout_type: 'side_box', 'corner_overlay', etc.
+        face_center: Optional (x, y) of detected face
+        debug: Enable debug logging
+        debug_dir: Directory for debug images
+        
+    Returns:
+        Refined (x, y, w, h) bbox
+    """
+    if debug:
+        print(f"  🔬 Universal refinement: seed={seed_bbox}, type={layout_type}")
+    
+    # Step 1: Find boundary using texture analysis
+    refined = find_webcam_boundary_universal(frame, seed_bbox, layout_type, debug)
+    
+    # Step 2: Apply layout constraints
+    constrained = apply_layout_constraints(
+        refined, seed_bbox, layout_type, frame.shape[:2], debug
+    )
+    
+    # Step 3: Validate no gameplay pixels
+    is_gameplay, gameplay_score = is_likely_gameplay_region(frame, constrained)
+    
+    if is_gameplay:
+        if debug:
+            print(f"  ⚠️ Gameplay detected in refined bbox (score={gameplay_score:.2f})")
+        
+        # Fallback to seed with conservative margin
+        x, y, w, h = seed_bbox
+        margin = int(w * 0.08)  # 8% margin
+        
+        seed_cx = x + w // 2
+        if seed_cx > frame.shape[1] / 2:  # Right side
+            # Shrink from left (toward gameplay)
+            constrained = (x + margin, y + margin // 2, w - margin, h - margin)
+        else:  # Left side
+            # Shrink from right (toward gameplay)
+            constrained = (x, y + margin // 2, w - margin, h - margin)
+        
+        if debug:
+            print(f"  🔧 Applied margin fallback: {constrained}")
+    
+    # Step 4: Face containment check
+    if face_center:
+        fx, fy = face_center
+        x, y, w, h = constrained
+        if not (x <= fx <= x + w and y <= fy <= y + h):
+            if debug:
+                print(f"  ⚠️ Face ({fx}, {fy}) not in bbox, reverting to seed")
+            constrained = seed_bbox
+    
+    # Step 5: Validate aspect ratio
+    x, y, w, h = constrained
+    ar = w / h if h > 0 else 0
+    if ar < 0.8 or ar > 3.5:
+        if debug:
+            print(f"  ⚠️ Bad aspect ratio ({ar:.2f}), reverting to seed")
+        constrained = seed_bbox
+    
+    if debug:
+        sx, sy, sw, sh = seed_bbox
+        fx, fy, fw, fh = constrained
+        print(f"  ✅ Universal refinement: {sw}x{sh}@({sx},{sy}) → {fw}x{fh}@({fx},{fy})")
+    
+    # Save debug image if requested
+    if debug_dir:
+        try:
+            debug_save_comparison(
+                frame,
+                seed_bbox,
+                constrained,
+                debug_dir,
+                is_valid=not is_gameplay
+            )
+        except Exception as e:
+            if debug:
+                print(f"  ⚠️ Failed to save debug image: {e}")
+    
+    return constrained
+
+
 def debug_save_comparison(
     frame: np.ndarray,
     seed_bbox: Tuple[int, int, int, int],
@@ -3367,6 +3904,7 @@ def refine_side_box_bbox(
     Main side_box refinement: tries multiple methods in order of reliability.
     
     Priority order (most reliable first):
+    0. universal - texture-based boundary detection (BEST for preventing bleed)
     1. temporal_stability - uses multi-frame variance (best for floating webcams)
     2. edge_scan_from_face - gradient-based edge detection from face
     3. tight_edges - edge projection analysis
@@ -3408,6 +3946,33 @@ def refine_side_box_bbox(
                 print(f"     ⚠️ {method_name} expanded too much ({area/gemini_area:.2f}x), rejecting")
             return None
         return bbox
+    
+    # Method 0: Universal texture-based boundary detection (BEST for preventing bleed)
+    # This method uses texture analysis to find the actual gameplay/webcam boundary
+    try:
+        seed_tuple = (gemini_bbox['x'], gemini_bbox['y'], gemini_bbox['width'], gemini_bbox['height'])
+        refined_tuple = refine_bbox_universal(
+            frame_bgr, seed_tuple, 'side_box', face_center, debug, debug_dir
+        )
+        
+        if refined_tuple:
+            rx, ry, rw, rh = refined_tuple
+            refined = {'x': rx, 'y': ry, 'width': rw, 'height': rh}
+            refined = validate_no_expansion(refined, "universal")
+            
+            if refined:
+                # Validate no gameplay pixels
+                is_gameplay, score = is_likely_gameplay_region(frame_bgr, (rx, ry, rw, rh))
+                if not is_gameplay:
+                    if debug:
+                        print(f"  ✅ side_box: universal method succeeded (no gameplay: score={score:.2f})")
+                    return refined
+                else:
+                    if debug:
+                        print(f"     ⚠️ universal: gameplay detected (score={score:.2f}), trying next method")
+    except Exception as e:
+        if debug:
+            print(f"     ⚠️ universal method failed: {e}")
     
     # Method 1: Temporal stability (BEST - uses multi-frame variance)
     if video_path:
@@ -5996,7 +6561,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 13  # v13: Hybrid detection - directional aggregation + gameplay-aware constrained refinement
+_CACHE_VERSION = 14  # v14: Universal webcam boundary detection - texture-based boundary finder for all layouts
 
 
 def _get_cache_path(temp_dir: str) -> str:
