@@ -15,7 +15,7 @@ import json
 import numpy as np
 import os
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List, Literal
+from typing import Optional, Tuple, Dict, List, Literal, Union
 from dataclasses import dataclass
 
 
