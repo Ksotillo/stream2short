@@ -235,10 +235,17 @@ COORDINATES: x=0 is LEFT edge, y=0 is TOP edge
 
 === WHAT IS A WEBCAM OVERLAY? ===
 A webcam overlay is a rectangular region showing a REAL HUMAN PERSON (streamer) overlaid on or alongside gameplay.
+The webcam overlay may be:
+- In a CORNER (touching edges) - traditional corner overlay
+- FLOATING (not touching any edge) - mid-right, mid-left, top-center, etc.
+
 The webcam region should include:
 - A person's face, head, and/or upper body
 - The ENTIRE webcam frame/border (not just the face)
 - Any background visible in the webcam feed
+
+CRITICAL: Return a TIGHT bounding box around ONLY the webcam rectangle.
+Do NOT include any gameplay area in the bounding box.
 
 === CRITICAL: WHAT IS NOT A WEBCAM ===
 DO NOT classify these as webcam:
@@ -259,11 +266,12 @@ Classify the webcam (if found) as one of these types:
    - Located in: top-left, top-right, bottom-left, or bottom-right
    - Edges are within ~2-3% of frame boundary
    
-2. "side_box" - Webcam on one side but NOT touching edges (inset/floating)
-   - On the right or left side of the frame, but NOT touching corners
-   - Has visible gap between webcam and frame edges
+2. "side_box" - Webcam FLOATING anywhere, NOT touching edges
+   - Can be mid-right, mid-left, top-center, bottom-center, or anywhere else
+   - Has visible gap between webcam and ALL frame edges
    - Example: webcam on right side with game behind/around it
    - This is common for streamers who want a "floating" webcam look
+   - IMPORTANT: Return TIGHT bbox around ONLY the webcam, exclude gameplay
    
 3. "top_band" - Wide webcam band spanning most of the top
    - Width >= 55% of frame width
@@ -307,9 +315,10 @@ For corner_overlay (MUST touch edges):
 - bottom-right: x + width ≈ {video_width}, y + height ≈ {video_height}
 
 For side_box (does NOT touch edges):
-- Has gaps between webcam and frame edges
-- Still return the full webcam rectangle (outer boundary)
-- Include the corner hint (e.g., "top-right" meaning right side, upper area)
+- Has gaps between webcam and frame edges on ALL sides
+- Return TIGHT bbox around ONLY the webcam rectangle (exclude gameplay!)
+- Include the nearest position hint: top-left, top-right, bottom-left, bottom-right, mid-left, mid-right, top-center, bottom-center, or center
+- The webcam border is usually a clean rectangle - find its exact edges
 
 === CONFIDENCE SCORING ===
 Provide confidence (0.0 to 1.0) based on:

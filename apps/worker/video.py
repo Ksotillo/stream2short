@@ -237,6 +237,7 @@ def render_split_layout_video(
     max_upscale: float = 2.0,  # Maximum upscale to avoid pixelation
     min_webcam_ratio: float = 0.15,  # Minimum 15% for visibility
     max_webcam_ratio: float = 0.35,  # Maximum 35% to leave room for game
+    effective_type: str = None,  # Webcam type for margin adjustment (side_box gets smaller margin)
 ) -> str:
     """
     Render a split-layout vertical video with webcam on top and main content below.
@@ -285,9 +286,16 @@ def render_split_layout_video(
     print(f"   Original webcam: {webcam_region.width}x{webcam_region.height} at ({webcam_region.x},{webcam_region.y})")
     
     # ==========================================================================
-    # STEP 1: Expand detected bbox by 8% margin to avoid tight crops
+    # STEP 1: Expand detected bbox by margin to avoid tight crops
+    # For side_box: use minimal margin (2%) since bbox is already refined tight
+    # For corner overlays: use standard margin (8%)
     # ==========================================================================
-    margin = 0.08
+    if effective_type == 'side_box':
+        margin = 0.02  # 2% for side_box - bbox is already tight, don't re-introduce bleed
+        print(f"   Using reduced margin ({margin*100:.0f}%) for side_box")
+    else:
+        margin = 0.08  # 8% for corner overlays
+    
     pad_x = int(webcam_region.width * margin)
     pad_y = int(webcam_region.height * margin)
     
@@ -1093,6 +1101,8 @@ def render_video_auto(
     elif layout == 'SPLIT' and layout_info.webcam_region:
         # Webcam + gameplay split layout
         print(f"🎥 Using SPLIT layout: {layout_info.reason}")
+        # Get effective_type from webcam_region for margin adjustment
+        eff_type = getattr(layout_info.webcam_region, 'effective_type', None)
         return render_split_layout_video(
             input_path=input_path,
             output_path=output_path,
@@ -1100,6 +1110,7 @@ def render_video_auto(
             subtitle_path=subtitle_path,
             width=width,
             height=height,
+            effective_type=eff_type,
         )
     
     else:

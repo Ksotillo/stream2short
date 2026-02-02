@@ -1232,6 +1232,391 @@ def refine_side_box_multiframe(
     return median_bbox
 
 
+def refine_side_box_bbox_contours(
+    frame_bgr: np.ndarray,
+    gemini_bbox: Dict[str, int],
+    face_center: Optional[Tuple[int, int]],
+    frame_width: int,
+    frame_height: int,
+    debug: bool = False,
+) -> Optional[Dict[str, int]]:
+    """
+    Refine side_box bbox using contour detection to find the webcam rectangle.
+    
+    This is the PREFERRED method for floating webcams because webcam overlays
+    typically have a clear rectangular border that shows up as a strong contour.
+    
+    Algorithm:
+    1. Build ROI around gemini bbox (expanded by ~25%)
+    2. Detect edges and find contours
+    3. Filter for rectangular contours (4-8 vertices after approxPolyDP)
+    4. Score by: face containment, aspect ratio closeness to 1.78, area reasonableness
+    5. Return best candidate
+    
+    Args:
+        frame_bgr: BGR frame
+        gemini_bbox: Initial bbox from Gemini
+        face_center: (x, y) of face center, or None
+        frame_width: Full frame width
+        frame_height: Full frame height
+        debug: Enable debug logging
+        
+    Returns:
+        Refined bbox or None if no good rectangle found
+    """
+    gx, gy, gw, gh = gemini_bbox['x'], gemini_bbox['y'], gemini_bbox['width'], gemini_bbox['height']
+    gemini_area = gw * gh
+    frame_area = frame_width * frame_height
+    
+    # Build expanded ROI (25% expansion, clamped to frame)
+    expand = 0.25
+    roi_x = max(0, int(gx - gw * expand))
+    roi_y = max(0, int(gy - gh * expand))
+    roi_w = min(frame_width - roi_x, int(gw * (1 + 2 * expand)))
+    roi_h = min(frame_height - roi_y, int(gh * (1 + 2 * expand)))
+    
+    if roi_w < 50 or roi_h < 50:
+        if debug:
+            print(f"  ⚠️ side_box contour: ROI too small")
+        return None
+    
+    roi = frame_bgr[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+    
+    # Convert to grayscale, blur, edge detect
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 40, 120)
+    
+    # Morphological closing to connect edge fragments
+    kernel = np.ones((3, 3), np.uint8)
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    
+    # Find contours
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        if debug:
+            print(f"  ⚠️ side_box contour: no contours found")
+        return None
+    
+    # Filter and score candidates
+    candidates = []
+    min_area = frame_area * 0.02  # At least 2% of frame
+    max_area = frame_area * 0.25  # At most 25% of frame
+    
+    for contour in contours:
+        # Approximate polygon
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        
+        # We want rectangular shapes (4-8 vertices)
+        if len(approx) < 4 or len(approx) > 8:
+            continue
+        
+        # Get bounding rect
+        cx, cy, cw, ch = cv2.boundingRect(contour)
+        area = cw * ch
+        
+        # Area filter
+        if area < min_area or area > max_area:
+            continue
+        
+        # Convert to full-frame coordinates
+        full_x = roi_x + cx
+        full_y = roi_y + cy
+        
+        # Aspect ratio (webcams are typically 1.3-2.3)
+        ar = cw / ch if ch > 0 else 0
+        if ar < 1.3 or ar > 2.3:
+            continue
+        
+        # Score: AR closeness to 1.78 + face containment + area similarity to gemini
+        ar_score = 1.0 - abs(ar - 1.78) / 1.0  # Closer to 1.78 = better
+        ar_score = max(0, ar_score)
+        
+        # Face containment
+        face_score = 0.0
+        if face_center:
+            fx, fy = face_center
+            if full_x <= fx <= full_x + cw and full_y <= fy <= full_y + ch:
+                face_score = 0.4  # Big bonus for containing face
+        
+        # Area similarity to gemini bbox
+        area_ratio = min(area, gemini_area) / max(area, gemini_area) if gemini_area > 0 else 0
+        area_score = area_ratio * 0.3
+        
+        # Overlap with gemini bbox
+        overlap_x = max(0, min(full_x + cw, gx + gw) - max(full_x, gx))
+        overlap_y = max(0, min(full_y + ch, gy + gh) - max(full_y, gy))
+        overlap_area = overlap_x * overlap_y
+        overlap_ratio = overlap_area / gemini_area if gemini_area > 0 else 0
+        overlap_score = overlap_ratio * 0.2
+        
+        score = ar_score * 0.3 + face_score + area_score + overlap_score
+        
+        candidates.append({
+            'x': full_x, 'y': full_y, 'width': cw, 'height': ch,
+            'score': score, 'ar': ar, 'overlap': overlap_ratio
+        })
+    
+    if not candidates:
+        if debug:
+            print(f"  ⚠️ side_box contour: no valid candidates after filtering")
+        return None
+    
+    # Sort by score
+    candidates.sort(key=lambda c: c['score'], reverse=True)
+    best = candidates[0]
+    
+    # Validate: must have at least 40% overlap with gemini bbox
+    if best['overlap'] < 0.40:
+        if debug:
+            print(f"  ⚠️ side_box contour: best candidate has only {best['overlap']:.1%} overlap (need 40%)")
+        return None
+    
+    if debug:
+        print(f"  ✅ side_box contour: {best['width']}x{best['height']} at ({best['x']},{best['y']}), AR={best['ar']:.2f}, score={best['score']:.3f}")
+    
+    return {
+        'x': best['x'], 'y': best['y'],
+        'width': best['width'], 'height': best['height']
+    }
+
+
+def refine_side_box_bbox_raycast(
+    frame_bgr: np.ndarray,
+    gemini_bbox: Dict[str, int],
+    face_center: Tuple[int, int],
+    frame_width: int,
+    frame_height: int,
+    debug: bool = False,
+) -> Optional[Dict[str, int]]:
+    """
+    Refine side_box bbox using raycast from face center to find edges.
+    
+    This is the FALLBACK method when contour detection fails.
+    Uses gradient analysis along scanlines from the face center.
+    
+    Algorithm:
+    1. From face center, cast rays in 4 directions (left, right, up, down)
+    2. For each direction, sample multiple parallel scanlines
+    3. Find the strongest sustained edge in each direction
+    4. Build bbox from the detected edges
+    
+    Args:
+        frame_bgr: BGR frame
+        gemini_bbox: Initial bbox from Gemini
+        face_center: (x, y) of face center (REQUIRED for raycast)
+        frame_width: Full frame width
+        frame_height: Full frame height
+        debug: Enable debug logging
+        
+    Returns:
+        Refined bbox or None if raycast failed
+    """
+    if face_center is None:
+        if debug:
+            print(f"  ⚠️ side_box raycast: no face center provided")
+        return None
+    
+    fx, fy = face_center
+    gx, gy, gw, gh = gemini_bbox['x'], gemini_bbox['y'], gemini_bbox['width'], gemini_bbox['height']
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Scanline offsets from face center
+    offsets = [-12, -6, 0, 6, 12]
+    
+    def find_edge_in_direction(start_x, start_y, dx, dy, max_dist, scanline_offsets):
+        """Find the strongest sustained edge in a direction."""
+        edges_found = []
+        
+        for offset in scanline_offsets:
+            # Perpendicular offset for parallel scanlines
+            if dx != 0:  # Horizontal scan
+                scan_y = start_y + offset
+                scan_x = start_x
+            else:  # Vertical scan
+                scan_x = start_x + offset
+                scan_y = start_y
+            
+            # Scan along the direction
+            best_edge_pos = None
+            best_edge_strength = 0
+            
+            for dist in range(10, max_dist, 2):
+                x = scan_x + dx * dist
+                y = scan_y + dy * dist
+                
+                if x < 1 or x >= frame_width - 1 or y < 1 or y >= frame_height - 1:
+                    break
+                
+                # Compute gradient magnitude
+                if dx != 0:  # Horizontal scan - look for vertical edges
+                    grad = abs(int(gray[y, x+1]) - int(gray[y, x-1]))
+                else:  # Vertical scan - look for horizontal edges
+                    grad = abs(int(gray[y+1, x]) - int(gray[y-1, x]))
+                
+                # Check if this is a sustained edge (strong gradient over neighborhood)
+                if grad > 30:  # Base threshold
+                    # Check sustainability (neighbor pixels also have edges)
+                    sustained = True
+                    for check in range(1, 4):
+                        cx = x + dx * check
+                        cy = y + dy * check
+                        if 1 <= cx < frame_width - 1 and 1 <= cy < frame_height - 1:
+                            if dx != 0:
+                                check_grad = abs(int(gray[cy, cx+1]) - int(gray[cy, cx-1]))
+                            else:
+                                check_grad = abs(int(gray[cy+1, cx]) - int(gray[cy-1, cx]))
+                            if check_grad < 15:
+                                sustained = False
+                                break
+                    
+                    if sustained and grad > best_edge_strength:
+                        best_edge_strength = grad
+                        best_edge_pos = (x, y, dist)
+            
+            if best_edge_pos:
+                edges_found.append(best_edge_pos)
+        
+        if not edges_found:
+            return None
+        
+        # Return median edge position
+        if len(edges_found) >= 2:
+            edges_found.sort(key=lambda e: e[2])  # Sort by distance
+            median_idx = len(edges_found) // 2
+            return edges_found[median_idx]
+        return edges_found[0]
+    
+    # Search bounds based on gemini bbox
+    max_left = max(gw, int(frame_width * 0.4))
+    max_right = max(gw, int(frame_width * 0.4))
+    max_up = max(gh, int(frame_height * 0.4))
+    max_down = max(gh, int(frame_height * 0.4))
+    
+    # Find edges in each direction
+    left_edge = find_edge_in_direction(fx, fy, -1, 0, max_left, offsets)
+    right_edge = find_edge_in_direction(fx, fy, 1, 0, max_right, offsets)
+    top_edge = find_edge_in_direction(fx, fy, 0, -1, max_up, offsets)
+    bottom_edge = find_edge_in_direction(fx, fy, 0, 1, max_down, offsets)
+    
+    # Build bbox from edges (fallback to face-relative positions if edge not found)
+    left = left_edge[0] if left_edge else max(0, fx - int(gw * 0.6))
+    right = right_edge[0] if right_edge else min(frame_width, fx + int(gw * 0.6))
+    top = top_edge[1] if top_edge else max(0, fy - int(gh * 0.4))
+    bottom = bottom_edge[1] if bottom_edge else min(frame_height, fy + int(gh * 0.7))
+    
+    ref_x = left
+    ref_y = top
+    ref_w = right - left
+    ref_h = bottom - top
+    
+    if debug:
+        found = [left_edge is not None, right_edge is not None, top_edge is not None, bottom_edge is not None]
+        print(f"  🔬 side_box raycast: found edges L={found[0]}, R={found[1]}, T={found[2]}, B={found[3]}")
+        print(f"     Raw: {ref_w}x{ref_h} at ({ref_x},{ref_y})")
+    
+    # Validation
+    # 1. Minimum size
+    if ref_w < frame_width * 0.12 or ref_h < frame_height * 0.10:
+        if debug:
+            print(f"  ⚠️ side_box raycast: bbox too small")
+        return None
+    
+    # 2. Aspect ratio check
+    ar = ref_w / ref_h if ref_h > 0 else 0
+    if ar < 1.3 or ar > 2.3:
+        if debug:
+            print(f"  ⚠️ side_box raycast: bad AR={ar:.2f}")
+        return None
+    
+    # 3. Must contain face center
+    if not (ref_x <= fx <= ref_x + ref_w and ref_y <= fy <= ref_y + ref_h):
+        if debug:
+            print(f"  ⚠️ side_box raycast: doesn't contain face")
+        return None
+    
+    # 4. Must overlap at least 40% with gemini bbox
+    overlap_x = max(0, min(ref_x + ref_w, gx + gw) - max(ref_x, gx))
+    overlap_y = max(0, min(ref_y + ref_h, gy + gh) - max(ref_y, gy))
+    overlap_area = overlap_x * overlap_y
+    gemini_area = gw * gh
+    overlap_ratio = overlap_area / gemini_area if gemini_area > 0 else 0
+    
+    if overlap_ratio < 0.40:
+        if debug:
+            print(f"  ⚠️ side_box raycast: only {overlap_ratio:.1%} overlap with gemini (need 40%)")
+        return None
+    
+    if debug:
+        print(f"  ✅ side_box raycast: {ref_w}x{ref_h} at ({ref_x},{ref_y}), AR={ar:.2f}, overlap={overlap_ratio:.1%}")
+    
+    return {
+        'x': ref_x, 'y': ref_y,
+        'width': ref_w, 'height': ref_h
+    }
+
+
+def refine_side_box_bbox(
+    frame_bgr: np.ndarray,
+    gemini_bbox: Dict[str, int],
+    face_center: Optional[Tuple[int, int]],
+    frame_width: int,
+    frame_height: int,
+    debug: bool = False,
+) -> Optional[Dict[str, int]]:
+    """
+    Main side_box refinement: tries contour detection first, then raycast fallback.
+    
+    Args:
+        frame_bgr: BGR frame
+        gemini_bbox: Initial bbox from Gemini
+        face_center: (x, y) of face center, or None
+        frame_width: Full frame width
+        frame_height: Full frame height
+        debug: Enable debug logging
+        
+    Returns:
+        Refined bbox or None if all methods failed
+    """
+    if debug:
+        print(f"  🔬 side_box refinement starting...")
+        print(f"     Gemini: {gemini_bbox['width']}x{gemini_bbox['height']} at ({gemini_bbox['x']},{gemini_bbox['y']})")
+        if face_center:
+            print(f"     Face center: ({face_center[0]}, {face_center[1]})")
+    
+    # Method 1: Contour detection (preferred)
+    refined = refine_side_box_bbox_contours(
+        frame_bgr, gemini_bbox, face_center,
+        frame_width, frame_height, debug
+    )
+    
+    if refined:
+        if debug:
+            print(f"  ✅ side_box: contour method succeeded")
+        return refined
+    
+    # Method 2: Raycast (fallback)
+    if face_center:
+        refined = refine_side_box_bbox_raycast(
+            frame_bgr, gemini_bbox, face_center,
+            frame_width, frame_height, debug
+        )
+        
+        if refined:
+            if debug:
+                print(f"  ✅ side_box: raycast method succeeded")
+            return refined
+    
+    if debug:
+        print(f"  ⚠️ side_box: all refinement methods failed, using gemini bbox")
+    
+    return None
+
+
 def convert_numpy_to_python(obj):
     """
     Recursively convert numpy types to Python native types for JSON serialization.
@@ -3114,40 +3499,55 @@ def detect_webcam_region(
                                         refinement_method = "gemini-norefine"
                             
                             # ============================================================
-                            # FACE-ANCHORED EDGE REFINEMENT for SIDE_BOX overlays
-                            # For inset/floating webcams, use edge projection to find
-                            # the true webcam rectangle. Uses multi-frame median for stability.
+                            # SIDE_BOX REFINEMENT (contour + raycast)
+                            # For inset/floating webcams, use contour detection to find
+                            # the true webcam rectangle. Falls back to raycast if contours fail.
                             # ============================================================
                             if not is_true_corner or effective_type == 'side_box':
-                                print(f"  🔬 Attempting FACE-ANCHORED EDGE refinement for side_box overlay...")
+                                print(f"  🔬 Attempting SIDE_BOX refinement (contour + raycast)...")
                                 print(f"     Initial bbox: {cam_w}x{cam_h} at ({cam_x},{cam_y})")
                                 
-                                # Use multi-frame refinement for stability
-                                edge_refined = refine_side_box_multiframe(
-                                    video_path,
-                                    {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
-                                    width, height,
-                                    timestamps=[3.0, 10.0, 15.0],
-                                    debug=True
-                                )
+                                # Load frame for refinement
+                                frame_for_refine = None
+                                if frame_path and os.path.exists(frame_path):
+                                    frame_for_refine = cv2.imread(frame_path)
+                                if frame_for_refine is None:
+                                    frame_for_refine = extract_frame(video_path, ts)
                                 
-                                if edge_refined:
-                                    # Validate: must contain face if we have one
-                                    valid = True
+                                if frame_for_refine is not None:
+                                    # Get face center for refinement
+                                    face_center_for_refine = None
                                     if detected_face:
-                                        if not bbox_contains_face(edge_refined, detected_face, margin_ratio=0.05):
-                                            print(f"  ⚠️ Edge-refined bbox doesn't contain face, keeping original")
-                                            valid = False
+                                        face_center_for_refine = (detected_face.center_x, detected_face.center_y)
                                     
-                                    if valid:
-                                        print(f"  ✅ Edge refinement accepted: {edge_refined['width']}x{edge_refined['height']} at ({edge_refined['x']},{edge_refined['y']})")
-                                        cam_x = edge_refined['x']
-                                        cam_y = edge_refined['y']
-                                        cam_w = edge_refined['width']
-                                        cam_h = edge_refined['height']
-                                        refinement_method = f"{refinement_method}+edge"
+                                    # Run the new side_box refinement (contour first, then raycast fallback)
+                                    refined = refine_side_box_bbox(
+                                        frame_for_refine,
+                                        {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h},
+                                        face_center_for_refine,
+                                        width, height,
+                                        debug=True
+                                    )
+                                    
+                                    if refined:
+                                        # Validate: must contain face if we have one
+                                        valid = True
+                                        if detected_face:
+                                            if not bbox_contains_face(refined, detected_face, margin_ratio=0.05):
+                                                print(f"  ⚠️ Refined bbox doesn't contain face, keeping original")
+                                                valid = False
+                                        
+                                        if valid:
+                                            print(f"  ✅ side_box refinement accepted: {refined['width']}x{refined['height']} at ({refined['x']},{refined['y']})")
+                                            cam_x = refined['x']
+                                            cam_y = refined['y']
+                                            cam_w = refined['width']
+                                            cam_h = refined['height']
+                                            refinement_method = f"{refinement_method}+sidebox"
+                                    else:
+                                        print(f"  ⚠️ side_box refinement failed, keeping gemini bbox")
                                 else:
-                                    print(f"  ⚠️ Edge refinement failed, keeping current bbox")
+                                    print(f"  ⚠️ Could not load frame for side_box refinement")
                             
                             # ============================================================
                             # HARD CONSTRAINTS ON FINAL BBOX
@@ -3180,38 +3580,43 @@ def detect_webcam_region(
                                     
                                     refinement_method = "face-forced"
                             
-                            # Constraint 2: Guardrails
-                            final_bbox_check = {
-                                'x': cam_x, 'y': cam_y,
-                                'width': cam_w, 'height': cam_h
-                            }
-                            passes_guardrail, guardrail_reason = check_guardrails(
-                                final_bbox_check, position, width, height
-                            )
-                            
-                            if not passes_guardrail:
-                                print(f"  ⚠️ Pre-padding bbox fails guardrails: {guardrail_reason}")
-                                print(f"  🔧 Clamping to corner band (60%)...")
+                            # Constraint 2: Guardrails (ONLY for true corner overlays)
+                            # For side_box: skip corner-band clamp - it's not appropriate for floating webcams
+                            if is_true_corner and effective_type != 'side_box':
+                                final_bbox_check = {
+                                    'x': cam_x, 'y': cam_y,
+                                    'width': cam_w, 'height': cam_h
+                                }
+                                passes_guardrail, guardrail_reason = check_guardrails(
+                                    final_bbox_check, position, width, height
+                                )
                                 
-                                # Clamp to corner band (60% for right, 40% for left)
-                                if position in ['top-right', 'bottom-right']:
-                                    min_x = int(width * 0.60)
-                                    if cam_x < min_x:
-                                        # Keep right edge fixed, reduce width from left
-                                        old_x = cam_x
-                                        old_right = cam_x + cam_w
-                                        cam_w = old_right - min_x
-                                        cam_x = min_x
-                                        print(f"     Clamped: x {old_x} -> {cam_x}, w -> {cam_w}")
-                                else:
-                                    # Left side: ensure x + w <= 40%
-                                    max_right = int(width * 0.40)
-                                    if cam_x + cam_w > max_right:
-                                        cam_w = max_right - cam_x
-                                        print(f"     Clamped: w -> {cam_w}")
-                                
-                                if refinement_method and "clamped" not in refinement_method:
-                                    refinement_method = f"{refinement_method}-clamped"
+                                if not passes_guardrail:
+                                    print(f"  ⚠️ Pre-padding bbox fails guardrails: {guardrail_reason}")
+                                    print(f"  🔧 Clamping to corner band (60%)...")
+                                    
+                                    # Clamp to corner band (60% for right, 40% for left)
+                                    if position in ['top-right', 'bottom-right']:
+                                        min_x = int(width * 0.60)
+                                        if cam_x < min_x:
+                                            # Keep right edge fixed, reduce width from left
+                                            old_x = cam_x
+                                            old_right = cam_x + cam_w
+                                            cam_w = old_right - min_x
+                                            cam_x = min_x
+                                            print(f"     Clamped: x {old_x} -> {cam_x}, w -> {cam_w}")
+                                    else:
+                                        # Left side: ensure x + w <= 40%
+                                        max_right = int(width * 0.40)
+                                        if cam_x + cam_w > max_right:
+                                            cam_w = max_right - cam_x
+                                            print(f"     Clamped: w -> {cam_w}")
+                                    
+                                    if refinement_method and "clamped" not in refinement_method:
+                                        refinement_method = f"{refinement_method}-clamped"
+                            else:
+                                # For side_box: gentle overlap validation instead of corner clamp
+                                print(f"  ℹ️ Skipping corner-band clamp for side_box (not appropriate for floating webcams)")
                             
                             # Clamp to video bounds
                             cam_x = max(0, min(cam_x, width - cam_w))
@@ -3233,29 +3638,45 @@ def detect_webcam_region(
                             # APPLY PADDING (relative to refined bbox ONLY)
                             # ============================================================
                             # Padding strategy by type:
-                            # - good Gemini corner: 6% (already touching edges)
-                            # - side_box (edge-refined): 4-5% (minimal - edge refinement is precise)
-                            # - other refined: 8-10% (moderate)
-                            if refinement_method == "gemini-good":
+                            # - good Gemini corner: 6% symmetric
+                            # - side_box: ASYMMETRIC (tight top/sides, more bottom) to prevent game bleed
+                            # - other refined: 8% symmetric
+                            if not is_true_corner or effective_type == 'side_box':
+                                # ASYMMETRIC padding for side_box - tight crop to prevent game bleed
+                                pad_left = int(cam_w * 0.02)    # 2% left
+                                pad_right = int(cam_w * 0.02)   # 2% right
+                                pad_top = int(cam_h * 0.01)     # 1% top (very tight)
+                                pad_bottom = int(cam_h * 0.05)  # 5% bottom (breathing room)
+                                
+                                new_x = cam_x - pad_left
+                                new_y = cam_y - pad_top
+                                new_w = cam_w + pad_left + pad_right
+                                new_h = cam_h + pad_top + pad_bottom
+                                
+                                print(f"  ℹ️ Asymmetric padding for side_box: L={pad_left}, R={pad_right}, T={pad_top}, B={pad_bottom}")
+                                print(f"  📐 After asymmetric padding: {new_w}x{new_h} at ({new_x},{new_y})")
+                            elif refinement_method == "gemini-good":
                                 padding_ratio = 0.06  # 6% for good Gemini corners
-                            elif not is_true_corner or effective_type == 'side_box':
-                                # SMALLER padding for side_box - refinement is more precise
-                                # and padding is what causes game bleed
-                                padding_ratio = 0.04  # 4% for side_box
-                                print(f"  ℹ️ Using minimal padding (4%) for side_box to prevent bleed")
+                                padding_x = int(cam_w * padding_ratio)
+                                padding_y = int(cam_h * padding_ratio)
+                                
+                                new_x = cam_x - padding_x
+                                new_y = cam_y - padding_y
+                                new_w = cam_w + (padding_x * 2)
+                                new_h = cam_h + (padding_y * 2)
+                                
+                                print(f"  📐 After padding (+{int(padding_ratio*100)}%): {new_w}x{new_h} at ({new_x},{new_y})")
                             else:
                                 padding_ratio = 0.08  # 8% for other refined bboxes
-                            
-                            padding_x = int(cam_w * padding_ratio)
-                            padding_y = int(cam_h * padding_ratio)
-                            
-                            # Expand region
-                            new_x = cam_x - padding_x
-                            new_y = cam_y - padding_y
-                            new_w = cam_w + (padding_x * 2)
-                            new_h = cam_h + (padding_y * 2)
-                            
-                            print(f"  📐 After padding (+{int(padding_ratio*100)}%): {new_w}x{new_h} at ({new_x},{new_y})")
+                                padding_x = int(cam_w * padding_ratio)
+                                padding_y = int(cam_h * padding_ratio)
+                                
+                                new_x = cam_x - padding_x
+                                new_y = cam_y - padding_y
+                                new_w = cam_w + (padding_x * 2)
+                                new_h = cam_h + (padding_y * 2)
+                                
+                                print(f"  📐 After padding (+{int(padding_ratio*100)}%): {new_w}x{new_h} at ({new_x},{new_y})")
                             
                             # ============================================================
                             # CLAMP TO VIDEO BOUNDS (DO NOT shift position for good/refined bbox)
@@ -3622,7 +4043,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 5  # v5: Fixed side_box => SPLIT classification (not TOP_BAND fallback)
+_CACHE_VERSION = 6  # v6: side_box contour+raycast refinement, asymmetric padding, no corner-band clamp
 
 
 def _get_cache_path(temp_dir: str) -> str:
