@@ -1154,6 +1154,56 @@ def apply_layout_constraints(
     return (int(x), int(y), int(w), int(h))
 
 
+def ensure_headroom(
+    bbox: Dict[str, int],
+    face_center: Optional[Tuple[int, int]],
+    frame_height: int,
+    min_headroom_ratio: float = 0.15,
+    debug: bool = False,
+) -> Dict[str, int]:
+    """
+    Ensure there's enough headroom above the face.
+    
+    If the face is too close to the top edge of the bbox, expand upward
+    to give proper headroom. This prevents the streamer's head from being
+    cut off in the final crop.
+    
+    Args:
+        bbox: Current bbox {'x', 'y', 'width', 'height'}
+        face_center: (x, y) of detected face center, or None
+        frame_height: Full frame height (to clamp expansion)
+        min_headroom_ratio: Minimum distance from top as ratio of height (default 15%)
+        debug: Enable debug logging
+        
+    Returns:
+        Adjusted bbox with proper headroom
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    
+    if not face_center:
+        return bbox
+    
+    face_x, face_y = face_center
+    
+    # Face should be at least min_headroom_ratio down from top of bbox
+    min_face_y_in_bbox = y + int(h * min_headroom_ratio)
+    
+    if face_y < min_face_y_in_bbox:
+        # Face is too high in bbox (or bbox top is too low)
+        # Move top edge up to give headroom
+        needed_headroom = int(h * min_headroom_ratio)
+        new_y = max(0, face_y - needed_headroom)
+        new_h = (y + h) - new_y  # Keep bottom edge same
+        
+        if debug:
+            print(f"  👤 Headroom protection: y {y} -> {new_y}, h {h} -> {new_h}")
+            print(f"     Face at y={face_y}, needed headroom={needed_headroom}px")
+        
+        return {'x': x, 'y': new_y, 'width': w, 'height': new_h}
+    
+    return bbox
+
+
 def refine_bbox_universal(
     frame: np.ndarray,
     seed_bbox: Tuple[int, int, int, int],
@@ -2381,6 +2431,16 @@ def refine_side_box_tight_edges(
         print(f"     Strengths: L={left_strength:.1f}, R={right_strength:.1f}, T={top_strength:.1f}, B={bottom_strength:.1f}")
     
     # ==========================================================================
+    # STEP 2.5: HEADROOM PROTECTION - Never move top edge down (cuts off head)
+    # ==========================================================================
+    # For side_box overlays: NEVER move top edge down
+    # Only allow it to move UP (decrease y) to include more headroom
+    if best_top > sy:
+        if debug:
+            print(f"     ⚠️ Preventing top edge from moving down ({sy} -> {best_top}), keeping y={sy}")
+        best_top = sy
+    
+    # ==========================================================================
     # STEP 3: BUILD REFINED BBOX
     # ==========================================================================
     new_x = best_left
@@ -3245,8 +3305,17 @@ def refine_bbox_edges(
         top_candidates.sort(key=lambda l: score_horizontal_line(l, bbox_top_roi, is_anchor), reverse=True)
         best_top = top_candidates[0]
         if abs(best_top['y'] - bbox_top_roi) < h * 0.3:
-            new_top = best_top['y']
-            adjustments['top'] = new_top - bbox_top_roi
+            proposed_adjustment = best_top['y'] - bbox_top_roi
+            
+            # HEADROOM PROTECTION: For side_box, NEVER move top edge down (cuts off head)
+            # Positive adjustment = moving down = BAD for webcam overlays
+            if mode == 'side_box' and proposed_adjustment > 0:
+                if debug:
+                    print(f"     🚫 Blocked top edge from moving down (+{proposed_adjustment}px) for side_box")
+                # Keep original top edge
+            else:
+                new_top = best_top['y']
+                adjustments['top'] = proposed_adjustment
     
     # BOTTOM border
     bottom_candidates = [l for l in horizontal_lines 
@@ -6007,6 +6076,24 @@ def detect_webcam_region(
                             print(f"  ⚠️ Could not load frame for side_box refinement")
                     
                     # ============================================================
+                    # HEADROOM PROTECTION (for side_box overlays)
+                    # Ensure the streamer's head isn't cut off
+                    # ============================================================
+                    if (effective_type == 'side_box' or not is_true_corner) and detected_face:
+                        current_bbox = {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h}
+                        face_center_tuple = (detected_face.center_x, detected_face.center_y)
+                        protected = ensure_headroom(
+                            current_bbox, face_center_tuple, height,
+                            min_headroom_ratio=0.15, debug=True
+                        )
+                        
+                        if protected['y'] != cam_y or protected['height'] != cam_h:
+                            cam_x = protected['x']
+                            cam_y = protected['y']
+                            cam_w = protected['width']
+                            cam_h = protected['height']
+                    
+                    # ============================================================
                     # HARD CONSTRAINTS ON FINAL BBOX
                     # 1. Must contain detected face (if any)
                     # 2. Must pass guardrails (not extend into gameplay)
@@ -6561,7 +6648,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 14  # v14: Universal webcam boundary detection - texture-based boundary finder for all layouts
+_CACHE_VERSION = 15  # v15: Headroom protection - prevent top edge from moving down and cutting off streamer's head
 
 
 def _get_cache_path(temp_dir: str) -> str:
