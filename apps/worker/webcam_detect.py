@@ -621,6 +621,149 @@ def is_hud_like_box(
     return False, "passed HUD checks"
 
 
+# =============================================================================
+# GAMEPLAY PIXEL DETECTION (for preventing webcam bleed into game UI)
+# =============================================================================
+
+def detect_gameplay_pixels(frame: np.ndarray, bbox: Tuple[int, int, int, int] = None) -> Union[float, np.ndarray]:
+    """
+    Detect gameplay UI pixels (high saturation, teal/green hues typical of games like Valorant).
+    
+    Args:
+        frame: BGR frame
+        bbox: Optional (x, y, w, h) tuple. If provided, returns ratio of gameplay pixels.
+              If None, returns full frame mask.
+              
+    Returns:
+        If bbox provided: float ratio of gameplay pixels (0.0 to 1.0)
+        If bbox is None: numpy mask where 255 = gameplay pixel
+    """
+    if bbox:
+        x, y, w, h = bbox
+        # Clamp to frame bounds
+        x = max(0, x)
+        y = max(0, y)
+        x2 = min(x + w, frame.shape[1])
+        y2 = min(y + h, frame.shape[0])
+        if x2 <= x or y2 <= y:
+            return 0.0
+        roi = frame[y:y2, x:x2]
+    else:
+        roi = frame
+    
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    
+    # High saturation mask (gameplay UI is saturated, webcam/room is natural)
+    _, sat_mask = cv2.threshold(hsv[:, :, 1], 80, 255, cv2.THRESH_BINARY)
+    
+    # Game color masks (Valorant/CSGO/Fortnite UI colors)
+    # Teal/Cyan range (Valorant buy menu, abilities)
+    lower_teal = np.array([80, 60, 40])
+    upper_teal = np.array([100, 255, 255])
+    teal_mask = cv2.inRange(hsv, lower_teal, upper_teal)
+    
+    # Green range (health bars, etc)
+    lower_green = np.array([40, 60, 40])
+    upper_green = np.array([80, 255, 255])
+    green_mask = cv2.inRange(hsv, lower_green, upper_green)
+    
+    # Blue range (mini maps, etc)
+    lower_blue = np.array([100, 60, 40])
+    upper_blue = np.array([130, 255, 255])
+    blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+    
+    # Red/Orange range (enemy indicators, damage)
+    lower_red1 = np.array([0, 100, 80])
+    upper_red1 = np.array([10, 255, 255])
+    red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    lower_red2 = np.array([170, 100, 80])
+    upper_red2 = np.array([180, 255, 255])
+    red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+    
+    # Combine gameplay indicators
+    gameplay_mask = cv2.bitwise_or(teal_mask, green_mask)
+    gameplay_mask = cv2.bitwise_or(gameplay_mask, blue_mask)
+    gameplay_mask = cv2.bitwise_or(gameplay_mask, red_mask)
+    # Only count high-saturation pixels as gameplay
+    gameplay_mask = cv2.bitwise_and(gameplay_mask, sat_mask)
+    
+    if bbox:
+        # Return ratio within bbox
+        total_pixels = roi.shape[0] * roi.shape[1]
+        gameplay_pixels = np.count_nonzero(gameplay_mask)
+        return gameplay_pixels / total_pixels if total_pixels > 0 else 0.0
+    else:
+        return gameplay_mask
+
+
+def validate_bbox_no_gameplay(frame: np.ndarray, bbox: Tuple[int, int, int, int], threshold: float = 0.15) -> Tuple[bool, float]:
+    """
+    Validate that a bbox doesn't contain too many gameplay pixels.
+    
+    Args:
+        frame: BGR frame
+        bbox: (x, y, w, h) tuple
+        threshold: Maximum allowed ratio of gameplay pixels (default 15%)
+        
+    Returns:
+        Tuple of (is_valid, gameplay_ratio)
+        is_valid is True if bbox contains less than threshold gameplay pixels
+    """
+    ratio = detect_gameplay_pixels(frame, bbox)
+    return ratio < threshold, ratio
+
+
+def debug_save_comparison(
+    frame: np.ndarray,
+    seed_bbox: Tuple[int, int, int, int],
+    final_bbox: Tuple[int, int, int, int],
+    temp_dir: str,
+    job_id: str = None,
+    is_valid: bool = True
+):
+    """
+    Save debug image showing seed vs final bbox with gameplay overlay.
+    
+    Args:
+        frame: BGR frame
+        seed_bbox: (x, y, w, h) from Gemini consensus
+        final_bbox: (x, y, w, h) after refinement
+        temp_dir: Directory to save debug image
+        job_id: Optional job ID for filename
+        is_valid: Whether final bbox passed gameplay validation
+    """
+    try:
+        debug = frame.copy()
+        sx, sy, sw, sh = seed_bbox
+        fx, fy, fw, fh = final_bbox
+        
+        # Red = Seed (Gemini consensus)
+        cv2.rectangle(debug, (sx, sy), (sx + sw, sy + sh), (0, 0, 255), 3)
+        cv2.putText(debug, "SEED", (sx, sy - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Green = Final (or Yellow if invalid)
+        color = (0, 255, 0) if is_valid else (0, 255, 255)
+        cv2.rectangle(debug, (fx, fy), (fx + fw, fy + fh), color, 3)
+        label = "FINAL" if is_valid else "INVALID"
+        cv2.putText(debug, label, (fx, fy - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        # Blue overlay for detected gameplay pixels (semi-transparent)
+        gameplay_mask = detect_gameplay_pixels(frame)
+        if isinstance(gameplay_mask, np.ndarray) and len(gameplay_mask.shape) == 2:
+            blue_overlay = np.zeros_like(debug)
+            blue_overlay[gameplay_mask > 0] = [255, 0, 0]  # Blue in BGR
+            debug = cv2.addWeighted(debug, 1.0, blue_overlay, 0.3, 0)
+        
+        # Save
+        filename = f"debug_refinement_{job_id}.jpg" if job_id else "debug_refinement.jpg"
+        save_path = os.path.join(temp_dir, filename)
+        cv2.imwrite(save_path, debug)
+        print(f"     📸 Saved refinement debug: {save_path}")
+    except Exception as e:
+        print(f"     ⚠️ Failed to save debug comparison: {e}")
+
+
 def check_corner_proximity(
     bbox: Dict[str, int],
     corner: str,
@@ -1570,22 +1713,19 @@ def refine_side_box_tight_edges(
     debug_dir: str = None,
 ) -> Optional[Dict[str, int]]:
     """
-    Find the true webcam rectangle boundaries using COMBINED edge detection.
+    Refine side_box edges with HARD CONSTRAINTS to prevent gameplay bleed.
     
-    VERSION 3: Fixed over-zoom issue. Changes from v2:
-    - Removed tightness bonus (was causing over-shrinking)
-    - Max 15% shrink from seed size
-    - Search for true overlay boundary (leftmost edge), not internal edges
-    - Reward size SIMILARITY to seed, not tightness
+    VERSION 4: Gameplay-aware constrained refinement.
     
-    Uses 3 edge methods combined for robustness:
-    1. Canny edges
-    2. Sobel gradient magnitude  
-    3. Local texture variance
+    CRITICAL CONSTRAINTS:
+    - For RIGHT-side cams: Left edge can ONLY move RIGHT (shrink), NEVER LEFT (expand into gameplay)
+    - For LEFT-side cams: Right edge can ONLY move LEFT (shrink), NEVER RIGHT
+    - Maximum 15% shrink from seed size
+    - Validate no gameplay pixels in final bbox
     
     Args:
         frame_bgr: BGR frame
-        seed_bbox: Initial bbox from Gemini (used as search center)
+        seed_bbox: Initial bbox from Gemini (used as seed)
         face_center: (x, y) of face center, or None
         frame_width: Full frame width  
         frame_height: Full frame height
@@ -1597,303 +1737,215 @@ def refine_side_box_tight_edges(
     """
     sx, sy, sw, sh = seed_bbox['x'], seed_bbox['y'], seed_bbox['width'], seed_bbox['height']
     
-    if debug:
-        print(f"  🔬 tight_edges (v2): seed={sw}x{sh} at ({sx},{sy})")
-    
-    # ==========================================================================
-    # STEP 1: Create expanded ROI (40% expansion - smaller than before)
-    # ==========================================================================
-    expand_ratio = 0.4  # Reduced from 0.6 to focus more locally
-    expand_x = int(sw * expand_ratio)
-    expand_y = int(sh * expand_ratio)
-    
-    roi_x = max(0, sx - expand_x)
-    roi_y = max(0, sy - expand_y)
-    roi_right = min(frame_width, sx + sw + expand_x)
-    roi_bottom = min(frame_height, sy + sh + expand_y)
-    roi_w = roi_right - roi_x
-    roi_h = roi_bottom - roi_y
-    
-    if roi_w < 100 or roi_h < 100:
-        if debug:
-            print(f"     ⚠️ ROI too small: {roi_w}x{roi_h}")
-        return None
-    
-    # Extract ROI
-    roi = frame_bgr[roi_y:roi_bottom, roi_x:roi_right]
-    
-    # Seed bbox position within ROI
-    seed_left_roi = sx - roi_x
-    seed_right_roi = sx + sw - roi_x
-    seed_top_roi = sy - roi_y
-    seed_bottom_roi = sy + sh - roi_y
-    
-    # Face center in ROI coordinates
-    face_x_roi = face_center[0] - roi_x if face_center else seed_left_roi + sw // 2
-    face_y_roi = face_center[1] - roi_y if face_center else seed_top_roi + sh // 3
+    # Determine which side the webcam is on
+    cx = sx + sw // 2
+    is_right_side = cx > frame_width / 2
     
     if debug:
-        print(f"     ROI: {roi_w}x{roi_h} at ({roi_x},{roi_y})")
-        print(f"     Seed in ROI: L={seed_left_roi}, R={seed_right_roi}, T={seed_top_roi}, B={seed_bottom_roi}")
-        print(f"     Face in ROI: ({face_x_roi}, {face_y_roi})")
+        side = "RIGHT" if is_right_side else "LEFT"
+        print(f"  🔬 tight_edges (v4): seed={sw}x{sh} at ({sx},{sy}), {side}-side webcam")
     
     # ==========================================================================
-    # STEP 2: COMBINED EDGE DETECTION (3 methods)
+    # STEP 1: CONSTRAINED SEARCH BOUNDARIES
     # ==========================================================================
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    max_shrink = 0.15  # Maximum 15% shrink
+    max_shrink_px = int(sw * max_shrink)
     
-    # Method 1: Canny edges
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    canny_edges = cv2.Canny(blurred, 30, 100)
+    if is_right_side:
+        # RIGHT-SIDE WEBCAM: Left edge is gameplay boundary (SACRED)
+        # Can only move left edge RIGHT (increase x), NEVER LEFT (decrease x)
+        left_edge_min = sx  # CANNOT GO LEFT OF THIS - prevents gameplay bleed
+        left_edge_max = sx + max_shrink_px  # Can shrink up to 15% right
+        # Right edge relatively stable, allow small adjustments
+        right_edge_min = (sx + sw) - max_shrink_px // 2
+        right_edge_max = min(sx + sw + max_shrink_px // 4, frame_width - 1)  # Minimal expansion
+    else:
+        # LEFT-SIDE WEBCAM: Right edge is gameplay boundary (SACRED)
+        left_edge_min = max(sx - max_shrink_px // 4, 0)  # Minimal expansion
+        left_edge_max = sx + max_shrink_px // 2
+        right_edge_min = (sx + sw) - max_shrink_px
+        right_edge_max = sx + sw  # CANNOT GO RIGHT OF THIS - prevents gameplay bleed
     
-    # Method 2: Sobel gradient magnitude
-    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    sobel_mag = np.sqrt(sobel_x**2 + sobel_y**2)
-    sobel_mag = (sobel_mag / sobel_mag.max() * 255).astype(np.uint8) if sobel_mag.max() > 0 else sobel_mag.astype(np.uint8)
-    
-    # Method 3: Local texture variance (high variance = edge/texture)
-    kernel_size = 7
-    local_mean = cv2.blur(gray.astype(np.float32), (kernel_size, kernel_size))
-    local_sqmean = cv2.blur((gray.astype(np.float32))**2, (kernel_size, kernel_size))
-    local_var = local_sqmean - local_mean**2
-    local_var = np.clip(local_var, 0, None)
-    texture_edges = (local_var / (local_var.max() + 1) * 255).astype(np.uint8)
-    
-    # COMBINE all 3 methods (weighted sum)
-    combined_edges = (
-        canny_edges.astype(np.float32) * 0.4 +
-        sobel_mag.astype(np.float32) * 0.4 +
-        texture_edges.astype(np.float32) * 0.2
-    ).astype(np.uint8)
-    
-    # Column sums (for vertical edges - left/right boundaries)
-    col_sum = combined_edges.sum(axis=0).astype(float)
-    # Row sums (for horizontal edges - top/bottom boundaries)
-    row_sum = combined_edges.sum(axis=1).astype(float)
-    
-    # Smooth with moving average
-    smooth_window = 7  # Smaller window for sharper edge detection
-    kernel = np.ones(smooth_window) / smooth_window
-    col_sum_smooth = np.convolve(col_sum, kernel, mode='same') if len(col_sum) > smooth_window else col_sum
-    row_sum_smooth = np.convolve(row_sum, kernel, mode='same') if len(row_sum) > smooth_window else row_sum
+    # Top/bottom: allow small adjustments both ways
+    top_edge_min = max(sy - max_shrink_px // 4, 0)
+    top_edge_max = sy + max_shrink_px // 2
+    bottom_edge_min = (sy + sh) - max_shrink_px // 2
+    bottom_edge_max = min(sy + sh + max_shrink_px // 4, frame_height - 1)
     
     if debug:
-        print(f"     Combined edges: col_sum range=[{col_sum_smooth.min():.0f}, {col_sum_smooth.max():.0f}]")
+        print(f"     Left edge range: [{left_edge_min}, {left_edge_max}]")
+        print(f"     Right edge range: [{right_edge_min}, {right_edge_max}]")
     
     # ==========================================================================
-    # STEP 3: PRIORITIZE LEFT EDGE SEARCH (critical for right-side webcams)
-    # Look for edges TIGHTER (to the RIGHT of seed_left) that still contain face
+    # STEP 2: FIND EDGES USING GRADIENT ANALYSIS WITHIN CONSTRAINED RANGES
     # ==========================================================================
-    def find_left_edge(col_projection, seed_left, face_x, search_range):
-        """
-        Find the LEFT edge of the webcam overlay.
-        
-        For right-side webcams, we want the LEFTMOST strong edge near the seed
-        (the actual overlay boundary), NOT internal edges like furniture.
-        Search LEFT of seed to find the true boundary.
-        """
-        # Search LEFT of seed to find the true overlay boundary
-        search_start = max(0, seed_left - search_range)
-        search_end = seed_left + search_range // 4  # Small search to the right
-        
-        if search_start >= search_end:
-            return seed_left, 0
-        
-        region = col_projection[search_start:search_end]
-        if len(region) < 5:
-            return seed_left, 0
-        
-        # Threshold: top 30% of edge strengths in this region
-        threshold = np.percentile(region, 70)
-        
-        # Find the LEFTMOST strong edge (actual overlay boundary)
-        best_pos = seed_left
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Use vertical Sobel to find strong vertical edges
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobelx = np.abs(sobelx)
+    
+    # Use horizontal Sobel for top/bottom edges
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    sobely = np.abs(sobely)
+    
+    def find_best_vertical_edge(x_start, x_end, y_start, y_end, sobel_img):
+        """Find the strongest vertical edge in the given range."""
+        best_pos = (x_start + x_end) // 2
         best_strength = 0
         
-        for i in range(0, len(region) - 2):  # Search left-to-right
-            val = region[i]
-            if val >= threshold and val >= region[i+1]:
-                global_pos = search_start + i
-                # Prefer edges NEAR seed (not too far left or right)
-                dist_from_seed = abs(global_pos - seed_left)
-                proximity_bonus = 1.0 - (dist_from_seed / search_range) * 0.5
-                score = val * proximity_bonus
-                
-                if score > best_strength:
-                    best_strength = score
-                    best_pos = global_pos
+        x_start = int(max(0, x_start))
+        x_end = int(min(x_end, frame_width - 1))
+        y_start = int(max(0, y_start))
+        y_end = int(min(y_end, frame_height - 1))
+        
+        if x_start >= x_end or y_start >= y_end:
+            return best_pos, 0
+        
+        for x_pos in range(x_start, x_end + 1):
+            # Sample vertical line at x_pos
+            strength = np.mean(sobel_img[y_start:y_end, x_pos])
+            if strength > best_strength:
+                best_strength = strength
+                best_pos = x_pos
         
         return best_pos, best_strength
     
-    def find_edge_candidates(projection, seed_pos, search_range, is_left_or_top=True):
-        """Find strong edge candidates in a search range around seed position."""
-        candidates = []
+    def find_best_horizontal_edge(y_start, y_end, x_start, x_end, sobel_img):
+        """Find the strongest horizontal edge in the given range."""
+        best_pos = (y_start + y_end) // 2
+        best_strength = 0
         
-        if is_left_or_top:
-            search_start = max(0, seed_pos - search_range)
-            search_end = min(len(projection), seed_pos + search_range // 3)
+        x_start = int(max(0, x_start))
+        x_end = int(min(x_end, frame_width - 1))
+        y_start = int(max(0, y_start))
+        y_end = int(min(y_end, frame_height - 1))
+        
+        if x_start >= x_end or y_start >= y_end:
+            return best_pos, 0
+        
+        for y_pos in range(y_start, y_end + 1):
+            # Sample horizontal line at y_pos
+            strength = np.mean(sobel_img[y_pos, x_start:x_end])
+            if strength > best_strength:
+                best_strength = strength
+                best_pos = y_pos
+        
+        return best_pos, best_strength
+    
+    # Find best edges within constrained ranges
+    best_left, left_strength = find_best_vertical_edge(left_edge_min, left_edge_max, sy, sy + sh, sobelx)
+    best_right, right_strength = find_best_vertical_edge(right_edge_min, right_edge_max, sy, sy + sh, sobelx)
+    best_top, top_strength = find_best_horizontal_edge(top_edge_min, top_edge_max, sx, sx + sw, sobely)
+    best_bottom, bottom_strength = find_best_horizontal_edge(bottom_edge_min, bottom_edge_max, sx, sx + sw, sobely)
+    
+    if debug:
+        print(f"     Found edges: L={best_left}, R={best_right}, T={best_top}, B={best_bottom}")
+        print(f"     Strengths: L={left_strength:.1f}, R={right_strength:.1f}, T={top_strength:.1f}, B={bottom_strength:.1f}")
+    
+    # ==========================================================================
+    # STEP 3: BUILD REFINED BBOX
+    # ==========================================================================
+    new_x = best_left
+    new_y = best_top
+    new_w = best_right - best_left
+    new_h = best_bottom - best_top
+    
+    # Validate basic size constraints
+    if new_w < 80 or new_h < 60:
+        if debug:
+            print(f"     ⚠️ Refined bbox too small: {new_w}x{new_h}, using seed")
+        new_x, new_y, new_w, new_h = sx, sy, sw, sh
+    
+    # Ensure we didn't expand too much (max 5% expansion allowed)
+    max_expand = 1.05
+    if new_w > sw * max_expand:
+        center_x = new_x + new_w // 2
+        new_w = int(sw * max_expand)
+        new_x = center_x - new_w // 2
+    if new_h > sh * max_expand:
+        center_y = new_y + new_h // 2
+        new_h = int(sh * max_expand)
+        new_y = center_y - new_h // 2
+    
+    # ==========================================================================
+    # STEP 4: GAMEPLAY VALIDATION
+    # ==========================================================================
+    test_bbox = (new_x, new_y, new_w, new_h)
+    is_valid, gameplay_ratio = validate_bbox_no_gameplay(frame_bgr, test_bbox, threshold=0.15)
+    
+    if not is_valid:
+        if debug:
+            print(f"     ⚠️ Gameplay detected ({gameplay_ratio:.1%}), applying conservative margin")
+        
+        # Fallback: use seed with conservative margin away from gameplay
+        margin = int(sw * 0.08)  # 8% margin
+        if is_right_side:
+            # Move left edge right (away from gameplay)
+            new_x = sx + margin
+            new_w = sw - margin
         else:
-            search_start = max(0, seed_pos - search_range // 3)
-            search_end = min(len(projection), seed_pos + search_range)
+            # Keep left edge, shrink from right (away from gameplay)
+            new_x = sx
+            new_w = sw - margin
+        new_y = sy
+        new_h = sh
         
-        if search_start >= search_end:
-            return [(seed_pos, 0)]
+        # Re-validate
+        is_valid, gameplay_ratio = validate_bbox_no_gameplay(frame_bgr, (new_x, new_y, new_w, new_h), threshold=0.20)
         
-        region = projection[search_start:search_end]
-        threshold = np.percentile(region, 60) if len(region) > 10 else 0
-        
-        for i in range(2, len(region) - 2):
-            val = region[i]
-            if val > threshold and val >= region[i-1] and val >= region[i+1]:
-                global_pos = search_start + i
-                candidates.append((global_pos, val))
-        
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates[:5] if candidates else [(seed_pos, 0)]
-    
-    search_x = int(sw * 0.30)
-    search_y = int(sh * 0.30)
-    
-    # Find left edge (don't over-tighten)
-    left_edge, left_strength = find_left_edge(col_sum_smooth, seed_left_roi, face_x_roi, search_x)
-    
-    # Standard edge finding for other edges
-    right_candidates = find_edge_candidates(col_sum_smooth, seed_right_roi, search_x, is_left_or_top=False)
-    top_candidates = find_edge_candidates(row_sum_smooth, seed_top_roi, search_y, is_left_or_top=True)
-    bottom_candidates = find_edge_candidates(row_sum_smooth, seed_bottom_roi, search_y, is_left_or_top=False)
-    
-    if debug:
-        print(f"     Left edge: pos={left_edge}, strength={left_strength:.0f}")
-        print(f"     Candidates: R={len(right_candidates)}, T={len(top_candidates)}, B={len(bottom_candidates)}")
+        if not is_valid and debug:
+            print(f"     ⚠️ Still {gameplay_ratio:.1%} gameplay after margin, proceeding anyway")
     
     # ==========================================================================
-    # STEP 4: Build and validate the rectangle
+    # STEP 5: FACE CONTAINMENT CHECK
     # ==========================================================================
-    best_rect = None
-    best_score = -1
-    
-    for r_pos, r_str in right_candidates[:3]:
-        for t_pos, t_str in top_candidates[:3]:
-            for b_pos, b_str in bottom_candidates[:3]:
-                if left_edge >= r_pos or t_pos >= b_pos:
-                    continue
-                
-                w = r_pos - left_edge
-                h = b_pos - t_pos
-                
-                # CRITICAL: Prevent over-shrinking (max 15% smaller than seed)
-                max_shrink = 0.15
-                if w < sw * (1 - max_shrink) or h < sh * (1 - max_shrink):
-                    continue
-                
-                # Minimum size must be at least 85% of seed
-                if w < sw * 0.85 or h < sh * 0.85:
-                    continue
-                
-                ar = w / h
-                if ar < 0.9 or ar > 3.0:
-                    continue
-                
-                # Must contain face
-                if face_center:
-                    if not (left_edge <= face_x_roi <= r_pos and t_pos <= face_y_roi <= b_pos):
-                        continue
-                
-                # Score the rectangle
-                score = 0
-                
-                # Edge strength (25 points)
-                edge_strength = (left_strength + r_str + t_str + b_str) / 4
-                max_strength = col_sum_smooth.max() + 1
-                score += (edge_strength / max_strength) * 25
-                
-                # AR bonus - prefer 16:9 = 1.78 (25 points)
-                ar_diff = abs(ar - 1.78)
-                score += max(0, 25 - ar_diff * 20)
-                
-                # SIZE SIMILARITY: prefer similar size to seed (30 points)
-                # Don't reward tightness - reward staying close to Gemini's bbox
-                w_ratio = min(w, sw) / max(w, sw) if sw > 0 else 0
-                h_ratio = min(h, sh) / max(h, sh) if sh > 0 else 0
-                score += ((w_ratio + h_ratio) / 2) * 30
-                
-                # Position similarity - prefer centered on seed (20 points)
-                center_x = (left_edge + r_pos) / 2
-                center_y = (t_pos + b_pos) / 2
-                seed_center_x = seed_left_roi + sw / 2
-                seed_center_y = seed_top_roi + sh / 2
-                dist = np.sqrt((center_x - seed_center_x)**2 + (center_y - seed_center_y)**2)
-                max_dist = np.sqrt(search_x**2 + search_y**2) + 1
-                score += (1 - dist / max_dist) * 20
-                
-                if score > best_score:
-                    best_score = score
-                    best_rect = (left_edge, r_pos, t_pos, b_pos)
-    
-    if best_rect is None:
-        if debug:
-            print(f"     ⚠️ No valid rectangle found")
-        return None
-    
-    left, right, top, bottom = best_rect
-    
-    # ==========================================================================
-    # STEP 5: Convert back to frame coordinates
-    # ==========================================================================
-    ref_x = roi_x + left
-    ref_y = roi_y + top
-    ref_w = right - left
-    ref_h = bottom - top
-    
-    # Final validation
-    if ref_w < 80 or ref_h < 60:
-        if debug:
-            print(f"     ⚠️ Final bbox too small: {ref_w}x{ref_h}")
-        return None
-    
-    ar = ref_w / ref_h
-    if ar < 0.9 or ar > 3.0:
-        if debug:
-            print(f"     ⚠️ Final AR out of range: {ar:.2f}")
-        return None
-    
-    # Must contain face
     if face_center:
-        if not (ref_x <= face_center[0] <= ref_x + ref_w and ref_y <= face_center[1] <= ref_y + ref_h):
+        fx, fy = face_center
+        if not (new_x <= fx <= new_x + new_w and new_y <= fy <= new_y + new_h):
             if debug:
-                print(f"     ⚠️ Final bbox doesn't contain face")
-            return None
+                print(f"     ⚠️ Face not in refined bbox, reverting to seed")
+            new_x, new_y, new_w, new_h = sx, sy, sw, sh
+    
+    # ==========================================================================
+    # STEP 6: FINAL VALIDATION AND OUTPUT
+    # ==========================================================================
+    ar = new_w / new_h if new_h > 0 else 0
+    if ar < 0.8 or ar > 3.5:
+        if debug:
+            print(f"     ⚠️ Bad AR ({ar:.2f}), using seed")
+        new_x, new_y, new_w, new_h = sx, sy, sw, sh
     
     if debug:
-        w_diff = ref_w - sw
-        h_diff = ref_h - sh
-        print(f"     ✅ tight_edges (v3): {ref_w}x{ref_h} at ({ref_x},{ref_y}), score={best_score:.1f}, AR={ar:.2f}")
-        print(f"     Δ from seed: width {w_diff:+d}px, height {h_diff:+d}px")
+        w_diff = new_w - sw
+        h_diff = new_h - sh
+        x_diff = new_x - sx
+        status = "✅ VALID" if is_valid else "⚠️ HAS GAMEPLAY"
+        print(f"     {status}: {new_w}x{new_h} at ({new_x},{new_y}), gameplay={gameplay_ratio:.1%}")
+        print(f"     Δ from seed: x {x_diff:+d}px, width {w_diff:+d}px, height {h_diff:+d}px")
+        
+        # Verify constraint was respected
+        if is_right_side and new_x < sx:
+            print(f"     ❌ CONSTRAINT VIOLATION: left edge moved LEFT on right-side webcam!")
+        elif not is_right_side and (new_x + new_w) > (sx + sw):
+            print(f"     ❌ CONSTRAINT VIOLATION: right edge moved RIGHT on left-side webcam!")
     
     # Save debug image if requested
     if debug_dir:
         try:
-            debug_img = roi.copy()
-            # Draw seed bbox (red)
-            cv2.rectangle(debug_img, (seed_left_roi, seed_top_roi), (seed_right_roi, seed_bottom_roi), (0, 0, 255), 2)
-            # Draw refined bbox (green)
-            cv2.rectangle(debug_img, (left, top), (right, bottom), (0, 255, 0), 2)
-            # Draw face center (blue circle)
-            if face_center:
-                cv2.circle(debug_img, (int(face_x_roi), int(face_y_roi)), 8, (255, 0, 0), -1)
-            # Draw left edge search area (yellow line)
-            cv2.line(debug_img, (left, 0), (left, roi_h), (0, 255, 255), 2)
-            
-            debug_path = os.path.join(debug_dir, 'debug_tight_edges.jpg')
-            cv2.imwrite(debug_path, debug_img)
-            print(f"     📸 Saved debug: {debug_path}")
+            debug_save_comparison(
+                frame_bgr,
+                (sx, sy, sw, sh),
+                (new_x, new_y, new_w, new_h),
+                debug_dir,
+                is_valid=is_valid
+            )
         except Exception as e:
             print(f"     ⚠️ Failed to save debug: {e}")
     
     return {
-        'x': ref_x, 'y': ref_y,
-        'width': ref_w, 'height': ref_h
+        'x': new_x, 'y': new_y,
+        'width': new_w, 'height': new_h
     }
 
 
@@ -3056,15 +3108,20 @@ def apply_layout_aware_padding(
 
 def aggregate_multiframe_bboxes(
     detections: List[Dict],
+    frame_width: int = 1920,
     debug: bool = False,
 ) -> Optional[Dict]:
     """
     Aggregate multiple frame detections into a single stable bbox.
     
-    Uses median aggregation for robustness against outliers.
+    DIRECTIONAL BIAS (critical for preventing gameplay bleed):
+    - For RIGHT-side webcams: use MAX x (rightmost detection) as anchor
+    - For LEFT-side webcams: use MIN x (leftmost detection) as anchor
+    - This prevents the aggregated bbox from expanding toward gameplay
     
     Args:
         detections: List of detection results from Gemini
+        frame_width: Video width for determining left/right side
         debug: Enable debug logging
         
     Returns:
@@ -3106,31 +3163,64 @@ def aggregate_multiframe_bboxes(
     if not matching:
         matching = valid
     
-    # Median aggregation of bbox
+    # Extract bbox components
     xs = [d['x'] for d in matching]
     ys = [d['y'] for d in matching]
     ws = [d['width'] for d in matching]
     hs = [d['height'] for d in matching]
     confs = [d.get('confidence', 0.5) for d in matching]
     
+    # ==========================================================================
+    # DIRECTIONAL BIAS: Prevent gameplay bleed by using conservative anchors
+    # ==========================================================================
+    median_x = np.median(xs)
+    is_right_side = median_x > frame_width / 2
+    
+    if majority_type in ['side_box', 'corner_overlay']:
+        if is_right_side:
+            # RIGHT-SIDE WEBCAM: Use MAX x to avoid left-bleed into gameplay
+            # The rightmost detection is the most conservative (furthest from gameplay)
+            agg_x = int(max(xs))
+            agg_y = int(np.median(ys))
+            agg_w = int(np.median(ws))
+            agg_h = int(np.median(hs))
+            bias_reason = f"right-side bias: using max(x)={agg_x} (range {min(xs)}-{max(xs)})"
+        else:
+            # LEFT-SIDE WEBCAM: Use MIN x to avoid right-bleed into gameplay
+            agg_x = int(min(xs))
+            agg_y = int(np.median(ys))
+            agg_w = int(np.median(ws))
+            agg_h = int(np.median(hs))
+            bias_reason = f"left-side bias: using min(x)={agg_x} (range {min(xs)}-{max(xs)})"
+    else:
+        # For top_band/full_cam/center_box, use median (no directional bias needed)
+        agg_x = int(np.median(xs))
+        agg_y = int(np.median(ys))
+        agg_w = int(np.median(ws))
+        agg_h = int(np.median(hs))
+        bias_reason = "median aggregation"
+    
     result = {
         'found': True,
         'type': majority_type,
         'effective_type': matching[0].get('effective_type', majority_type),
         'corner': majority_corner,
-        'x': int(np.median(xs)),
-        'y': int(np.median(ys)),
-        'width': int(np.median(ws)),
-        'height': int(np.median(hs)),
+        'x': agg_x,
+        'y': agg_y,
+        'width': agg_w,
+        'height': agg_h,
         'confidence': float(np.mean(confs)),
-        'reason': f"Aggregated from {len(matching)} frames",
+        'reason': f"Aggregated from {len(matching)} frames ({bias_reason})",
         '_aggregated': True,
         '_frame_count': len(matching),
+        '_is_right_side': is_right_side,
     }
     
     if debug:
         print(f"     Majority type: {majority_type}, corner: {majority_corner}")
-        print(f"     Median bbox: {result['width']}x{result['height']} at ({result['x']},{result['y']})")
+        print(f"     {'RIGHT' if is_right_side else 'LEFT'}-side webcam detected")
+        print(f"     Aggregated bbox: {result['width']}x{result['height']} at ({result['x']},{result['y']})")
+        print(f"     Aggregation: {bias_reason}")
     
     return result
 
@@ -3237,8 +3327,8 @@ def run_multiframe_gemini_detection(
     valid_sorted = sorted(valid, key=lambda d: d.get('confidence', 0), reverse=True)
     highest_conf = valid_sorted[0]
     
-    # Aggregate using median (more robust)
-    aggregated = aggregate_multiframe_bboxes(valid, debug=True)
+    # Aggregate using directional bias (prevents gameplay bleed)
+    aggregated = aggregate_multiframe_bboxes(valid, frame_width=frame_width, debug=True)
     
     if aggregated:
         # Use the highest confidence detection's type/corner but aggregated bbox
@@ -5906,7 +5996,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 12  # v12: Fix over-zoom - max 15% shrink, reward size similarity not tightness
+_CACHE_VERSION = 13  # v13: Hybrid detection - directional aggregation + gameplay-aware constrained refinement
 
 
 def _get_cache_path(temp_dir: str) -> str:
