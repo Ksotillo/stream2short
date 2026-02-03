@@ -18,6 +18,13 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Literal, Union
 from dataclasses import dataclass
 
+# =============================================================================
+# SIDE_BOX FACE CONTAINMENT CONSTANTS
+# These control how aggressively we ensure the face is visible in the final bbox
+# =============================================================================
+SIDEBOX_FACE_MIN_HEADROOM_PCT = 0.10  # Face must be at least 10% down from bbox top
+SIDEBOX_BOTTOM_LOCK_TOLERANCE_PCT = 0.03  # Allow 3% past seed_bottom if needed for face
+
 
 @dataclass
 class BBoxCandidate:
@@ -6537,17 +6544,69 @@ def detect_webcam_region(
                     new_h = max(100, new_h)
                     
                     # ============================================================
-                    # SANITY CHECK: Face must be inside final bbox (debug-only)
+                    # FACE CONTAINMENT FIX (for side_box - not just debug!)
+                    # If face is outside bbox, SHIFT bbox up to include it
                     # ============================================================
                     if effective_type == 'side_box' and detected_face:
-                        if detected_face.center_y < new_y:
-                            print(f"  🚨 FACE OUTSIDE BBOX TOP even after headroom shift!")
-                            print(f"     face_center_y={detected_face.center_y}, bbox_y={new_y}")
-                        elif detected_face.center_y > new_y + new_h:
+                        face_center_y = detected_face.center_y
+                        face_height = detected_face.height if detected_face.height > 0 else 60
+                        face_top = face_center_y - face_height // 2
+                        
+                        # Minimum headroom: face should be at least 10% down from bbox top
+                        min_headroom_px = int(new_h * SIDEBOX_FACE_MIN_HEADROOM_PCT)
+                        desired_top = face_top - min_headroom_px
+                        
+                        if face_center_y < new_y:
+                            # Face is ABOVE bbox - must shift up
+                            print(f"  🚨 FACE OUTSIDE BBOX TOP - applying correction!")
+                            print(f"     face_center_y={face_center_y}, face_top≈{face_top}, bbox_y={new_y}")
+                            
+                            # Calculate how much to shift up
+                            shift_up = new_y - desired_top
+                            seed_bottom = gemini_y + gemini_h
+                            max_allowed_bottom = seed_bottom + int(gemini_h * SIDEBOX_BOTTOM_LOCK_TOLERANCE_PCT)
+                            
+                            # Try to shift up while respecting bottom lock
+                            proposed_y = max(0, new_y - shift_up)
+                            proposed_bottom = proposed_y + new_h
+                            
+                            if proposed_bottom <= max_allowed_bottom:
+                                # Good - shift works within tolerance
+                                new_y = proposed_y
+                                print(f"     ✅ Shifted bbox up: new_y={new_y}, bottom={new_y + new_h}")
+                            else:
+                                # Bottom lock conflict - shift up as much as possible, then shrink height
+                                new_y = max(0, max_allowed_bottom - new_h)
+                                if new_y + new_h > max_allowed_bottom:
+                                    new_h = max_allowed_bottom - new_y
+                                print(f"     ⚠️ Bottom lock conflict - shifted to y={new_y}, h={new_h}")
+                                print(f"        (allowed 3% past seed_bottom for face visibility)")
+                        
+                        elif face_center_y > new_y + new_h:
                             print(f"  🚨 FACE OUTSIDE BBOX BOTTOM!")
-                            print(f"     face_center_y={detected_face.center_y}, bbox_bottom={new_y + new_h}")
+                            print(f"     face_center_y={face_center_y}, bbox_bottom={new_y + new_h}")
+                            # This shouldn't happen with bottom lock, but log it
+                        
                         else:
-                            print(f"  ✅ Face inside bbox: face_y={detected_face.center_y}, bbox=[{new_y}, {new_y + new_h}]")
+                            # Face is inside - verify headroom
+                            headroom = face_top - new_y
+                            if headroom < min_headroom_px:
+                                print(f"  ⚠️ Insufficient headroom ({headroom}px < {min_headroom_px}px)")
+                                # Try to add more headroom by shifting up
+                                shift_needed = min_headroom_px - headroom
+                                seed_bottom = gemini_y + gemini_h
+                                max_allowed_bottom = seed_bottom + int(gemini_h * SIDEBOX_BOTTOM_LOCK_TOLERANCE_PCT)
+                                
+                                proposed_y = max(0, new_y - shift_needed)
+                                proposed_bottom = proposed_y + new_h
+                                
+                                if proposed_bottom <= max_allowed_bottom:
+                                    new_y = proposed_y
+                                    print(f"     ✅ Added headroom: new_y={new_y}")
+                                else:
+                                    print(f"     ⚠️ Could not add full headroom (bottom lock)")
+                            else:
+                                print(f"  ✅ Face inside bbox: face_y={face_center_y}, bbox=[{new_y}, {new_y + new_h}], headroom={headroom}px")
                     
                     print(f"  📐 FINAL bbox: {new_w}x{new_h} at ({new_x},{new_y})")
                     print(f"  ═══════════════════════════════════════\n")
@@ -6602,6 +6661,23 @@ def detect_webcam_region(
                         })
                     
                     save_debug_frame_multi_box(frame_path, debug_combined_path, debug_boxes)
+                    
+                    # 4. Save actual cropped webcam region (proves bbox correctness)
+                    try:
+                        if frame_for_refine is not None:
+                            # Crop the final bbox from the frame
+                            crop_x = max(0, new_x)
+                            crop_y = max(0, new_y)
+                            crop_x2 = min(width, new_x + new_w)
+                            crop_y2 = min(height, new_y + new_h)
+                            
+                            webcam_crop = frame_for_refine[crop_y:crop_y2, crop_x:crop_x2]
+                            if webcam_crop.size > 0:
+                                debug_crop_path = f"{temp_dir}/debug_final_webcam_crop{job_suffix}.jpg"
+                                cv2.imwrite(debug_crop_path, webcam_crop)
+                                print(f"  📸 Saved final webcam crop: {debug_crop_path}")
+                    except Exception as e:
+                        print(f"  ⚠️ Could not save webcam crop debug: {e}")
                     
                     # Clean up the frame file now that we're done
                     try:
@@ -6845,7 +6921,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 18  # v18: Headroom SHIFT for side_box - translate bbox up instead of expand, respect bottom lock
+_CACHE_VERSION = 19  # v19: Face containment correction + render margin for side_box
 
 
 def _get_cache_path(temp_dir: str) -> str:

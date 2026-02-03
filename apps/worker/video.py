@@ -287,22 +287,44 @@ def render_split_layout_video(
     
     # ==========================================================================
     # STEP 1: Expand detected bbox by margin to avoid tight crops
-    # For side_box: use ZERO margin since tight_edges refinement already found exact edges
+    # For side_box: use small margin (6%) + extra top headroom (12%) for face/hair
     # For corner overlays: use standard margin (8%)
     # ==========================================================================
+    # Tunables for side_box
+    SIDEBOX_RENDER_MARGIN = 0.06      # 6% general margin
+    SIDEBOX_TOP_HEADROOM_PCT = 0.12   # 12% extra top padding for forehead/hair
+    
     if effective_type == 'side_box':
-        margin = 0.0  # ZERO for side_box - bbox is already tight from edge refinement
-        print(f"   Using ZERO margin for side_box (tight bbox already)")
+        margin = SIDEBOX_RENDER_MARGIN
+        top_headroom = int(webcam_region.height * SIDEBOX_TOP_HEADROOM_PCT)
+        print(f"   Using {margin*100:.0f}% margin + {SIDEBOX_TOP_HEADROOM_PCT*100:.0f}% top headroom for side_box")
     else:
         margin = 0.08  # 8% for corner overlays
+        top_headroom = 0
     
     pad_x = int(webcam_region.width * margin)
     pad_y = int(webcam_region.height * margin)
     
-    cam_x = max(0, webcam_region.x - pad_x)
-    cam_y = max(0, webcam_region.y - pad_y)
-    cam_w = min(src_width - cam_x, webcam_region.width + 2 * pad_x)
-    cam_h = min(src_height - cam_y, webcam_region.height + 2 * pad_y)
+    # For side_box: apply extra top headroom while preserving bottom edge
+    # This shifts the crop UP to capture forehead/hair without adding gameplay at bottom
+    if effective_type == 'side_box' and top_headroom > 0:
+        # Calculate original bottom edge (SACRED - don't expand past this)
+        original_bottom = webcam_region.y + webcam_region.height
+        
+        # Apply extra top padding (shift crop up)
+        cam_y = max(0, webcam_region.y - pad_y - top_headroom)
+        cam_x = max(0, webcam_region.x - pad_x)
+        
+        # Calculate new height that reaches original bottom + standard bottom margin
+        cam_h = min(src_height - cam_y, (original_bottom + pad_y) - cam_y)
+        cam_w = min(src_width - cam_x, webcam_region.width + 2 * pad_x)
+        
+        print(f"   Side_box headroom: top shifted by {top_headroom}px, bottom at {cam_y + cam_h} (original: {original_bottom})")
+    else:
+        cam_x = max(0, webcam_region.x - pad_x)
+        cam_y = max(0, webcam_region.y - pad_y)
+        cam_w = min(src_width - cam_x, webcam_region.width + 2 * pad_x)
+        cam_h = min(src_height - cam_y, webcam_region.height + 2 * pad_y)
     
     # Make all crop dimensions EVEN to prevent implicit padding with yuv420p
     cam_x = even(cam_x)
