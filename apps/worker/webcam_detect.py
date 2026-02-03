@@ -2365,11 +2365,12 @@ def refine_side_box_tight_edges(
         right_edge_min = (sx + sw) - max_shrink_px
         right_edge_max = sx + sw  # CANNOT GO RIGHT OF THIS - prevents gameplay bleed
     
-    # Top: allow upward expansion (for headroom), but not downward
+    # Top: allow small adjustments both ways (headroom protection will clamp later)
     top_edge_min = max(sy - max_shrink_px // 4, 0)
     top_edge_max = sy + max_shrink_px // 2
     
     # Bottom: can ONLY SHRINK (move up), NEVER EXPAND (move down into gameplay)
+    # This is CRITICAL for side_box - gameplay is below the webcam
     bottom_edge_min = (sy + sh) - max_shrink_px // 2
     bottom_edge_max = sy + sh  # SACRED: cannot expand downward into gameplay
     
@@ -2472,14 +2473,15 @@ def refine_side_box_tight_edges(
             best_top = max(0, min_allowed_top)
     
     # ==========================================================================
-    # STEP 2.5B: BOTTOM EDGE PROTECTION - Prevent expansion into gameplay
+    # STEP 2.6: BOTTOM EDGE PROTECTION - Prevent gameplay bleed
     # ==========================================================================
-    # For side_box overlays: NEVER move bottom edge down
-    # Only allow it to move UP (decrease height), never DOWN (increase height)
-    if best_bottom > (sy + sh):
+    # For side_box overlays: NEVER move bottom edge down into gameplay
+    # This is a HARD CLAMP - defense in depth even if search bounds were correct
+    seed_bottom = sy + sh
+    if best_bottom > seed_bottom:
         if debug:
-            print(f"     ⚠️ Preventing bottom edge from moving down ({sy + sh} -> {best_bottom}), keeping at {sy + sh}")
-        best_bottom = sy + sh
+            print(f"     ⚠️ Preventing bottom edge from moving down ({seed_bottom} -> {best_bottom}), keeping bottom={seed_bottom}")
+        best_bottom = seed_bottom
     
     # ==========================================================================
     # STEP 3: BUILD REFINED BBOX
@@ -2554,18 +2556,6 @@ def refine_side_box_tight_edges(
             print(f"     ⚠️ Bad AR ({ar:.2f}), using seed")
         new_x, new_y, new_w, new_h = sx, sy, sw, sh
     
-    # ==========================================================================
-    # STEP 6B: HEIGHT CONSTRAINT VALIDATION
-    # ==========================================================================
-    # Ensure we didn't expand height beyond seed (prevents gameplay bleed)
-    # Max 5% height expansion allowed (for edge detection accuracy margin)
-    if new_h > sh * 1.05:
-        if debug:
-            print(f"     ⚠️ Height expanded too much ({new_h} > {sh * 1.05:.0f}), clamping to seed height")
-        new_h = sh
-        # Keep top position, shrink from bottom (safer - gameplay is usually below)
-        # new_y stays the same, new_h is reduced to seed
-    
     if debug:
         w_diff = new_w - sw
         h_diff = new_h - sh
@@ -2574,22 +2564,11 @@ def refine_side_box_tight_edges(
         print(f"     {status}: {new_w}x{new_h} at ({new_x},{new_y}), gameplay={gameplay_ratio:.1%}")
         print(f"     Δ from seed: x {x_diff:+d}px, width {w_diff:+d}px, height {h_diff:+d}px")
         
-        # Height constraint verification
-        print(f"     Seed height: {sh}, Final height: {new_h}, Ratio: {new_h/sh:.2f}")
-        if new_h > sh:
-            print(f"     ⚠️ WARNING: Height increased by {new_h - sh}px")
-        else:
-            print(f"     ✅ Height decreased or maintained")
-        
         # Verify constraint was respected
         if is_right_side and new_x < sx:
             print(f"     ❌ CONSTRAINT VIOLATION: left edge moved LEFT on right-side webcam!")
         elif not is_right_side and (new_x + new_w) > (sx + sw):
             print(f"     ❌ CONSTRAINT VIOLATION: right edge moved RIGHT on left-side webcam!")
-        
-        # Bottom edge constraint verification
-        if (new_y + new_h) > (sy + sh):
-            print(f"     ❌ CONSTRAINT VIOLATION: bottom edge moved DOWN into gameplay!")
     
     # Save debug image if requested
     if debug_dir:
@@ -3389,8 +3368,17 @@ def refine_bbox_edges(
         bottom_candidates.sort(key=lambda l: score_horizontal_line(l, bbox_bottom_roi, is_anchor), reverse=True)
         best_bottom = bottom_candidates[0]
         if abs(best_bottom['y'] - bbox_bottom_roi) < h * 0.3:
-            new_bottom = best_bottom['y']
-            adjustments['bottom'] = new_bottom - bbox_bottom_roi
+            proposed_adjustment = best_bottom['y'] - bbox_bottom_roi
+            
+            # BOTTOM PROTECTION: For side_box, NEVER move bottom edge down (gameplay bleed)
+            # Positive adjustment = moving down = BAD for webcam overlays
+            if mode == 'side_box' and proposed_adjustment > 0:
+                if debug:
+                    print(f"     🚫 Blocked bottom edge from moving down (+{proposed_adjustment}px) for side_box")
+                # Keep original bottom edge
+            else:
+                new_bottom = best_bottom['y']
+                adjustments['bottom'] = proposed_adjustment
     
     # LEFT border
     left_candidates = [l for l in vertical_lines 
@@ -6160,6 +6148,30 @@ def detect_webcam_region(
                             cam_h = protected['height']
                     
                     # ============================================================
+                    # SIDE_BOX HEIGHT CONSTRAINT (prevent bottom gameplay bleed)
+                    # Final bbox must NEVER extend below Gemini-provided bottom edge
+                    # ============================================================
+                    if effective_type == 'side_box' or not is_true_corner:
+                        gemini_bottom = gemini_y + gemini_h
+                        current_bottom = cam_y + cam_h
+                        max_allowed_h = int(gemini_h * 1.05)  # Allow max 5% tolerance
+                        
+                        # Check if we exceeded Gemini's bottom edge
+                        if current_bottom > gemini_bottom:
+                            old_bottom = current_bottom
+                            # Clamp bottom to Gemini's bottom (shrink from below)
+                            cam_h = gemini_bottom - cam_y
+                            print(f"  ⚠️ side_box bottom exceeded Gemini: {old_bottom} > {gemini_bottom}")
+                            print(f"     Clamping height to {cam_h}px (bottom at {gemini_bottom})")
+                        
+                        # Also enforce max 5% height expansion as defense
+                        if cam_h > max_allowed_h:
+                            old_h = cam_h
+                            cam_h = gemini_h  # Hard reset to Gemini height (safest)
+                            print(f"  ⚠️ side_box height exceeded Gemini by >5% ({old_h} > {max_allowed_h})")
+                            print(f"     Hard reset to Gemini height: {cam_h}px")
+                    
+                    # ============================================================
                     # HARD CONSTRAINTS ON FINAL BBOX
                     # 1. Must contain detected face (if any)
                     # 2. Must pass guardrails (not extend into gameplay)
@@ -6714,7 +6726,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 17  # v17: Fix bottom gameplay bleed - bottom edge can only shrink, never expand
+_CACHE_VERSION = 17  # v17: Bottom edge protection - side_box bbox cannot extend below Gemini bottom
 
 
 def _get_cache_path(temp_dir: str) -> str:
