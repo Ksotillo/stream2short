@@ -1216,6 +1216,83 @@ def ensure_headroom(
     return bbox
 
 
+def ensure_headroom_sidebox_shift(
+    bbox: Dict[str, int],
+    face_center: Optional[Tuple[int, int]],
+    frame_height: int,
+    seed_bottom: int,
+    min_headroom_ratio: float = 0.15,
+    face_height: int = 60,
+    debug: bool = False,
+) -> Dict[str, int]:
+    """
+    SIDE_BOX-specific headroom protection with SHIFT instead of EXPAND.
+
+    Unlike ensure_headroom(), this does NOT expand the bbox upward while keeping
+    the bottom fixed (which can preserve gameplay bleed).
+    
+    Instead, it SHIFTs the bbox upward to include the face + headroom, while
+    enforcing a hard bottom lock: bbox_bottom <= seed_bottom (Gemini bottom).
+    
+    If shifting upward would violate bottom lock, we shrink height from the bottom.
+    
+    Key invariant: Final bbox satisfies BOTH:
+    - bbox_bottom <= seed_bottom (no gameplay bleed)
+    - face_top >= bbox_top + headroom (face visible with headroom)
+    
+    Args:
+        bbox: Current bbox {'x', 'y', 'width', 'height'}
+        face_center: (x, y) of detected face center, or None
+        frame_height: Full frame height (to clamp expansion)
+        seed_bottom: Gemini-provided bottom edge (SACRED - cannot exceed)
+        min_headroom_ratio: Minimum distance from top as ratio of height (default 15%)
+        face_height: Approximate face height for calculating face top
+        debug: Enable debug logging
+        
+    Returns:
+        Adjusted bbox that contains the face with proper headroom, respecting bottom lock
+    """
+    x, y, w, h = bbox['x'], bbox['y'], bbox['width'], bbox['height']
+    
+    if not face_center:
+        return bbox
+    
+    face_x, face_y = face_center
+    face_top = face_y - face_height // 2
+    
+    headroom_px = int(h * min_headroom_ratio)
+    desired_top = face_top - headroom_px
+    
+    # If bbox top is too low (face would be cut off), shift up
+    if y > desired_top:
+        new_y = max(0, desired_top)
+        
+        # Keep same height if possible, but enforce bottom lock
+        new_h = h
+        new_bottom = new_y + new_h
+        
+        if new_bottom > seed_bottom:
+            # Must shrink height to respect bottom lock
+            new_h = max(1, seed_bottom - new_y)
+        
+        # Clamp to frame
+        if new_y + new_h > frame_height:
+            new_h = max(1, frame_height - new_y)
+        
+        if debug:
+            print(f"  👤 SIDE_BOX HEADROOM SHIFT:")
+            print(f"     face_center_y={face_y}, face_top≈{face_top}, headroom={headroom_px}px")
+            print(f"     bbox_y {y} -> {new_y}, h {h} -> {new_h}, bottom_lock={seed_bottom}")
+            if new_y + new_h < seed_bottom:
+                print(f"     ✅ Bottom respected: {new_y + new_h} < {seed_bottom}")
+            else:
+                print(f"     ✅ Bottom at limit: {new_y + new_h} == {seed_bottom}")
+        
+        return {'x': x, 'y': new_y, 'width': w, 'height': new_h}
+    
+    return bbox
+
+
 def refine_bbox_universal(
     frame: np.ndarray,
     seed_bbox: Tuple[int, int, int, int],
@@ -6130,16 +6207,33 @@ def detect_webcam_region(
                     # ============================================================
                     # HEADROOM PROTECTION (for side_box overlays)
                     # Ensure the streamer's head isn't cut off
+                    # For side_box: use SHIFT instead of EXPAND to respect bottom lock
                     # ============================================================
+                    seed_bottom = gemini_y + gemini_h
+                    
                     if (effective_type == 'side_box' or not is_true_corner) and detected_face:
                         current_bbox = {'x': cam_x, 'y': cam_y, 'width': cam_w, 'height': cam_h}
                         face_center_tuple = (detected_face.center_x, detected_face.center_y)
-                        protected = ensure_headroom(
-                            current_bbox, face_center_tuple, height,
-                            min_headroom_ratio=0.15,
-                            face_height=detected_face.height if detected_face.height > 0 else 60,
-                            debug=True
-                        )
+                        
+                        if effective_type == 'side_box':
+                            # SIDE_BOX: Use SHIFT (not expand) to respect bottom lock
+                            protected = ensure_headroom_sidebox_shift(
+                                current_bbox,
+                                face_center_tuple,
+                                height,
+                                seed_bottom=seed_bottom,
+                                min_headroom_ratio=0.15,
+                                face_height=detected_face.height if detected_face.height > 0 else 60,
+                                debug=True
+                            )
+                        else:
+                            # Other types: use original expand behavior
+                            protected = ensure_headroom(
+                                current_bbox, face_center_tuple, height,
+                                min_headroom_ratio=0.15,
+                                face_height=detected_face.height if detected_face.height > 0 else 60,
+                                debug=True
+                            )
                         
                         if protected['y'] != cam_y or protected['height'] != cam_h:
                             cam_x = protected['x']
@@ -6404,6 +6498,18 @@ def detect_webcam_region(
                     print(f"  📐 After frame clamp: {new_w}x{new_h} at ({new_x},{new_y})")
                     
                     # ============================================================
+                    # SIDE_BOX BOTTOM LOCK (after padding/clamp)
+                    # Padding can push bottom down again - enforce hard lock
+                    # ============================================================
+                    if effective_type == 'side_box':
+                        seed_bottom = gemini_y + gemini_h
+                        current_bottom = new_y + new_h
+                        if current_bottom > seed_bottom:
+                            print(f"  ⚠️ SIDE_BOX bottom lock after padding: {current_bottom} -> {seed_bottom}")
+                            new_h = max(1, seed_bottom - new_y)
+                            print(f"     Adjusted height to {new_h}px")
+                    
+                    # ============================================================
                     # GAME BLEED GUARDRAIL (ONLY for TRUE corner overlays!)
                     # For mid-right/side_box overlays, this guardrail would clip
                     # the actual webcam, so we SKIP it.
@@ -6429,6 +6535,19 @@ def detect_webcam_region(
                     # Ensure minimum dimensions
                     new_w = max(100, new_w)
                     new_h = max(100, new_h)
+                    
+                    # ============================================================
+                    # SANITY CHECK: Face must be inside final bbox (debug-only)
+                    # ============================================================
+                    if effective_type == 'side_box' and detected_face:
+                        if detected_face.center_y < new_y:
+                            print(f"  🚨 FACE OUTSIDE BBOX TOP even after headroom shift!")
+                            print(f"     face_center_y={detected_face.center_y}, bbox_y={new_y}")
+                        elif detected_face.center_y > new_y + new_h:
+                            print(f"  🚨 FACE OUTSIDE BBOX BOTTOM!")
+                            print(f"     face_center_y={detected_face.center_y}, bbox_bottom={new_y + new_h}")
+                        else:
+                            print(f"  ✅ Face inside bbox: face_y={detected_face.center_y}, bbox=[{new_y}, {new_y + new_h}]")
                     
                     print(f"  📐 FINAL bbox: {new_w}x{new_h} at ({new_x},{new_y})")
                     print(f"  ═══════════════════════════════════════\n")
@@ -6726,7 +6845,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 17  # v17: Bottom edge protection - side_box bbox cannot extend below Gemini bottom
+_CACHE_VERSION = 18  # v18: Headroom SHIFT for side_box - translate bbox up instead of expand, respect bottom lock
 
 
 def _get_cache_path(temp_dir: str) -> str:
