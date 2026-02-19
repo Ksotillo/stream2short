@@ -36,6 +36,7 @@
 - [x] **NEW:** Gemini Vision AI webcam detection
 - [x] **NEW:** FULL_CAM layout mode (when clip is just webcam)
 - [x] **NEW:** Layout caching (skip re-detection on re-renders)
+- [x] **NEW:** YOLOv8 webcam detector (Mean IoU 0.921, 98.1% found accuracy)
 
 ### Infrastructure
 - [x] Anti-spam cooldowns
@@ -263,13 +264,17 @@ Replaced fixed "3-word chunks" with intelligent rules in `smart_chunker.py`:
 - `SPLIT` - when webcam detected in corner
 - `NO_WEBCAM` - simple center crop
 
-### 3.2 Face Tracking
-- **Status:** ✅ Complete (using OpenCV DNN)
+### 3.2 Face Tracking & Webcam Detection
+- **Status:** ✅ Complete
 - **Effort:** ~4-6 hours
 
 **What we have:**
 - ✅ OpenCV DNN face detection
-- ✅ Gemini Vision AI webcam rectangle detection
+- ✅ Gemini Vision AI webcam rectangle detection (fallback)
+- ✅ **YOLOv8 webcam detector** — primary strategy, fine-tuned on 53 labeled Twitch clips
+  - Mean IoU: 0.921 | Found accuracy: 98.1% | Inference: ~1–2s
+  - Supports: `side_box`, `corner_overlay`, `full_cam`, `top_band`, `bottom_band`, `center_box`
+  - Detection waterfall: **YOLO → Gemini → OpenCV** (fully backward-compatible)
 - ✅ Face-anchored cropping
 - ✅ **Dynamic per-frame tracking** with EMA smoothing
 - ✅ FFmpeg expression-based interpolation between keyframes
@@ -403,7 +408,7 @@ Replaced fixed "3-word chunks" with intelligent rules in `smart_chunker.py`:
 - [ ] Background music enhances without overpowering speech
 
 ---
-{"cost":["Cost per item","cost_per_item","Unit Cost"],"price":["Shell Lumber Pricing","shell_lumber_pricing","price"],"compare_at":["Suggested Retail / Compare At Price","Compare At Price","compare_at_price"],"product_id":["Shell Lumber Product ID","shell_lumber_product_id"],"variant_id":["Shell Lumber Variant ID","shell_lumber_variant_id"],"inventory_id":["Shell Lumber Variant Inventory Item ID","shell_lumber_variant_inventory_item_id"],"shipping_flag":["SHIP BY UPS FEDEX USPS Override","SHIP BY UPS FEDEX USPS","canShip","shipByParcel"]}
+
 ## 🆕 Unplanned Features (Added Since Roadmap)
 
 These features were implemented outside the original roadmap:
@@ -420,6 +425,7 @@ These features were implemented outside the original roadmap:
 | **Layout Caching** | Skip re-detection on re-renders | ✅ Done |
 | **Force Reprocess** | Bypass duplicate detection for testing | ✅ Done |
 | **Transcript Editing** | Edit subtitles in dashboard and re-render with changes | ✅ Done |
+| **YOLOv8 Webcam Detector** | Fine-tuned model (53 Twitch clips, Mean IoU 0.921, 98.1% found accuracy) replaces heuristic detection as Strategy 0. Gemini + OpenCV remain as fallbacks. | ✅ Done |
 
 ---
 
@@ -469,6 +475,7 @@ phase-1-dashboard
 phase-1-notifications
 phase-2-caption-presets
 phase-3-face-tracking
+feature/yolo-webcam-locator   ← current: YOLO webcam detection upgrade
 ...
 ```
 
@@ -476,4 +483,4 @@ phase-3-face-tracking
 
 ---
 
-*Last updated: January 2026*
+*Last updated: February 2026*

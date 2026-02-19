@@ -10,7 +10,7 @@ A **!clip** command in your Twitch chat creates a vertical 9:16 video with burne
 - 📱 **Vertical video rendering** (1080x1920) optimized for social platforms
 - 📝 **AI-powered subtitles** using Whisper for accurate transcription
 - 🎤 **Speaker diarization** - color subtitles by speaker (white/yellow)
-- 📷 **Webcam detection** - auto-detects face and creates split layout
+- 📷 **Webcam detection** - YOLOv8 model (98% accuracy, ~0.92 mean IoU) auto-detects webcam overlay and creates the right layout
 - 👥 **Multi-streamer support** - works for multiple connected streamers
 - 📦 **Google Drive storage** - organized by streamer and date
 - 🔄 **Job queue** - handles multiple clip requests efficiently
@@ -45,8 +45,9 @@ Stream2Short/
                         ┌──────┴──────┐     ┌─────────────────┐
                         │  Supabase   │◀────│  Python Worker  │
                         │  Database   │     │                 │
-                        └─────────────┘     │  • Twitch API   │
+                        └─────────────┘                                                 │  • Twitch API   │
                                             │  • Whisper      │
+                                            │  • YOLOv8       │
                                             │  • FFmpeg       │
                                             │  • Google Drive │
                                             └─────────────────┘
@@ -260,6 +261,11 @@ stream2short/
 │       ├── twitch_api.py    # Twitch API client
 │       ├── transcribe.py    # Whisper transcription
 │       ├── video.py         # FFmpeg processing
+│       ├── webcam_detect.py # Webcam overlay detection (orchestrator)
+│       ├── webcam_locator/  # YOLOv8 detection engine (fine-tuned)
+│       ├── webcam_locator_bridge.py  # Adapter: locator → WebcamRegion
+│       ├── models/
+│       │   └── webcam_yolov8n.pt     # Trained YOLO weights (~6MB)
 │       ├── storage.py       # Google Drive upload
 │       ├── pipeline.py      # Processing pipeline
 │       ├── main.py          # Worker entry point
@@ -281,6 +287,58 @@ queued → creating_clip → waiting_clip → downloading → transcribing → r
                                                                                             ↓
                                                                                          failed
 ```
+
+## Webcam Detection
+
+The worker automatically detects whether a stream clip contains a webcam overlay and positions it correctly in the vertical frame.
+
+### Detection Pipeline
+
+Detection runs as a waterfall — the highest-priority strategy that returns a result wins:
+
+| Priority | Strategy | Accuracy | Speed |
+|---|---|---|---|
+| 1 | **YOLOv8** (fine-tuned on Twitch clips) | Mean IoU 0.921, 98% found | ~1–2s |
+| 2 | **Gemini Vision API** (if `GEMINI_API_KEY` set) | Good rough localization | ~3–6s |
+| 3 | **OpenCV** (face detection + edge heuristics) | Moderate | ~1–2s |
+
+If no strategy finds a webcam, the clip is rendered as a simple center crop.
+
+### Layout Types
+
+| Layout | Description |
+|---|---|
+| `SPLIT` | Webcam in a corner or side of the frame alongside gameplay |
+| `FULL_CAM` | Clip is entirely webcam — rendered full-frame with face tracking |
+| `NO_WEBCAM` | No webcam found — simple center crop of gameplay |
+
+### YOLOv8 Model
+
+The model (`models/webcam_yolov8n.pt`) is a YOLOv8 Nano fine-tuned on 53 hand-labeled Twitch stream clips covering a variety of streamers, games, and webcam layouts. Trained for 80 epochs with transfer learning from COCO weights.
+
+**Supported webcam types detected:** `side_box`, `corner_overlay`, `full_cam`, `top_band`, `bottom_band`, `center_box`
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | — | If set, enables Gemini as Strategy 2 fallback |
+
+### Troubleshooting Webcam Detection
+
+```bash
+# Watch detection logs for the next job
+docker compose logs -f worker
+
+# Look for these lines:
+# ✅ [Strategy 0] YOLO webcam_locator: side_box @ (980,10) 290x220  pos=top-right  conf=0.87
+# ℹ️ [Strategy 0] YOLO: no webcam detected, trying Gemini...
+# ⚠️ [Strategy 0] YOLO failed (...), falling back to Gemini+OpenCV
+```
+
+If YOLO consistently misses a specific layout, the model can be retrained using the `webcam-locator` companion project.
+
+---
 
 ## Troubleshooting
 
