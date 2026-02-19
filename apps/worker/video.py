@@ -1334,7 +1334,7 @@ def render_segment(
 def concat_video_segments(
     segment_paths: list[str],
     output_path: str,
-    crossfade_duration: float = 0.3,
+    crossfade_duration: float = 0.15,
 ) -> str:
     """
     Concatenate rendered segment videos into a single output.
@@ -1620,5 +1620,5 @@ def render_video_with_transitions(
         )
         segment_render_paths.append(seg_out)
 
-    return concat_video_segments(segment_render_paths, output_path)
+    return concat_video_segments(segment_render_paths, output_path, crossfade_duration=0.15)
 
