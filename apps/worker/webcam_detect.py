@@ -124,6 +124,36 @@ class FaceCenter:
         return cls(x=data['x'], y=data['y'], width=data['width'], height=data['height'])
 
 
+@dataclass
+class LayoutSegment:
+    """A contiguous time window where the detected layout is stable."""
+    start_time: float       # seconds from clip start
+    end_time: float         # seconds (exclusive)
+    layout: str             # 'FULL_CAM', 'SPLIT', 'TOP_BAND', 'NO_WEBCAM'
+    webcam_region: Optional[WebcamRegion] = None
+
+    @property
+    def duration(self) -> float:
+        return self.end_time - self.start_time
+
+    def to_dict(self) -> Dict:
+        return {
+            'start_time': float(self.start_time),
+            'end_time': float(self.end_time),
+            'layout': self.layout,
+            'webcam_region': self.webcam_region.to_dict() if self.webcam_region else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'LayoutSegment':
+        return cls(
+            start_time=float(data['start_time']),
+            end_time=float(data['end_time']),
+            layout=data['layout'],
+            webcam_region=WebcamRegion.from_dict(data['webcam_region']) if data.get('webcam_region') else None,
+        )
+
+
 def _to_python_scalar(val):
     """Convert numpy scalar types to Python native types for JSON serialization."""
     if val is None:
@@ -161,7 +191,8 @@ class LayoutInfo:
     bbox_area_ratio: float = 0.0
     gemini_type: str = 'unknown'  # Type from Gemini detection
     confidence: float = 0.0  # Detection confidence
-    
+    segments: Optional[List[LayoutSegment]] = None  # Temporal segments; None = not yet analyzed
+
     def to_dict(self) -> Dict:
         return {
             'layout': self.layout,
@@ -171,10 +202,12 @@ class LayoutInfo:
             'bbox_area_ratio': _to_python_scalar(self.bbox_area_ratio),
             'gemini_type': self.gemini_type,
             'confidence': _to_python_scalar(self.confidence),
+            'segments': [s.to_dict() for s in self.segments] if self.segments is not None else None,
         }
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'LayoutInfo':
+        segs_data = data.get('segments')
         return cls(
             layout=data['layout'],
             webcam_region=WebcamRegion.from_dict(data['webcam_region']) if data.get('webcam_region') else None,
@@ -183,6 +216,7 @@ class LayoutInfo:
             bbox_area_ratio=data.get('bbox_area_ratio', 0.0),
             gemini_type=data.get('gemini_type', 'unknown'),
             confidence=data.get('confidence', 0.0),
+            segments=[LayoutSegment.from_dict(s) for s in segs_data] if segs_data is not None else None,
         )
 
 
@@ -6953,7 +6987,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 19  # v19: Face containment correction + render margin for side_box
+_CACHE_VERSION = 20  # v20: Temporal layout segments support (mid-clip transition detection)
 
 
 def _get_cache_path(temp_dir: str) -> str:
@@ -7049,6 +7083,246 @@ def _save_layout_cache(temp_dir: str, layout_info: LayoutInfo) -> None:
                 pass
 
 
+def _yolo_type_to_layout(wl_type: str, bbox: Dict, frame_w: int, frame_h: int) -> str:
+    """
+    Fast layout classification from a YOLO webcam_locator type string.
+    
+    Does not require a frame or verbose logging — designed for high-frequency
+    temporal sampling where calling the full classify_layout() would be too noisy.
+    """
+    if not wl_type or wl_type in ('none', 'unknown', ''):
+        return 'NO_WEBCAM'
+    if wl_type == 'full_cam':
+        return 'FULL_CAM'
+    if wl_type in ('top_band', 'bottom_band', 'center_box'):
+        return 'TOP_BAND'
+    if wl_type in ('corner_overlay', 'side_box'):
+        return 'SPLIT'
+    # Fallback: classify by bbox area ratio
+    if bbox and frame_w > 0 and frame_h > 0:
+        area_ratio = (bbox.get('width', 0) * bbox.get('height', 0)) / (frame_w * frame_h)
+        if area_ratio >= 0.70:
+            return 'FULL_CAM'
+    return 'SPLIT'
+
+
+def _merge_short_segments(segments: List[LayoutSegment], min_duration: float) -> List[LayoutSegment]:
+    """
+    Merge layout segments shorter than min_duration into their longer neighbor.
+    Runs iteratively until all remaining segments meet the minimum duration.
+    """
+    if len(segments) <= 1:
+        return segments
+
+    result = list(segments)
+    changed = True
+    while changed and len(result) > 1:
+        changed = False
+        new_result: List[LayoutSegment] = []
+        i = 0
+        while i < len(result):
+            seg = result[i]
+            if seg.duration < min_duration:
+                if not new_result:
+                    # No previous segment — absorb into next
+                    if i + 1 < len(result):
+                        merged = LayoutSegment(
+                            start_time=seg.start_time,
+                            end_time=result[i + 1].end_time,
+                            layout=result[i + 1].layout,
+                            webcam_region=result[i + 1].webcam_region,
+                        )
+                        new_result.append(merged)
+                        i += 2
+                        changed = True
+                        continue
+                else:
+                    # Absorb into previous segment (extend its end)
+                    prev = new_result[-1]
+                    new_result[-1] = LayoutSegment(
+                        start_time=prev.start_time,
+                        end_time=seg.end_time,
+                        layout=prev.layout,
+                        webcam_region=prev.webcam_region,
+                    )
+                    i += 1
+                    changed = True
+                    continue
+            new_result.append(seg)
+            i += 1
+        result = new_result
+
+    return result
+
+
+def detect_layout_segments(
+    video_path: str,
+    temp_dir: str,
+    sample_interval: float = 2.0,
+    min_segment_duration: float = 1.5,
+) -> List[LayoutSegment]:
+    """
+    Detect layout changes across a video clip using temporal YOLO sampling.
+
+    Samples frames at regular intervals, classifies each frame's layout via YOLO
+    (Strategy 0 only — fast, no Gemini), then groups consecutive same-layout
+    frames into LayoutSegment objects.
+
+    Returns an empty list if YOLO is unavailable or the clip is too short to
+    warrant transition analysis. A single-element list means no transitions.
+
+    Args:
+        video_path: Path to the source video
+        temp_dir: Job temp directory (for future caching)
+        sample_interval: Seconds between frame samples (default 2.0s)
+        min_segment_duration: Merge segments shorter than this (default 1.5s)
+
+    Returns:
+        List[LayoutSegment] ordered by start_time, covering [0, duration].
+    """
+    print(f"\n🕐 Temporal layout analysis: {video_path}")
+
+    # Import YOLO lazily so missing package is a soft failure
+    try:
+        from webcam_locator.yolo_detect import is_yolo_available
+        from webcam_locator.consensus import detect_from_frames
+    except ImportError:
+        print("  ⚠️ webcam_locator not importable — skipping temporal analysis")
+        return []
+
+    if not is_yolo_available():
+        print("  ⚠️ YOLO model not found — skipping temporal analysis")
+        return []
+
+    # Get video properties
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"  ⚠️ Cannot open video: {video_path}")
+        return []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0.0
+    cap.release()
+
+    if duration < sample_interval * 2:
+        print(f"  ⏩ Clip too short ({duration:.1f}s) for transition analysis")
+        return []
+
+    # Build sample timestamps (midpoints of each interval)
+    sample_times: List[float] = []
+    t = sample_interval / 2.0
+    while t < duration:
+        sample_times.append(min(t, duration - 0.1))
+        t += sample_interval
+
+    print(f"  📊 Sampling {len(sample_times)} frames (every {sample_interval}s over {duration:.1f}s clip)")
+
+    # Extract all frames in a single VideoCapture pass
+    cap = cv2.VideoCapture(video_path)
+    frames_at: List[Tuple[float, np.ndarray]] = []
+    for ts in sample_times:
+        frame_pos = int(ts * fps)
+        frame_pos = max(0, min(frame_pos, total_frames - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            frames_at.append((ts, frame))
+    cap.release()
+
+    if not frames_at:
+        print("  ⚠️ Could not extract any frames")
+        return []
+
+    frame_h, frame_w = frames_at[0][1].shape[:2]
+
+    # Run YOLO on each frame individually and map to layout label
+    raw: List[Tuple[float, str, Optional[WebcamRegion]]] = []
+    for ts, frame in frames_at:
+        try:
+            result = detect_from_frames([frame], use_gemini=False)
+        except Exception as e:
+            print(f"  ⚠️ YOLO failed at {ts:.1f}s: {e}")
+            raw.append((ts, 'NO_WEBCAM', None))
+            continue
+
+        webcam_region: Optional[WebcamRegion] = None
+        if result.get("found"):
+            from webcam_locator_bridge import _derive_position
+            wl_type = result.get("type", "unknown")
+            position = _derive_position(result, frame_w, frame_h)
+            bbox = {
+                'x': int(result.get('x', 0)),
+                'y': int(result.get('y', 0)),
+                'width': int(result.get('width', 0)),
+                'height': int(result.get('height', 0)),
+            }
+            layout_label = _yolo_type_to_layout(wl_type, bbox, frame_w, frame_h)
+            webcam_region = WebcamRegion(
+                x=bbox['x'], y=bbox['y'],
+                width=bbox['width'], height=bbox['height'],
+                position=position,
+                gemini_type=wl_type,
+                gemini_confidence=float(result.get('confidence', 0.0)),
+                effective_type=wl_type,
+            )
+        else:
+            layout_label = 'NO_WEBCAM'
+
+        raw.append((ts, layout_label, webcam_region))
+
+    if not raw:
+        return []
+
+    # Group consecutive same-layout frames into candidate segments
+    segments_raw: List[LayoutSegment] = []
+    current_layout = raw[0][1]
+    current_start = 0.0
+    current_webcam = raw[0][2]
+
+    for i in range(1, len(raw)):
+        prev_ts, _, _ = raw[i - 1]
+        curr_ts, curr_layout, curr_webcam_candidate = raw[i]
+
+        if curr_layout != current_layout:
+            # Transition boundary is midpoint between the two samples
+            boundary = (prev_ts + curr_ts) / 2.0
+            segments_raw.append(LayoutSegment(
+                start_time=current_start,
+                end_time=boundary,
+                layout=current_layout,
+                webcam_region=current_webcam,
+            ))
+            current_layout = curr_layout
+            current_start = boundary
+            current_webcam = curr_webcam_candidate
+        else:
+            # Keep the most recent webcam region (more stable detection)
+            if curr_webcam_candidate:
+                current_webcam = curr_webcam_candidate
+
+    # Final segment runs to end of clip
+    segments_raw.append(LayoutSegment(
+        start_time=current_start,
+        end_time=duration,
+        layout=current_layout,
+        webcam_region=current_webcam,
+    ))
+
+    # Merge micro-segments shorter than min_segment_duration
+    segments = _merge_short_segments(segments_raw, min_segment_duration)
+
+    # Summary log
+    unique = list(dict.fromkeys(s.layout for s in segments))
+    if len(segments) > 1:
+        print(f"  🎬 {len(segments)} layout segments detected: {' → '.join(s.layout for s in segments)}")
+        for seg in segments:
+            print(f"     [{seg.start_time:.1f}s – {seg.end_time:.1f}s] {seg.layout} ({seg.duration:.1f}s)")
+    else:
+        print(f"  ✅ Single layout throughout: {segments[0].layout if segments else 'none'}")
+
+    return segments
+
+
 def detect_layout_with_cache(
     video_path: str,
     temp_dir: str,
@@ -7079,6 +7353,14 @@ def detect_layout_with_cache(
     if not force_refresh:
         cached = _load_cached_layout(temp_dir)
         if cached:
+            # If cached result has no segments (e.g., old cache), run temporal analysis now
+            if cached.segments is None:
+                try:
+                    cached.segments = detect_layout_segments(video_path, temp_dir)
+                    _save_layout_cache(temp_dir, cached)
+                except Exception as e:
+                    print(f"  ⚠️ Temporal analysis on cache-hit failed: {e}")
+                    cached.segments = []
             return cached
     
     # Get video dimensions
@@ -7095,6 +7377,7 @@ def detect_layout_with_cache(
             face_center=None,
             reason='No webcam detected by Gemini or OpenCV',
             bbox_area_ratio=0.0,
+            segments=[],  # No segments needed for no-webcam clips
         )
         _save_layout_cache(temp_dir, layout_info)
         print(f"  📹 Layout: NO_WEBCAM")
@@ -7215,8 +7498,16 @@ def detect_layout_with_cache(
         gemini_type=gemini_type,
         confidence=gemini_confidence,
     )
-    
-    # Cache result
+
+    # Run temporal segment analysis (detects mid-clip layout transitions)
+    try:
+        segments = detect_layout_segments(video_path, temp_dir)
+        layout_info.segments = segments
+    except Exception as e:
+        print(f"  ⚠️ Temporal layout analysis failed: {e}")
+        layout_info.segments = []
+
+    # Cache result (includes temporal segments)
     _save_layout_cache(temp_dir, layout_info)
     
     # Log summary

@@ -9,8 +9,10 @@ from typing import Optional
 from webcam_detect import (
     detect_webcam_region,
     detect_layout_with_cache,
+    detect_layout_segments,
     WebcamRegion,
     LayoutInfo,
+    LayoutSegment,
     FaceCenter,
     get_video_dimensions,
 )
@@ -1036,6 +1038,7 @@ def render_video_auto(
     height: int = 1920,
     enable_webcam_detection: bool = True,
     temp_dir: str = "/tmp",
+    layout_info: LayoutInfo | None = None,
 ) -> str:
     """
     Automatically render the best layout based on layout classification.
@@ -1057,6 +1060,7 @@ def render_video_auto(
         height: Output height (default 1920)
         enable_webcam_detection: Whether to try detecting webcam (default True)
         temp_dir: Temporary directory for caching and frame extraction
+        layout_info: Pre-computed layout (skips detection when provided)
         
     Returns:
         Path to output video
@@ -1072,22 +1076,23 @@ def render_video_auto(
             height=height,
         )
     
-    # Use cached layout detection (runs detection only once per job)
-    try:
-        layout_info = detect_layout_with_cache(
-            video_path=input_path,
-            temp_dir=temp_dir,
-        )
-    except Exception as e:
-        print(f"⚠️ Layout detection failed: {e}")
-        # Fall back to simple center crop
-        return render_vertical_video(
-            input_path=input_path,
-            output_path=output_path,
-            subtitle_path=subtitle_path,
-            width=width,
-            height=height,
-        )
+    # Use pre-computed layout or run detection with cache
+    if layout_info is None:
+        try:
+            layout_info = detect_layout_with_cache(
+                video_path=input_path,
+                temp_dir=temp_dir,
+            )
+        except Exception as e:
+            print(f"⚠️ Layout detection failed: {e}")
+            # Fall back to simple center crop
+            return render_vertical_video(
+                input_path=input_path,
+                output_path=output_path,
+                subtitle_path=subtitle_path,
+                width=width,
+                height=height,
+            )
     
     # ==========================================================================
     # Choose render function based on layout
@@ -1145,4 +1150,407 @@ def render_video_auto(
             width=width,
             height=height,
         )
+
+
+# =============================================================================
+# TEMPORAL LAYOUT TRANSITIONS
+# =============================================================================
+
+def _ass_time_to_seconds(t: str) -> float:
+    """Parse an ASS timestamp string (H:MM:SS.cs) to seconds."""
+    h, m, s_cs = t.split(':')
+    s, cs = s_cs.split('.')
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(cs) / 100
+
+
+def _seconds_to_ass_time(secs: float) -> str:
+    """Format seconds as an ASS timestamp (H:MM:SS.cs)."""
+    secs = max(0.0, secs)
+    h = int(secs // 3600)
+    secs -= h * 3600
+    m = int(secs // 60)
+    secs -= m * 60
+    s = int(secs)
+    cs = round((secs - s) * 100)
+    if cs >= 100:
+        cs = 99
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def slice_ass_subtitles(
+    input_path: str,
+    output_path: str,
+    start_time: float,
+    end_time: float,
+) -> Optional[str]:
+    """
+    Slice an ASS subtitle file to the window [start_time, end_time] and
+    shift all timestamps so the window starts at t=0.
+
+    Returns output_path if any dialogue lines remain, None otherwise.
+    """
+    if not os.path.exists(input_path) or os.path.getsize(input_path) <= 10:
+        return None
+
+    try:
+        with open(input_path, 'r', encoding='utf-8-sig', errors='replace') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"  ⚠️ Could not read subtitle file: {e}")
+        return None
+
+    header_lines = []
+    event_lines = []
+    in_events = False
+
+    for line in lines:
+        stripped = line.rstrip('\n')
+        if stripped.strip() == '[Events]':
+            in_events = True
+            header_lines.append(line)
+            continue
+        if not in_events:
+            header_lines.append(line)
+            continue
+
+        # Inside [Events] section
+        if not stripped.startswith('Dialogue:'):
+            header_lines.append(line)
+            continue
+
+        # Parse Dialogue line: Dialogue: Layer,Start,End,Style,Name,mL,mR,mV,Effect,Text
+        parts = stripped.split(',', 9)
+        if len(parts) < 10:
+            continue
+
+        try:
+            ev_start = _ass_time_to_seconds(parts[1])
+            ev_end = _ass_time_to_seconds(parts[2])
+        except (ValueError, IndexError):
+            continue
+
+        # Keep events that overlap with [start_time, end_time]
+        if ev_end <= start_time or ev_start >= end_time:
+            continue
+
+        # Clamp and shift by -start_time
+        new_start = max(0.0, ev_start - start_time)
+        new_end = min(end_time - start_time, ev_end - start_time)
+
+        parts[1] = _seconds_to_ass_time(new_start)
+        parts[2] = _seconds_to_ass_time(new_end)
+        event_lines.append(','.join(parts) + '\n')
+
+    if not event_lines:
+        return None
+
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.writelines(header_lines)
+            f.writelines(event_lines)
+        return output_path
+    except Exception as e:
+        print(f"  ⚠️ Could not write sliced subtitle: {e}")
+        return None
+
+
+def render_segment(
+    input_path: str,
+    output_path: str,
+    start_time: float,
+    end_time: float,
+    layout_info: LayoutInfo,
+    subtitle_path: Optional[str],
+    temp_dir: str,
+    width: int = 1080,
+    height: int = 1920,
+    seg_index: int = 0,
+) -> str:
+    """
+    Render a time-trimmed segment of the source clip with a specific layout.
+
+    Steps:
+    1. Trim [start_time, end_time] from the source via stream-copy (fast).
+    2. Optionally slice+shift the subtitle file to match the segment window.
+    3. Render the trimmed clip with render_video_auto() using the pre-computed layout.
+
+    Args:
+        input_path: Full source video path
+        output_path: Destination for the rendered segment
+        start_time: Segment start in seconds (from source)
+        end_time: Segment end in seconds (from source)
+        layout_info: Pre-detected layout for this segment (skips re-detection)
+        subtitle_path: ASS subtitle file for the full clip (will be sliced), or None
+        temp_dir: Job temp dir for intermediates
+        seg_index: Segment index (used to name temp files)
+
+    Returns:
+        output_path
+    """
+    duration = end_time - start_time
+    print(f"\n  ✂️  Trimming segment {seg_index}: [{start_time:.2f}s – {end_time:.2f}s] ({duration:.2f}s)")
+
+    # Step 1: Stream-copy trim (no re-encode — fast, preserves quality)
+    trimmed_path = os.path.join(temp_dir, f"seg_{seg_index}_raw.mp4")
+    trim_cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_time),
+        "-to", str(end_time),
+        "-i", input_path,
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        trimmed_path,
+    ]
+    try:
+        subprocess.run(trim_cmd, capture_output=True, text=True, check=True)
+        print(f"  ✅ Trim complete: {trimmed_path}")
+    except subprocess.CalledProcessError as e:
+        raise VideoProcessingError(f"Segment trim failed: {e.stderr}")
+
+    # Step 2: Slice subtitle file to this segment window
+    seg_subtitle_path = None
+    if subtitle_path and os.path.exists(subtitle_path):
+        sliced_sub = os.path.join(temp_dir, f"seg_{seg_index}_captions.ass")
+        result = slice_ass_subtitles(subtitle_path, sliced_sub, start_time, end_time)
+        if result:
+            seg_subtitle_path = result
+            print(f"  📝 Subtitle sliced for segment {seg_index}")
+
+    # Step 3: Render with pre-computed layout (no re-detection)
+    render_video_auto(
+        input_path=trimmed_path,
+        output_path=output_path,
+        subtitle_path=seg_subtitle_path,
+        width=width,
+        height=height,
+        temp_dir=temp_dir,
+        layout_info=layout_info,
+    )
+
+    print(f"  ✅ Segment {seg_index} rendered: {output_path}")
+    return output_path
+
+
+def concat_video_segments(
+    segment_paths: list[str],
+    output_path: str,
+    crossfade_duration: float = 0.3,
+) -> str:
+    """
+    Concatenate rendered segment videos into a single output.
+
+    When crossfade_duration > 0, uses FFmpeg xfade (video) and acrossfade
+    (audio) filters for smooth transitions between layout changes.
+    Falls back to a simple stream-copy concat when crossfade_duration == 0.
+
+    Args:
+        segment_paths: Ordered list of rendered segment paths
+        output_path: Final concatenated video path
+        crossfade_duration: Seconds of crossfade at each boundary (default 0.3)
+
+    Returns:
+        output_path
+    """
+    import shutil
+
+    if len(segment_paths) == 1:
+        shutil.copy(segment_paths[0], output_path)
+        return output_path
+
+    n = len(segment_paths)
+    print(f"\n🔗 Concatenating {n} segments (crossfade={crossfade_duration}s)...")
+
+    if crossfade_duration <= 0:
+        # Simple stream-copy concat — fastest, no quality loss
+        filelist_path = output_path + ".filelist.txt"
+        with open(filelist_path, 'w') as f:
+            for p in segment_paths:
+                f.write(f"file '{p}'\n")
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", filelist_path,
+            "-c", "copy",
+            output_path,
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            print(f"✅ Concat complete (stream copy): {output_path}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            raise VideoProcessingError(f"Segment concat failed: {e.stderr}")
+        finally:
+            try:
+                os.remove(filelist_path)
+            except Exception:
+                pass
+
+    # Crossfade concat — measure each segment's duration first
+    durations = [get_video_duration(p) for p in segment_paths]
+
+    # Build inputs
+    inputs = []
+    for p in segment_paths:
+        inputs += ["-i", p]
+
+    # Build filter_complex with chained xfade (video) and acrossfade (audio)
+    filter_parts = []
+
+    # --- VIDEO: chain xfade ---
+    # Running cumulative offset tracks where the next transition starts in output time
+    cumulative_offset = 0.0
+    prev_video = "0:v"
+
+    for i in range(1, n):
+        cumulative_offset += durations[i - 1] - crossfade_duration
+        out_label = f"v{i}" if i < n - 1 else "vout"
+        filter_parts.append(
+            f"[{prev_video}][{i}:v]xfade=transition=fade"
+            f":duration={crossfade_duration}"
+            f":offset={cumulative_offset:.4f}"
+            f"[{out_label}]"
+        )
+        prev_video = out_label
+
+    # --- AUDIO: chain acrossfade ---
+    prev_audio = "0:a"
+    for i in range(1, n):
+        out_label = f"a{i}" if i < n - 1 else "aout"
+        filter_parts.append(
+            f"[{prev_audio}][{i}:a]acrossfade=d={crossfade_duration}"
+            f":c1=tri:c2=tri"
+            f"[{out_label}]"
+        )
+        prev_audio = out_label
+
+    filter_complex = ";".join(filter_parts)
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "256k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print(f"✅ Concat complete (xfade): {output_path}")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        # If xfade fails (e.g., audio codec issues), fall back to stream-copy
+        print(f"⚠️ xfade concat failed, falling back to stream-copy: {e.stderr[:300]}")
+        return concat_video_segments(segment_paths, output_path, crossfade_duration=0)
+
+
+def render_video_with_transitions(
+    input_path: str,
+    output_path: str,
+    subtitle_path: Optional[str] = None,
+    width: int = 1080,
+    height: int = 1920,
+    temp_dir: str = "/tmp",
+) -> str:
+    """
+    Render a vertical video with automatic mid-clip layout transitions.
+
+    Detects layout changes across the clip (e.g., SPLIT corner_overlay → FULL_CAM)
+    and renders each segment with its optimal layout, then concatenates with a
+    smooth crossfade. Falls back to single-layout render when no transitions are found.
+
+    This is the primary render entry point — it replaces render_video_auto() in the
+    pipeline for all non-segment-specific calls.
+
+    Args:
+        input_path: Source clip path
+        output_path: Destination for the final vertical video
+        subtitle_path: ASS subtitle file path (will be sliced per segment if transitions)
+        width: Output width (default 1080)
+        height: Output height (default 1920)
+        temp_dir: Job temp directory
+
+    Returns:
+        output_path
+    """
+    print(f"\n{'='*60}")
+    print(f"🎬 Layout-aware render: {input_path}")
+    print(f"{'='*60}")
+
+    # Detect layout including temporal segments (uses cache)
+    try:
+        layout_info = detect_layout_with_cache(
+            video_path=input_path,
+            temp_dir=temp_dir,
+        )
+    except Exception as e:
+        print(f"⚠️ Layout detection failed: {e} — falling back to center crop")
+        return render_vertical_video(
+            input_path=input_path,
+            output_path=output_path,
+            subtitle_path=subtitle_path,
+            width=width,
+            height=height,
+        )
+
+    segments = layout_info.segments or []
+
+    # Determine unique layouts across segments
+    unique_layouts = list(dict.fromkeys(s.layout for s in segments))
+    has_transitions = len(unique_layouts) > 1
+
+    if not has_transitions:
+        # Single layout — use fast standard render (no per-segment work)
+        if segments:
+            print(f"📹 Single layout throughout: {unique_layouts[0]}")
+        return render_video_auto(
+            input_path=input_path,
+            output_path=output_path,
+            subtitle_path=subtitle_path,
+            width=width,
+            height=height,
+            temp_dir=temp_dir,
+            layout_info=layout_info,
+        )
+
+    # Multi-layout: render each segment independently then concatenate
+    print(f"🎬 Multi-layout detected: {' → '.join(s.layout for s in segments)}")
+
+    segment_render_paths = []
+    for i, seg in enumerate(segments):
+        seg_out = os.path.join(temp_dir, f"seg_{i}_final.mp4")
+
+        seg_layout_info = LayoutInfo(
+            layout=seg.layout,
+            webcam_region=seg.webcam_region,
+            face_center=None,  # face tracking resolves this per-segment at render time
+            reason=f"Temporal segment {i}: {seg.layout}",
+            bbox_area_ratio=0.0,
+            gemini_type=seg.webcam_region.gemini_type if seg.webcam_region else 'unknown',
+            confidence=seg.webcam_region.gemini_confidence if seg.webcam_region else 0.0,
+            segments=[],
+        )
+
+        render_segment(
+            input_path=input_path,
+            output_path=seg_out,
+            start_time=seg.start_time,
+            end_time=seg.end_time,
+            layout_info=seg_layout_info,
+            subtitle_path=subtitle_path,
+            temp_dir=temp_dir,
+            width=width,
+            height=height,
+            seg_index=i,
+        )
+        segment_render_paths.append(seg_out)
+
+    return concat_video_segments(segment_render_paths, output_path)
 

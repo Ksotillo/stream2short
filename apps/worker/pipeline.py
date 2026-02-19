@@ -19,7 +19,7 @@ from twitch_api import (
 )
 from transcribe import transcribe_video
 from groq_transcribe import transcribe_with_segments
-from video import render_vertical_video, render_video_auto, apply_subtitles_to_video, VideoProcessingError
+from video import render_vertical_video, render_video_auto, render_video_with_transitions, apply_subtitles_to_video, VideoProcessingError
 from storage import upload_file, SharedDriveError
 from diarization import (
     diarize_video,
@@ -352,12 +352,11 @@ def _process_job_stages(
         # Version 1: WITHOUT subtitles (base render - full composition)
         video_no_subs_path = str(temp_dir / "final_no_subs.mp4")
         print("🎬 Rendering BASE version (without subtitles)...")
-        print("   💡 This does the full layout composition (split/crop/tracking)")
-        render_video_auto(
+        print("   💡 Layout-aware: detects mid-clip transitions and renders per-segment")
+        render_video_with_transitions(
             input_path=raw_video_path,
             output_path=video_no_subs_path,
             subtitle_path=None,  # No subtitles for base
-            enable_webcam_detection=True,
             temp_dir=str(temp_dir),
         )
         print(f"✅ Base render complete: {video_no_subs_path}")
@@ -373,6 +372,19 @@ def _process_job_stages(
         )
         print(f"✅ Subtitles applied: {video_with_subs_path}")
         
+        # Persist layout segments to database for dashboard visibility
+        try:
+            from webcam_detect import detect_layout_with_cache
+            _layout = detect_layout_with_cache(raw_video_path, str(temp_dir))
+            if _layout.segments:
+                segments_data = [s.to_dict() for s in _layout.segments]
+                update_job(job_id, layout_segments=segments_data)
+                if len(set(s['layout'] for s in segments_data)) > 1:
+                    transition_summary = ' → '.join(s['layout'] for s in segments_data)
+                    log_job_event(job_id, "info", f"Layout transitions: {transition_summary}", "render")
+        except Exception as e:
+            print(f"  ⚠️ Could not persist layout segments: {e}")
+
         update_job(job_id, final_video_path=video_with_subs_path)
         update_last_stage(job_id, "render")
         log_job_event(job_id, "info", "Render complete (both versions)", "render")
