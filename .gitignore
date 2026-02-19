@@ -41,6 +41,9 @@ logs/
 *.pt
 *.bin
 
+# But DO track the webcam locator YOLO model (small, purpose-built, needed at build time)
+!apps/worker/models/webcam_yolov8n.pt
+
 # Test coverage
 coverage/
 .coverage

@@ -5877,7 +5877,39 @@ def detect_webcam_region(
         WebcamRegion if webcam detected, None otherwise
     """
     print(f"🔍 Detecting webcam region in: {video_path}")
-    
+
+    # =========================================================================
+    # Strategy 0: webcam_locator YOLOv8 model (highest accuracy, ~98% found rate)
+    # Fine-tuned on 53 labeled Twitch clips. Returns immediately if confident.
+    # Falls through silently if model not found or no webcam detected.
+    # =========================================================================
+    try:
+        from webcam_locator_bridge import detect_with_locator
+        locator_result = detect_with_locator(video_path, sample_times)
+        if locator_result:
+            print(
+                f"  ✅ [Strategy 0] YOLO webcam_locator: "
+                f"{locator_result['gemini_type']} @ "
+                f"({locator_result['x']},{locator_result['y']}) "
+                f"{locator_result['width']}x{locator_result['height']}  "
+                f"pos={locator_result['position']}  "
+                f"conf={locator_result['gemini_confidence']:.2f}"
+            )
+            return WebcamRegion(
+                x=locator_result["x"],
+                y=locator_result["y"],
+                width=locator_result["width"],
+                height=locator_result["height"],
+                position=locator_result["position"],
+                gemini_type=locator_result["gemini_type"],
+                gemini_confidence=locator_result["gemini_confidence"],
+                effective_type=locator_result["effective_type"],
+            )
+        # YOLO found nothing → fall through to Gemini + OpenCV strategies
+        print("  ℹ️ [Strategy 0] YOLO: no webcam detected, trying Gemini...")
+    except Exception as _locator_exc:
+        print(f"  ⚠️ [Strategy 0] YOLO failed ({_locator_exc}), falling back to Gemini+OpenCV")
+
     # =========================================================================
     # Strategy 1: Try Gemini Vision AI first (more accurate)
     # =========================================================================

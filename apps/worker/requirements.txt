@@ -36,6 +36,9 @@ yt-dlp>=2024.1.0
 opencv-contrib-python-headless>=4.9.0
 numpy>=1.26.0
 
+# YOLOv8 webcam detector (webcam_locator package — fine-tuned on Twitch clips)
+ultralytics>=8.0.0
+
 # Speaker diarization (optional - requires HF_TOKEN and model access)
 # Using CPU-only PyTorch to avoid large NVIDIA CUDA downloads
 # Version compatibility: pyannote.audio 3.x + huggingface-hub <1.0 (uses use_auth_token)
