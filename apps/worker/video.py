@@ -1451,6 +1451,69 @@ def concat_video_segments(
         return concat_video_segments(segment_paths, output_path, crossfade_duration=0)
 
 
+def _anchor_segments_to_primary(
+    segments: list[LayoutSegment],
+    primary: LayoutInfo,
+) -> list[LayoutSegment]:
+    """
+    Correct false NO_WEBCAM temporal segments by replacing them with the primary layout.
+
+    Single-frame YOLO (used in temporal sampling) is less reliable than the
+    multi-frame consensus used in primary detection. Small corner overlays
+    (e.g. 7-8% of frame area) are frequently missed per-frame, producing
+    spurious NO_WEBCAM results even when the overlay is clearly present.
+
+    Strategy:
+    1. If the primary detection found a webcam, replace any temporal NO_WEBCAM
+       segment with the primary layout + webcam_region.
+    2. Collapse consecutive segments that now share the same layout into one.
+
+    This preserves genuine transitions (e.g. SPLIT → FULL_CAM) while
+    eliminating false negatives.
+    """
+    if not segments or primary.layout == 'NO_WEBCAM':
+        return segments
+
+    # Step 1: replace NO_WEBCAM with primary layout
+    anchored: list[LayoutSegment] = []
+    replaced = 0
+    for seg in segments:
+        if seg.layout == 'NO_WEBCAM':
+            anchored.append(LayoutSegment(
+                start_time=seg.start_time,
+                end_time=seg.end_time,
+                layout=primary.layout,
+                webcam_region=primary.webcam_region,
+            ))
+            replaced += 1
+        else:
+            anchored.append(seg)
+
+    if replaced:
+        print(f"  🔧 Anchoring: replaced {replaced} false NO_WEBCAM segment(s) → {primary.layout}")
+
+    # Step 2: collapse consecutive segments that now share the same layout
+    if not anchored:
+        return anchored
+
+    collapsed: list[LayoutSegment] = [anchored[0]]
+    for seg in anchored[1:]:
+        if seg.layout == collapsed[-1].layout:
+            collapsed[-1] = LayoutSegment(
+                start_time=collapsed[-1].start_time,
+                end_time=seg.end_time,
+                layout=collapsed[-1].layout,
+                webcam_region=collapsed[-1].webcam_region,
+            )
+        else:
+            collapsed.append(seg)
+
+    if len(collapsed) < len(anchored):
+        print(f"  🔧 Collapsed to {len(collapsed)} segment(s) after anchoring")
+
+    return collapsed
+
+
 def render_video_with_transitions(
     input_path: str,
     output_path: str,
@@ -1501,6 +1564,11 @@ def render_video_with_transitions(
         )
 
     segments = layout_info.segments or []
+
+    # Anchor: single-frame YOLO misses small overlays that multi-frame consensus finds.
+    # Replace NO_WEBCAM temporal segments with the primary layout when primary found a webcam,
+    # then collapse any consecutive same-layout segments that result from the correction.
+    segments = _anchor_segments_to_primary(segments, layout_info)
 
     # Determine unique layouts across segments
     unique_layouts = list(dict.fromkeys(s.layout for s in segments))
