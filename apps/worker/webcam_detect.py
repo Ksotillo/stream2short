@@ -7235,11 +7235,19 @@ def detect_layout_segments(
 
     frame_h, frame_w = frames_at[0][1].shape[:2]
 
-    # Run YOLO on each frame individually and map to layout label
+    # Run YOLO with a 3-frame sliding window for each sample.
+    # Single-frame YOLO misses small corner overlays (~8% area) that the
+    # multi-frame consensus finds reliably. Passing prev+current+next frames
+    # gives the consensus algorithm enough signal to vote correctly.
     raw: List[Tuple[float, str, Optional[WebcamRegion]]] = []
-    for ts, frame in frames_at:
+    for i, (ts, frame) in enumerate(frames_at):
+        # Build window: up to 3 consecutive frames centered on this sample
+        window = [
+            frames_at[j][1]
+            for j in range(max(0, i - 1), min(len(frames_at), i + 2))
+        ]
         try:
-            result = detect_from_frames([frame], use_gemini=False)
+            result = detect_from_frames(window, use_gemini=False)
         except Exception as e:
             print(f"  ⚠️ YOLO failed at {ts:.1f}s: {e}")
             raw.append((ts, 'NO_WEBCAM', None))
