@@ -304,19 +304,90 @@ Detection runs as a waterfall — the highest-priority strategy that returns a r
 
 If no strategy finds a webcam, the clip is rendered as a simple center crop.
 
-### Layout Types
+### Webcam Types (Detection)
 
-| Layout | Description |
-|---|---|
-| `SPLIT` | Webcam in a corner or side of the frame alongside gameplay |
-| `FULL_CAM` | Clip is entirely webcam — rendered full-frame with face tracking |
-| `NO_WEBCAM` | No webcam found — simple center crop of gameplay |
+The detector identifies **where** the webcam is positioned in the source video:
+
+| Type | Description | Visual |
+|------|-------------|--------|
+| `corner_overlay` | Small webcam box touching a corner (2+ edges) | Traditional corner cam |
+| `side_box` | Floating webcam NOT touching edges (gaps on all sides) | Inset/floating overlay |
+| `top_band` | Wide horizontal strip at top (width ≥55%, height 18-60%) | Banner-style at top |
+| `bottom_band` | Wide horizontal strip at bottom (width ≥55%, height 18-60%) | Banner-style at bottom |
+| `center_box` | Large centered webcam block | Centered overlay |
+| `full_cam` | Webcam covers >70% of frame (no gameplay) | Webcam-only content |
+
+### Layout Types (Rendering)
+
+The webcam type gets mapped to a **rendering layout**:
+
+| Layout | When Used | How It Renders |
+|--------|-----------|----------------|
+| `SPLIT` | `corner_overlay`, `side_box`, `center_box` | Webcam on top, gameplay below (stacked) |
+| `TOP_BAND` | `top_band`, `bottom_band` | Preserves source stacking, crops to 9:16 |
+| `FULL_CAM` | `full_cam` or no gameplay detected | Full-frame webcam with face tracking |
+| `NO_WEBCAM` | No webcam found | Simple center crop of gameplay |
+
+### Detection → Rendering Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 1. DETECTION: Find webcam bounding box                                   │
+│    YOLO → Gemini → OpenCV (waterfall)                                   │
+│    Output: bbox coordinates + webcam_type                               │
+└─────────────────────────────────────┬───────────────────────────────────┘
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 2. CLASSIFICATION: Determine layout                                      │
+│    - corner_overlay touching 2+ edges? → SPLIT                          │
+│    - side_box (floating)? → SPLIT (with special handling)               │
+│    - top/bottom_band (wide)? → TOP_BAND                                 │
+│    - full_cam (>70% area)? → FULL_CAM                                   │
+│    - nothing found? → NO_WEBCAM                                         │
+└─────────────────────────────────────┬───────────────────────────────────┘
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 3. REFINEMENT: Adjust bbox for accurate cropping (SPLIT/side_box only)  │
+│    - Edge detection with Sobel gradients                                │
+│    - Face containment check (streamer's face must be inside)            │
+│    - Headroom protection (don't cut off head)                           │
+│    - Bottom lock (don't include gameplay below webcam)                  │
+└─────────────────────────────────────┬───────────────────────────────────┘
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 4. RENDERING: Create vertical video                                     │
+│    - Crop webcam region → scale to 1080px wide                          │
+│    - Crop gameplay → scale to fit remaining space                       │
+│    - Stack vertically → 1080x1920 output                                │
+│    - Burn in subtitles                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Concepts for `side_box` (Floating Webcams)
+
+Floating webcams are the trickiest to crop correctly because they don't touch frame edges:
+
+| Concept | What It Does |
+|---------|--------------|
+| **Bottom Lock** | Final crop bottom edge ≤ Gemini-detected bottom (prevents gameplay bleed) |
+| **Headroom Protection** | Face must have ~10-15% headroom above (prevents head cut-off) |
+| **Headroom Shift** | If face is above bbox, SHIFT bbox up instead of expanding down |
+| **Render Margin** | 6% margin + 12% extra top headroom applied during rendering |
+
+### Debug Artifacts
+
+When processing a clip, these debug images are saved to help troubleshoot detection issues:
+
+| File | Description |
+|------|-------------|
+| `debug_webcam_detect_initial.jpg` | Gemini's raw detection (red box) |
+| `debug_webcam_detect_refined.jpg` | Final refined bbox (green box) |
+| `debug_webcam_detection_{job_id}.jpg` | Combined view with all boxes + face |
+| `debug_final_webcam_crop_{job_id}.jpg` | Actual cropped webcam region |
 
 ### YOLOv8 Model
 
 The model (`models/webcam_yolov8n.pt`) is a YOLOv8 Nano fine-tuned on 53 hand-labeled Twitch stream clips covering a variety of streamers, games, and webcam layouts. Trained for 80 epochs with transfer learning from COCO weights.
-
-**Supported webcam types detected:** `side_box`, `corner_overlay`, `full_cam`, `top_band`, `bottom_band`, `center_box`
 
 ### Environment Variables
 
@@ -334,7 +405,17 @@ docker compose logs -f worker
 # ✅ [Strategy 0] YOLO webcam_locator: side_box @ (980,10) 290x220  pos=top-right  conf=0.87
 # ℹ️ [Strategy 0] YOLO: no webcam detected, trying Gemini...
 # ⚠️ [Strategy 0] YOLO failed (...), falling back to Gemini+OpenCV
+
+# For side_box issues, look for:
+# 👤 SIDE_BOX HEADROOM SHIFT: ...
+# ⚠️ SIDE_BOX bottom lock after padding: ...
+# ✅ Face inside bbox: ...
 ```
+
+**Common issues:**
+- **Face cut off at top** → Headroom shift may have failed; check `debug_final_webcam_crop.jpg`
+- **Gameplay visible in webcam section** → Bottom lock violated; check Gemini bbox vs final bbox
+- **Wrong region detected** → YOLO may have missed; falls back to Gemini which is less precise
 
 If YOLO consistently misses a specific layout, the model can be retrained using the `webcam-locator` companion project.
 

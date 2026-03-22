@@ -383,6 +383,7 @@ Replaced fixed "3-word chunks" with intelligent rules in `smart_chunker.py`:
 
 **Status:** Not Started
 
+
 ### 6.1 Auto-Upload to Platforms
 - **Status:** Not Started
 - **Effort:** ~6-8 hours
@@ -426,6 +427,8 @@ These features were implemented outside the original roadmap:
 | **Force Reprocess** | Bypass duplicate detection for testing | ✅ Done |
 | **Transcript Editing** | Edit subtitles in dashboard and re-render with changes | ✅ Done |
 | **YOLOv8 Webcam Detector** | Fine-tuned model (53 Twitch clips, Mean IoU 0.921, 98.1% found accuracy) replaces heuristic detection as Strategy 0. Gemini + OpenCV remain as fallbacks. | ✅ Done |
+| **Side_box Refinement (v19)** | Face containment + headroom shift for floating webcams. Bottom lock prevents gameplay bleed. | ✅ Done |
+| **Webcam Detection Docs** | Comprehensive documentation in README covering detection pipeline, layout types, refinement concepts, and debug artifacts. | ✅ Done |
 
 ---
 
@@ -483,4 +486,4 @@ feature/yolo-webcam-locator   ← current: YOLO webcam detection upgrade
 
 ---
 
-*Last updated: February 2026*
+*Last updated: March 2026*
