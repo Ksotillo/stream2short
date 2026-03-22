@@ -328,6 +328,41 @@ The webcam type gets mapped to a **rendering layout**:
 | `FULL_CAM` | `full_cam` or no gameplay detected | Full-frame webcam with face tracking |
 | `NO_WEBCAM` | No webcam found | Simple center crop of gameplay |
 
+### Classification Thresholds
+
+The exact rules used to classify layouts:
+
+| Rule | Threshold | Result |
+|------|-----------|--------|
+| Area ≥ 70% of frame | `(w × h) / (frame_w × frame_h) ≥ 0.70` | `FULL_CAM` |
+| Width ≥ 55% AND height 18-60% AND near top | `w/W ≥ 0.55`, `0.18 ≤ h/H ≤ 0.60`, `y < 0.25H` | `TOP_BAND` |
+| Width ≥ 55% AND height 18-60% AND near bottom | Same as above but `y > 0.75H` | `TOP_BAND` |
+| Area 3-30% AND in corner zone | Typical corner overlay | `SPLIT` |
+| Floating (gaps on all sides) | Not touching any edge | `SPLIT` (as `side_box`) |
+
+### Edge Cases & Reclassification
+
+The system may **reclassify** a detection based on geometry:
+
+| Scenario | Original Type | Reclassified To | Why |
+|----------|---------------|-----------------|-----|
+| "Corner" only touches 1 edge | `corner_overlay` | `side_box` | True corners touch 2+ edges (within 2% of frame) |
+| Webcam not near any edge | `corner_overlay` | `side_box` | It's actually floating/inset |
+| Very large "corner" overlay | `corner_overlay` | `TOP_BAND` | If width ≥ 55%, it's a band |
+
+**The `effective_type` concept:**
+- Gemini/YOLO returns a `gemini_type` (what it thinks it is)
+- The system may override this to `effective_type` based on geometry checks
+- Rendering uses `effective_type`, not the original detection type
+
+```
+Example:
+  Gemini says: corner_overlay at (800, 100) 300x200
+  Edge check:  Only touches RIGHT edge (not top)
+  Result:      effective_type = "side_box" (downgraded)
+               Rendered as SPLIT with side_box handling
+```
+
 ### Detection → Rendering Flow
 
 ```
