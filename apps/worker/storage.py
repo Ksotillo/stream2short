@@ -9,13 +9,64 @@ Folder structure: {Shared Drive}/{Parent Folder}/{Streamer}/{Date}/{clip_name}.m
 import os
 import re
 import json
+import time
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Callable, TypeVar
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 from config import config
+
+# Retry configuration for transient network errors
+UPLOAD_MAX_RETRIES = 3
+UPLOAD_RETRY_DELAY = 2.0  # seconds, with exponential backoff
+
+T = TypeVar('T')
+
+
+def _retry_on_network_error(
+    operation: Callable[[], T],
+    operation_name: str = "operation",
+    max_retries: int = UPLOAD_MAX_RETRIES,
+    delay: float = UPLOAD_RETRY_DELAY,
+) -> T:
+    """
+    Retry an operation on transient network errors (BrokenPipeError, ConnectionError, etc.)
+    
+    Args:
+        operation: Function to execute
+        operation_name: Name for logging
+        max_retries: Maximum retry attempts
+        delay: Initial delay between retries (exponential backoff)
+        
+    Returns:
+        Result of operation()
+        
+    Raises:
+        Last exception if all retries fail
+    """
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            return operation()
+        except (BrokenPipeError, ConnectionError, ConnectionResetError, OSError) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = delay * (2 ** attempt)  # Exponential backoff
+                print(f"⚠️ Network error during {operation_name} (attempt {attempt + 1}/{max_retries}): {e}")
+                print(f"   Retrying in {wait_time:.1f}s...")
+                time.sleep(wait_time)
+                
+                # Reset the Drive service to get a fresh connection
+                global _drive_service
+                _drive_service = None
+            else:
+                print(f"❌ {operation_name} failed after {max_retries} attempts: {e}")
+                raise
+    
+    raise last_error
 
 # Google Drive API scopes - full drive access for Shared Drives
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -443,14 +494,19 @@ def upload_file(
     }
     
     # Upload with resumable upload for large files
-    media = MediaFileUpload(
-        local_path,
-        mimetype='video/mp4',
-        resumable=True
-    )
-    
-    try:
-        file = service.files().create(
+    # Wrap in retry logic for transient network errors (BrokenPipeError, etc.)
+    def do_upload():
+        # Re-create media object for each attempt (file position may have changed)
+        media = MediaFileUpload(
+            local_path,
+            mimetype='video/mp4',
+            resumable=True
+        )
+        
+        # Get fresh service in case connection was reset
+        svc = get_drive_service()
+        
+        file = svc.files().create(
             body=file_metadata,
             media_body=media,
             fields='id, name, webViewLink, webContentLink',
@@ -465,7 +521,7 @@ def upload_file(
                 'type': 'anyone',
                 'role': 'reader'
             }
-            service.permissions().create(
+            svc.permissions().create(
                 fileId=file['id'],
                 body=permission,
                 supportsAllDrives=True
@@ -482,6 +538,12 @@ def upload_file(
             'webContentLink': file.get('webContentLink', ''),
             'path': full_path
         }
+    
+    try:
+        return _retry_on_network_error(
+            do_upload,
+            operation_name=f"Google Drive upload ({final_filename})"
+        )
         
     except HttpError as e:
         if e.resp.status == 403:
