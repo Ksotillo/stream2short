@@ -2,21 +2,25 @@
 
 Whisper (via Groq or local) sometimes produces incorrect word-level timestamps:
 - Words pinned to 0.0s when they're actually spoken much later
-- Words with timestamps outside their parent segment boundaries
-- Suspicious gaps between consecutive words
+- Words with timestamps that don't correspond to any speech segment
 
 This module cross-references word-level timestamps against segment-level
-timestamps and fixes anomalies before the chunker sees them.
+timestamps and ONLY fixes clearly broken ones — it does not aggressively
+clamp words that already have reasonable timing.
+
+Key principle: if a word's timestamp already falls within (or near) any
+segment's time range, it's probably correct. Only fix timestamps that are
+clearly orphaned (not near any segment).
 """
 
 from typing import Optional
 
 
-# A word is considered "suspicious" if the gap to the next word exceeds this
-SUSPICIOUS_GAP_THRESHOLD = 2.0  # seconds
+# A word is "orphaned" if it's more than this far from any segment boundary
+ORPHAN_THRESHOLD = 1.5  # seconds — word must be >1.5s from nearest segment
 
-# If a word starts before its segment, it's clearly wrong
-# (This is the core fix for the "subtitle appears at 0:00" bug)
+# A word at the very start (< this time) with a large gap to next word is suspicious
+EARLY_WORD_THRESHOLD = 0.5  # seconds — words starting before 0.5s are suspect
 
 
 def sanitize_word_timestamps(
@@ -25,16 +29,15 @@ def sanitize_word_timestamps(
     debug: bool = False,
 ) -> list[dict]:
     """
-    Fix word-level timestamps using segment-level timestamps as ground truth.
+    Fix ONLY clearly broken word timestamps using segments as reference.
 
-    Whisper's segment timestamps are generally more reliable than word timestamps.
-    This function ensures every word falls within its parent segment's time range.
+    Conservative approach — only fixes words whose timestamps are clearly wrong:
+    1. Words that don't fall within or near ANY segment (orphaned)
+    2. Words stuck at 0.0s when no segment starts that early
 
-    Algorithm:
-    1. For each word, find the segment it belongs to (by text matching + proximity)
-    2. Clamp word.start to be >= segment.start
-    3. Clamp word.end to be <= segment.end
-    4. Detect suspicious gaps and redistribute timestamps
+    Does NOT fix words that already have reasonable timing, even if they
+    don't perfectly match their text-matched segment. This prevents
+    breaking correct timestamps like "carro" at 3.5s being clamped to 7s.
 
     Args:
         words: List of word dicts with 'word', 'start', 'end'
@@ -47,35 +50,27 @@ def sanitize_word_timestamps(
     if not words or not segments:
         return words
 
-    # Build segment lookup: for each segment, track which words belong to it
-    word_to_segment = _assign_words_to_segments(words, segments)
-
     fixes_applied = 0
     sanitized = []
 
     for i, word in enumerate(words):
         fixed_word = word.copy()
-        seg = word_to_segment.get(i)
 
-        if seg:
-            seg_start = seg['start']
-            seg_end = seg['end']
+        # Check if this word's timestamp is "orphaned" — not near any segment
+        is_orphaned, nearest_seg, distance = _check_orphaned(fixed_word, segments)
 
-            # Clamp word start to segment start
-            if fixed_word['start'] < seg_start:
-                if debug:
-                    print(f"  🔧 Word '{fixed_word['word']}' start {fixed_word['start']:.2f}s "
-                          f"< segment start {seg_start:.2f}s → clamped")
-                fixed_word['start'] = seg_start
-                fixes_applied += 1
+        if is_orphaned and nearest_seg:
+            # This word's timestamp is clearly wrong — fix it
+            old_start = fixed_word['start']
 
-            # Clamp word end to segment end
-            if fixed_word['end'] > seg_end:
-                if debug:
-                    print(f"  🔧 Word '{fixed_word['word']}' end {fixed_word['end']:.2f}s "
-                          f"> segment end {seg_end:.2f}s → clamped")
-                fixed_word['end'] = seg_end
-                fixes_applied += 1
+            # Find the best time to place this word
+            fixed_word = _fix_orphaned_word(fixed_word, i, words, segments, debug)
+            fixes_applied += 1
+
+            if debug:
+                print(f"  🔧 Orphaned word '{fixed_word['word']}' at {old_start:.2f}s "
+                      f"(nearest segment at {nearest_seg['start']:.2f}s, dist={distance:.1f}s) "
+                      f"→ moved to {fixed_word['start']:.2f}s")
 
         # Ensure end > start (basic sanity)
         if fixed_word['end'] <= fixed_word['start']:
@@ -83,13 +78,9 @@ def sanitize_word_timestamps(
 
         sanitized.append(fixed_word)
 
-    # Second pass: fix suspicious gaps between consecutive words
-    gap_fixes = _fix_suspicious_gaps(sanitized, debug=debug)
-    fixes_applied += gap_fixes
-
-    # Third pass: ensure monotonic timestamps (each word starts >= previous word's start)
-    mono_fixes = _ensure_monotonic(sanitized, debug=debug)
-    fixes_applied += mono_fixes
+    # Second pass: fix early-start words (0.0s with big gap to next word)
+    early_fixes = _fix_early_start_words(sanitized, segments, debug=debug)
+    fixes_applied += early_fixes
 
     if fixes_applied > 0:
         print(f"🔧 Timestamp sanitizer: fixed {fixes_applied} word timestamp(s)")
@@ -100,157 +91,133 @@ def sanitize_word_timestamps(
     return sanitized
 
 
-def _assign_words_to_segments(
-    words: list[dict],
+def _check_orphaned(
+    word: dict,
     segments: list[dict],
-) -> dict[int, dict]:
+) -> tuple[bool, Optional[dict], float]:
     """
-    Assign each word to its parent segment.
+    Check if a word's timestamp is orphaned (not near any segment).
 
-    Uses a two-pass approach:
-    1. Try text matching (rebuild segment text from consecutive words)
-    2. Fall back to time proximity (find closest segment by timestamp)
+    A word is orphaned if its start time is more than ORPHAN_THRESHOLD
+    seconds away from the nearest segment's time range.
 
     Returns:
-        Dict mapping word index -> segment dict
+        (is_orphaned, nearest_segment, distance_to_nearest)
     """
-    if not segments:
-        return {}
+    word_start = word['start']
+    best_seg = None
+    best_dist = float('inf')
 
-    word_to_segment = {}
-
-    # Approach: walk through segments and words in order.
-    # For each segment, consume words whose text matches the segment's words.
-    seg_idx = 0
-    word_idx = 0
-
-    # Precompute: split each segment's text into individual words for matching
-    seg_words_list = []
     for seg in segments:
-        seg_text = seg.get('text', '').strip()
-        seg_word_tokens = seg_text.split()
-        seg_words_list.append(seg_word_tokens)
+        seg_start = seg['start']
+        seg_end = seg['end']
 
-    for seg_idx, seg in enumerate(segments):
-        seg_word_tokens = seg_words_list[seg_idx]
-        if not seg_word_tokens:
-            continue
+        # Word falls inside this segment — definitely not orphaned
+        if seg_start - 0.3 <= word_start <= seg_end + 0.3:
+            return False, seg, 0.0
 
-        # Try to match words sequentially
-        matched_count = 0
-        scan_idx = word_idx
+        # Calculate distance to segment
+        dist = min(abs(word_start - seg_start), abs(word_start - seg_end))
+        if dist < best_dist:
+            best_dist = dist
+            best_seg = seg
 
-        for seg_word_token in seg_word_tokens:
-            if scan_idx >= len(words):
-                break
-
-            # Fuzzy match: strip punctuation and compare lowercase
-            word_clean = words[scan_idx]['word'].strip().lower().strip('.,!?;:¿¡"\'')
-            seg_clean = seg_word_token.strip().lower().strip('.,!?;:¿¡"\'')
-
-            if word_clean == seg_clean or seg_clean.startswith(word_clean) or word_clean.startswith(seg_clean):
-                word_to_segment[scan_idx] = seg
-                scan_idx += 1
-                matched_count += 1
-            else:
-                # Words might not perfectly match (punctuation differences, etc.)
-                # Still assign if we're within the segment's time range
-                if seg['start'] <= words[scan_idx]['start'] <= seg['end'] + 0.5:
-                    word_to_segment[scan_idx] = seg
-                    scan_idx += 1
-                    matched_count += 1
-                else:
-                    break
-
-        if matched_count > 0:
-            word_idx = scan_idx
-
-    # Fallback: assign any unmatched words to the nearest segment by time
-    for i in range(len(words)):
-        if i not in word_to_segment:
-            word_start = words[i]['start']
-            best_seg = None
-            best_dist = float('inf')
-
-            for seg in segments:
-                # Distance: how far is the word from this segment's time range?
-                if seg['start'] <= word_start <= seg['end']:
-                    best_seg = seg
-                    break
-                dist = min(abs(word_start - seg['start']), abs(word_start - seg['end']))
-                if dist < best_dist:
-                    best_dist = dist
-                    best_seg = seg
-
-            if best_seg:
-                word_to_segment[i] = best_seg
-
-    return word_to_segment
+    is_orphaned = best_dist > ORPHAN_THRESHOLD
+    return is_orphaned, best_seg, best_dist
 
 
-def _fix_suspicious_gaps(
+def _fix_orphaned_word(
+    word: dict,
+    word_idx: int,
+    all_words: list[dict],
+    segments: list[dict],
+    debug: bool = False,
+) -> dict:
+    """
+    Fix an orphaned word by finding the right segment for it via text matching.
+
+    Strategy:
+    1. Find which segment contains this word's text
+    2. Place the word at a reasonable position within that segment
+    """
+    word_text_clean = word['word'].strip().lower().strip('.,!?;:¿¡"\'')
+    fixed = word.copy()
+
+    # Find the segment that contains this word by text
+    best_seg = None
+    for seg in segments:
+        seg_text_clean = seg['text'].strip().lower()
+        if word_text_clean in seg_text_clean:
+            best_seg = seg
+            break
+
+    if not best_seg:
+        # Fallback: use nearest segment by time
+        _, best_seg, _ = _check_orphaned(word, segments)
+
+    if best_seg:
+        # Place word at segment start (it will be ordered by the chunker later)
+        # Use the segment's start as reference, offset slightly based on
+        # neighboring words that are already in this segment
+        fixed['start'] = best_seg['start']
+        fixed['end'] = min(best_seg['start'] + 0.3, best_seg['end'])
+
+        # If the previous word is also in this time range, place after it
+        if word_idx > 0:
+            prev = all_words[word_idx - 1]
+            if abs(prev['end'] - best_seg['start']) < 2.0:
+                fixed['start'] = prev['end']
+                fixed['end'] = fixed['start'] + 0.3
+
+    return fixed
+
+
+def _fix_early_start_words(
     words: list[dict],
+    segments: list[dict],
     debug: bool = False,
 ) -> int:
     """
-    Detect and fix suspicious gaps between consecutive words.
+    Fix words stuck at the very beginning (near 0.0s) when speech
+    doesn't actually start that early.
 
-    Example: word[0] = {start: 0.0, end: 0.3}, word[1] = {start: 7.2, end: 7.5}
-    The 7-second gap is clearly wrong. Word[0] should start near word[1].
-
-    Fix: redistribute the first word's timing to just before the second word.
+    This catches the classic Whisper bug: first word gets start=0.0
+    but actual speech begins seconds later.
     """
+    if not words or not segments:
+        return 0
+
+    # Find when speech actually starts (earliest segment)
+    earliest_segment_start = min(seg['start'] for seg in segments)
+
     fixes = 0
 
-    for i in range(len(words) - 1):
-        current = words[i]
-        next_word = words[i + 1]
+    for i, word in enumerate(words):
+        # Only look at words near the start of the audio
+        if word['start'] > EARLY_WORD_THRESHOLD:
+            break
 
-        gap = next_word['start'] - current['end']
+        # If this word starts before the earliest segment and there's a gap
+        # to the next word, it's likely a Whisper hallucination at 0.0s
+        if word['start'] < earliest_segment_start - ORPHAN_THRESHOLD:
+            # Check gap to next word
+            if i + 1 < len(words):
+                next_start = words[i + 1]['start']
+                gap = next_start - word['end']
 
-        if gap > SUSPICIOUS_GAP_THRESHOLD:
-            # This word's timestamp is likely wrong
-            # Move it to just before the next word, with estimated duration
-            word_duration = current['end'] - current['start']
-            word_duration = max(0.15, min(word_duration, 0.5))  # Sane duration
+                if gap > ORPHAN_THRESHOLD:
+                    old_start = word['start']
 
-            new_start = next_word['start'] - word_duration
-            new_end = next_word['start']
+                    # Move word to just before the next word
+                    word_duration = max(0.15, min(word['end'] - word['start'], 0.4))
+                    word['start'] = max(0, next_start - word_duration)
+                    word['end'] = next_start
 
-            if debug:
-                print(f"  🔧 Suspicious gap: '{current['word']}' ends at {current['end']:.2f}s "
-                      f"but next word starts at {next_word['start']:.2f}s "
-                      f"(gap={gap:.1f}s) → moved to {new_start:.2f}s")
-
-            current['start'] = max(0, new_start)
-            current['end'] = max(current['start'] + 0.1, new_end)
-            fixes += 1
-
-    return fixes
-
-
-def _ensure_monotonic(
-    words: list[dict],
-    debug: bool = False,
-) -> int:
-    """
-    Ensure word timestamps are monotonically non-decreasing.
-
-    After clamping and gap fixes, some words might have start times
-    that come before the previous word. Fix by pushing them forward.
-    """
-    fixes = 0
-
-    for i in range(1, len(words)):
-        prev_end = words[i - 1]['end']
-        if words[i]['start'] < prev_end:
-            if debug:
-                print(f"  🔧 Non-monotonic: '{words[i]['word']}' start {words[i]['start']:.2f}s "
-                      f"< prev end {prev_end:.2f}s → adjusted")
-            words[i]['start'] = prev_end
-            if words[i]['end'] <= words[i]['start']:
-                words[i]['end'] = words[i]['start'] + 0.15
-            fixes += 1
+                    if debug:
+                        print(f"  🔧 Early word '{word['word']}' at {old_start:.2f}s "
+                              f"moved to {word['start']:.2f}s (speech starts at "
+                              f"{earliest_segment_start:.1f}s, gap to next={gap:.1f}s)")
+                    fixes += 1
 
     return fixes
 
