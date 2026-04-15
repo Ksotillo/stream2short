@@ -24,8 +24,8 @@ from typing import Optional
 
 
 # Maximum characters per line for readability (used for line breaking)
-# ~25 chars = 3-5 words typically
-MAX_CHARS_PER_LINE = 25
+# ~20 chars = 2-4 words typically
+MAX_CHARS_PER_LINE = 20
 
 # Maximum lines per subtitle (1 = single line only, cleaner look)
 MAX_LINES_PER_SUBTITLE = 1

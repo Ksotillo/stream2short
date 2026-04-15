@@ -2,7 +2,7 @@
 
 Replaces fixed "N-word chunks" with intelligent segmentation rules:
 - Break on punctuation (. , ! ? ; :)
-- Max ~25 characters per line (~3-5 words)
+- Max ~20 characters per line (~2-4 words)
 - Single line only (no 2-line subtitles)
 - Duration: 0.6–1.8 seconds per chunk (ADAPTIVE based on speech rate)
 - Optional keyword emphasis (highlights important words)
@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 
 
 # Configuration constants
-DEFAULT_MAX_CHARS_PER_LINE = 25  # ~3-5 words per subtitle
+DEFAULT_MAX_CHARS_PER_LINE = 20  # ~2-4 words per subtitle
 DEFAULT_MAX_LINES = 1  # Single line only (never 2 lines)
 DEFAULT_MIN_DURATION = 0.6  # seconds (shorter for fewer words)
 DEFAULT_MAX_DURATION = 1.8  # seconds (shorter chunks)
@@ -165,18 +165,18 @@ def get_adaptive_config(
     if rate_category == 'slow':
         # Slow speech: slightly longer chunks, still single line
         return ChunkConfig(
-            max_chars_per_line=28,  # ~4-5 words
+            max_chars_per_line=24,  # ~3-4 words
             max_lines=1,  # Always single line
             min_duration=0.8,
-            max_duration=2.2,
-            min_chars=5,
+            max_duration=2.0,
+            min_chars=4,
             enable_emphasis=enable_emphasis,
         )
     elif rate_category == 'fast':
         # Fast speech: shorter chunks, fewer words
         # This prevents subtitle overlap by creating more frequent, shorter segments
         return ChunkConfig(
-            max_chars_per_line=22,  # ~3-4 words
+            max_chars_per_line=18,  # ~2-3 words
             max_lines=1,  # Always single line
             min_duration=0.4,
             max_duration=1.0,  # Much shorter for fast speech
@@ -186,7 +186,7 @@ def get_adaptive_config(
     else:
         # Normal speech: default settings
         return ChunkConfig(
-            max_chars_per_line=DEFAULT_MAX_CHARS_PER_LINE,  # 25 chars, ~3-5 words
+            max_chars_per_line=DEFAULT_MAX_CHARS_PER_LINE,  # 20 chars, ~2-4 words
             max_lines=DEFAULT_MAX_LINES,  # 1 line
             min_duration=DEFAULT_MIN_DURATION,
             max_duration=DEFAULT_MAX_DURATION,
