@@ -2,6 +2,8 @@
 
 Local fallback transcription when Groq is not configured.
 Now uses smart chunking for natural subtitle breaks.
+Word timestamps are sanitized against segment boundaries to prevent
+subtitles from appearing before speech.
 """
 
 import os
@@ -10,6 +12,7 @@ from typing import Optional
 from faster_whisper import WhisperModel
 from config import config
 from smart_chunker import smart_chunk_transcript
+from timestamp_sanitizer import sanitize_word_timestamps, extract_segments_from_whisper
 
 # Global model instance (loaded lazily)
 _model: Optional[WhisperModel] = None
@@ -117,6 +120,11 @@ def transcribe_video_with_segments(
     segments_list = list(segments)
     print(f"📝 Found {len(segments_list)} speech segments")
     
+    # Extract segment-level timestamps for validation
+    whisper_segments = extract_segments_from_whisper(segments_list)
+    if whisper_segments:
+        print(f"📝 Got {len(whisper_segments)} segment-level timestamps for validation")
+    
     # Collect all words with timestamps
     all_words = []
     full_text_parts = []
@@ -152,6 +160,10 @@ def transcribe_video_with_segments(
                         'end': float(word_end),
                     })
                     full_text_parts.append(word_text)
+    
+    # Sanitize word timestamps against segment boundaries
+    if whisper_segments and all_words:
+        all_words = sanitize_word_timestamps(all_words, whisper_segments, debug=True)
     
     # Apply smart chunking or legacy chunking
     if enable_smart_chunking and all_words:

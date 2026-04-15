@@ -4,6 +4,8 @@ Uses Groq's blazing-fast Whisper API for near-instant transcription.
 Falls back to local faster-whisper if Groq is not configured.
 
 Now uses smart chunking for natural subtitle breaks instead of fixed word counts.
+Word timestamps are sanitized against segment boundaries to prevent
+subtitles from appearing before speech.
 """
 
 import os
@@ -12,6 +14,7 @@ from typing import Optional
 from groq import Groq
 from config import config
 from smart_chunker import smart_chunk_transcript
+from timestamp_sanitizer import sanitize_word_timestamps, extract_segments_from_groq
 
 
 _groq_client: Optional[Groq] = None
@@ -84,6 +87,11 @@ def transcribe_with_groq(
     
     print(f"📝 Groq transcription complete!")
     
+    # Extract segment-level timestamps (more reliable than word-level)
+    groq_segments = extract_segments_from_groq(transcription)
+    if groq_segments:
+        print(f"📝 Got {len(groq_segments)} segment-level timestamps for validation")
+    
     # Collect word-level data for smart chunking
     all_words = []
     full_text_parts = []
@@ -106,6 +114,10 @@ def transcribe_with_groq(
                     'end': float(end),
                 })
                 full_text_parts.append(word_text)
+        
+        # Sanitize word timestamps against segment boundaries
+        if groq_segments and all_words:
+            all_words = sanitize_word_timestamps(all_words, groq_segments, debug=True)
     
     elif hasattr(transcription, 'segments') and transcription.segments:
         # Fallback to segment-level timestamps - synthesize word timing
