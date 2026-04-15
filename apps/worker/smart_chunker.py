@@ -31,12 +31,6 @@ SPEECH_RATE_FAST = 4.0      # Above this = fast speaker
 # Minimum gap between subtitles to prevent overlap (seconds)
 MIN_SUBTITLE_GAP = 0.05  # 50ms
 
-# Timing adjustments to sync subtitles with speech
-# Positive = delay subtitle appearance (prevents appearing before speech)
-SUBTITLE_START_OFFSET = 0.05  # 50ms delay - subtitle appears slightly after word starts
-# How long to keep subtitle after last word ends (negative = disappear sooner)
-SUBTITLE_END_TRIM = 0.15  # Trim 150ms from end - subtitle disappears faster
-
 # Punctuation that signals a natural break point
 STRONG_BREAK_PUNCTUATION = {'.', '!', '?'}  # End of sentence
 MEDIUM_BREAK_PUNCTUATION = {',', ';', ':'}  # Clause breaks
@@ -363,11 +357,7 @@ def _finalize_chunk(words: list[Word], config: ChunkConfig) -> Optional[dict]:
     """
     Convert a list of Word objects into a final chunk dict.
     
-    Applies text formatting, timing adjustments, and identifies emphasis words.
-    
-    Timing adjustments:
-    - Start time is slightly delayed to prevent subtitle appearing before speech
-    - End time is trimmed so subtitle doesn't linger after speech ends
+    Applies text formatting and identifies emphasis words if enabled.
     """
     if not words:
         return None
@@ -377,25 +367,9 @@ def _finalize_chunk(words: list[Word], config: ChunkConfig) -> Optional[dict]:
     if not text.strip():
         return None
     
-    # Calculate raw timing from word timestamps
-    raw_start = words[0].start
-    raw_end = words[-1].end
-    
-    # Apply timing adjustments:
-    # 1. Delay start slightly so subtitle appears WITH speech, not before
-    adjusted_start = raw_start + SUBTITLE_START_OFFSET
-    
-    # 2. Trim end so subtitle disappears faster (doesn't linger)
-    adjusted_end = raw_end - SUBTITLE_END_TRIM
-    
-    # Ensure minimum duration (at least 0.3s visible)
-    min_duration = 0.3
-    if adjusted_end - adjusted_start < min_duration:
-        adjusted_end = adjusted_start + min_duration
-    
     chunk = {
-        'start': adjusted_start,
-        'end': adjusted_end,
+        'start': words[0].start,
+        'end': words[-1].end,
         'text': text,
     }
     
