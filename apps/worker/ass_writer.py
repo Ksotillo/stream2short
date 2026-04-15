@@ -24,7 +24,11 @@ from typing import Optional
 
 
 # Maximum characters per line for readability (used for line breaking)
-MAX_CHARS_PER_LINE = 30
+# ~25 chars = 3-5 words typically
+MAX_CHARS_PER_LINE = 25
+
+# Maximum lines per subtitle (1 = single line only, cleaner look)
+MAX_LINES_PER_SUBTITLE = 1
 
 
 # Animation settings
@@ -84,8 +88,8 @@ def generate_ass_header(
     play_res_x: int = 1080,
     play_res_y: int = 1920,
     font_name: str = "Montserrat ExtraBold",
-    font_size: int = 75,  # Large TikTok/Reels style
-    margin_v: int = 280,  # Higher up from bottom
+    font_size: int = 83,  # Large TikTok/Reels style (+10% from 75)
+    margin_v: int = 580,  # ~30% from bottom (was 280, now ~20-25% higher)
     margin_l: int = 50,
     margin_r: int = 50,
     outline: int = 4,     # Thick outline for readability
@@ -227,7 +231,7 @@ def get_speaker_style(
 def format_text_with_line_breaks(
     text: str,
     max_chars_per_line: int = MAX_CHARS_PER_LINE,
-    max_lines: int = 2,
+    max_lines: int = MAX_LINES_PER_SUBTITLE,
 ) -> str:
     """
     Format text with ASS line breaks (\\N) for readability.
@@ -372,8 +376,8 @@ def segments_to_ass(
     play_res_x: int = 1080,
     play_res_y: int = 1920,
     font_name: str = "Montserrat ExtraBold",
-    font_size: int = 75,  # Large TikTok/Reels style
-    margin_v: int = 280,  # Higher up from bottom
+    font_size: int = 83,  # Large TikTok/Reels style (+10% from 75)
+    margin_v: int = 580,  # ~30% from bottom (was 280, now ~20-25% higher)
     margin_l: int = 50,
     margin_r: int = 50,
     enable_zoom_animation: bool = True,

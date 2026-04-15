@@ -2,9 +2,9 @@
 
 Replaces fixed "N-word chunks" with intelligent segmentation rules:
 - Break on punctuation (. , ! ? ; :)
-- Max ~30 characters per line
-- Max 2 lines per subtitle
-- Duration: 0.8–2.2 seconds per chunk (ADAPTIVE based on speech rate)
+- Max ~25 characters per line (~3-5 words)
+- Single line only (no 2-line subtitles)
+- Duration: 0.6–1.8 seconds per chunk (ADAPTIVE based on speech rate)
 - Optional keyword emphasis (highlights important words)
 - Non-overlap post-processor ensures no subtitle collisions
 
@@ -18,11 +18,11 @@ from typing import Optional, Tuple
 
 
 # Configuration constants
-DEFAULT_MAX_CHARS_PER_LINE = 30
-DEFAULT_MAX_LINES = 2
-DEFAULT_MIN_DURATION = 0.8  # seconds
-DEFAULT_MAX_DURATION = 2.2  # seconds
-DEFAULT_MIN_CHARS = 5  # Minimum chars before allowing a break
+DEFAULT_MAX_CHARS_PER_LINE = 25  # ~3-5 words per subtitle
+DEFAULT_MAX_LINES = 1  # Single line only (never 2 lines)
+DEFAULT_MIN_DURATION = 0.6  # seconds (shorter for fewer words)
+DEFAULT_MAX_DURATION = 1.8  # seconds (shorter chunks)
+DEFAULT_MIN_CHARS = 4  # Minimum chars before allowing a break
 
 # Adaptive speech rate thresholds (words per second)
 SPEECH_RATE_SLOW = 2.5      # Below this = slow speaker
@@ -149,44 +149,45 @@ def get_adaptive_config(
 ) -> ChunkConfig:
     """
     Create a ChunkConfig adapted to the speech rate.
-    
+
     Fast speakers get shorter chunks to prevent overlap.
     Slow speakers get longer chunks for natural reading.
-    
+    All configs use single line (max_lines=1) for cleaner appearance.
+
     Args:
         speech_rate: Words per second
         rate_category: 'slow', 'normal', or 'fast'
         enable_emphasis: Whether to enable keyword emphasis
-        
+
     Returns:
         ChunkConfig tuned for the speech rate
     """
     if rate_category == 'slow':
-        # Slow speech: longer chunks, more characters
+        # Slow speech: slightly longer chunks, still single line
         return ChunkConfig(
-            max_chars_per_line=35,
-            max_lines=2,
-            min_duration=1.0,
-            max_duration=2.5,
-            min_chars=6,
+            max_chars_per_line=28,  # ~4-5 words
+            max_lines=1,  # Always single line
+            min_duration=0.8,
+            max_duration=2.2,
+            min_chars=5,
             enable_emphasis=enable_emphasis,
         )
     elif rate_category == 'fast':
-        # Fast speech: shorter chunks, fewer characters
+        # Fast speech: shorter chunks, fewer words
         # This prevents subtitle overlap by creating more frequent, shorter segments
         return ChunkConfig(
-            max_chars_per_line=25,
-            max_lines=2,
-            min_duration=0.5,
-            max_duration=1.2,  # Much shorter for fast speech
-            min_chars=4,
+            max_chars_per_line=22,  # ~3-4 words
+            max_lines=1,  # Always single line
+            min_duration=0.4,
+            max_duration=1.0,  # Much shorter for fast speech
+            min_chars=3,
             enable_emphasis=enable_emphasis,
         )
     else:
         # Normal speech: default settings
         return ChunkConfig(
-            max_chars_per_line=DEFAULT_MAX_CHARS_PER_LINE,
-            max_lines=DEFAULT_MAX_LINES,
+            max_chars_per_line=DEFAULT_MAX_CHARS_PER_LINE,  # 25 chars, ~3-5 words
+            max_lines=DEFAULT_MAX_LINES,  # 1 line
             min_duration=DEFAULT_MIN_DURATION,
             max_duration=DEFAULT_MAX_DURATION,
             min_chars=DEFAULT_MIN_CHARS,
