@@ -89,7 +89,7 @@ def generate_ass_header(
     play_res_y: int = 1920,
     font_name: str = "Montserrat ExtraBold",
     font_size: int = 83,  # Large TikTok/Reels style (+10% from 75)
-    margin_v: int = 580,  # ~30% from bottom (was 280, now ~20-25% higher)
+    margin_v: int = 420,  # ~22% from bottom (balanced position)
     margin_l: int = 50,
     margin_r: int = 50,
     outline: int = 4,     # Thick outline for readability
@@ -377,7 +377,7 @@ def segments_to_ass(
     play_res_y: int = 1920,
     font_name: str = "Montserrat ExtraBold",
     font_size: int = 83,  # Large TikTok/Reels style (+10% from 75)
-    margin_v: int = 580,  # ~30% from bottom (was 280, now ~20-25% higher)
+    margin_v: int = 420,  # ~22% from bottom (balanced position)
     margin_l: int = 50,
     margin_r: int = 50,
     enable_zoom_animation: bool = True,
