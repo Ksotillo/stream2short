@@ -44,6 +44,9 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Force latest yt-dlp — Twitch API changes frequently break older versions
+RUN pip install --no-cache-dir --upgrade yt-dlp
+
 # Copy application code
 COPY . .
 
