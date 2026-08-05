@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 import { config } from './config.js';
 
 // Database types
@@ -88,6 +89,7 @@ export interface JobEvent {
 }
 
 // Create Supabase client with service role key (server-side only)
+// ws transport required for Node.js < 22 (no native WebSocket)
 export const supabase = createClient(
   config.supabase.url,
   config.supabase.serviceRoleKey,
@@ -95,6 +97,9 @@ export const supabase = createClient(
     auth: {
       autoRefreshToken: false,
       persistSession: false,
+    },
+    realtime: {
+      transport: ws,
     },
   }
 );
