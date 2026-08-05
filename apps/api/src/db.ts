@@ -2,6 +2,9 @@ import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import { config } from './config.js';
 
+// ws needs to be cast for Supabase's realtime transport type
+const WebSocketPolyfill = ws as unknown as typeof WebSocket;
+
 // Database types
 export interface Channel {
   id: string;
@@ -99,7 +102,7 @@ export const supabase = createClient(
       persistSession: false,
     },
     realtime: {
-      transport: ws,
+      transport: WebSocketPolyfill,
     },
   }
 );
