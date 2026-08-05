@@ -70,11 +70,19 @@ def main():
         print(f"🧹 Cleaned {stale_cleaned} stale temp directories from previous runs")
     
     # Connect to Redis
+    # socket_timeout must be longer than brpop timeout (5s) to avoid
+    # "Timeout reading from socket" errors during blocking waits
     try:
-        redis_client = redis.from_url(config.REDIS_URL)
+        redis_client = redis.from_url(
+            config.REDIS_URL,
+            socket_timeout=30,
+            socket_connect_timeout=10,
+            retry_on_timeout=True,
+            health_check_interval=15,
+        )
         redis_client.ping()
         print(f"✅ Connected to Redis: {config.REDIS_URL}")
-    except redis.ConnectionError as e:
+    except (redis.ConnectionError, redis.TimeoutError) as e:
         print(f"❌ Failed to connect to Redis: {e}")
         sys.exit(1)
     
@@ -118,16 +126,22 @@ def main():
                 else:
                     mark_job_failed(job_id, str(e))
                     
-        except redis.ConnectionError as e:
+        except (redis.ConnectionError, redis.TimeoutError) as e:
             print(f"⚠️ Redis connection error: {e}")
             print("Attempting to reconnect in 5 seconds...")
             import time
             time.sleep(5)
             try:
-                redis_client = redis.from_url(config.REDIS_URL)
+                redis_client = redis.from_url(
+                    config.REDIS_URL,
+                    socket_timeout=30,
+                    socket_connect_timeout=10,
+                    retry_on_timeout=True,
+                    health_check_interval=15,
+                )
                 redis_client.ping()
                 print("✅ Reconnected to Redis")
-            except redis.ConnectionError:
+            except (redis.ConnectionError, redis.TimeoutError):
                 print("❌ Failed to reconnect")
                 
         except Exception as e:
