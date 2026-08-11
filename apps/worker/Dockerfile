@@ -44,8 +44,9 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Force latest yt-dlp — Twitch API changes frequently break older versions
-RUN pip install --no-cache-dir --upgrade yt-dlp
+# Install yt-dlp NIGHTLY — Twitch frequently rotates GraphQL hashes which
+# breaks stable releases with KeyError('data'). Nightly gets fixes within hours.
+RUN pip install --no-cache-dir -U --pre "yt-dlp[default]"
 
 # Copy application code
 COPY . .
@@ -57,6 +58,8 @@ RUN mkdir -p /tmp/stream2short
 ENV PYTHONUNBUFFERED=1
 ENV TEMP_DIR=/tmp/stream2short
 
-# Run the worker
-CMD ["python", "main.py"]
+# Entrypoint auto-updates yt-dlp to latest nightly on every container start,
+# so future Twitch breakages only need a restart instead of a rebuild
+RUN chmod +x entrypoint.sh
+CMD ["./entrypoint.sh"]
 
