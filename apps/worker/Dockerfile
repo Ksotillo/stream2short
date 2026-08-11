@@ -59,7 +59,8 @@ ENV PYTHONUNBUFFERED=1
 ENV TEMP_DIR=/tmp/stream2short
 
 # Entrypoint auto-updates yt-dlp to latest nightly on every container start,
-# so future Twitch breakages only need a restart instead of a rebuild
-RUN chmod +x entrypoint.sh
+# so future Twitch breakages only need a restart instead of a rebuild.
+# sed strips CRLF line endings in case the file was checked out on Windows.
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 CMD ["./entrypoint.sh"]
 
