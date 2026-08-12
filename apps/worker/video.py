@@ -1254,15 +1254,25 @@ def render_segment(
     duration = end_time - start_time
     print(f"\n  ✂️  Trimming segment {seg_index}: [{start_time:.2f}s – {end_time:.2f}s] ({duration:.2f}s)")
 
-    # Step 1: Stream-copy trim (no re-encode — fast, preserves quality)
+    # Step 1: Frame-accurate trim (re-encode).
+    # IMPORTANT: do NOT use "-c copy" here — stream copy can only cut at
+    # keyframes, and Twitch clips have keyframes every ~2-3s. A copy trim
+    # backs up to the previous keyframe, causing segments to REPEAT the last
+    # seconds of the previous segment (rewind effect) and produce corrupted
+    # smeared frames at the start (mid-GOP decode).
+    # High-quality intermediate (CRF 18) since it gets re-encoded once more
+    # during the layout render.
     trimmed_path = os.path.join(temp_dir, f"seg_{seg_index}_raw.mp4")
     trim_cmd = [
         "ffmpeg", "-y",
         "-ss", str(start_time),
         "-to", str(end_time),
         "-i", input_path,
-        "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "192k",
         trimmed_path,
     ]
     try:
