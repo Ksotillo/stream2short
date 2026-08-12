@@ -6987,7 +6987,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 21  # v21: Layout boundaries snapped to scene cuts (was midpoint of 2s samples)
+_CACHE_VERSION = 22  # v22: Stinger-aware boundaries (animation span kept out of face-tracked segments)
 
 
 def _get_cache_path(temp_dir: str) -> str:
@@ -7155,14 +7155,25 @@ def _merge_short_segments(segments: List[LayoutSegment], min_duration: float) ->
     return result
 
 
-def _find_scene_cut(video_path: str, t_start: float, t_end: float) -> Optional[float]:
-    """
-    Find the exact scene-cut timestamp within [t_start, t_end].
+# Padding added around a detected transition animation span, to catch the
+# low-motion head/tail frames of stinger animations (paint splashes, wipes).
+_TRANSITION_SPAN_PAD = 0.15
+# Max plausible stinger animation length; spans longer than this are noise.
+_TRANSITION_SPAN_MAX = 2.0
 
-    Layout transitions (OBS scene switches) are hard cuts with a large
-    frame-to-frame pixel difference. Scans downscaled grayscale frame diffs
-    across the window and returns the timestamp of the strongest cut, or
-    None if no clear cut exists (e.g. gradual fade or detection noise).
+
+def _find_scene_transition(
+    video_path: str, t_start: float, t_end: float
+) -> Optional[Tuple[float, float]]:
+    """
+    Find the scene transition within [t_start, t_end].
+
+    Returns (span_start, span_end) covering the transition. For a hard cut
+    the span is a single frame; for stinger animations (e.g. a 0.8s paint
+    splash) it covers the whole animation, found by expanding around the
+    strongest frame-to-frame diff while diffs stay elevated.
+
+    Returns None if no clear transition exists (gradual fade or noise).
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -7192,13 +7203,46 @@ def _find_scene_cut(video_path: str, t_start: float, t_end: float) -> Optional[f
 
     values = [d for _, d in diffs]
     peak_idx = int(np.argmax(values))
-    peak_ts, peak_val = diffs[peak_idx]
+    peak_val = values[peak_idx]
     baseline = float(np.median(values))
 
     # Require a clear spike: strong absolute change AND well above baseline motion
-    if peak_val >= 15.0 and peak_val >= max(3.0 * baseline, baseline + 10.0):
-        return peak_ts
-    return None
+    if not (peak_val >= 15.0 and peak_val >= max(3.0 * baseline, baseline + 10.0)):
+        return None
+
+    # Expand around the peak while diffs stay elevated (stinger animation
+    # frames), tolerating up to 2 consecutive calm frames mid-animation.
+    elevated = max(2.0 * baseline, 0.25 * peak_val, 6.0)
+    lo = hi = peak_idx
+    gap = 0
+    for i in range(peak_idx - 1, -1, -1):
+        if values[i] >= elevated:
+            lo = i
+            gap = 0
+        else:
+            gap += 1
+            if gap > 2:
+                break
+    gap = 0
+    for i in range(peak_idx + 1, len(values)):
+        if values[i] >= elevated:
+            hi = i
+            gap = 0
+        else:
+            gap += 1
+            if gap > 2:
+                break
+
+    span_start = max(t_start, diffs[lo][0] - _TRANSITION_SPAN_PAD)
+    span_end = min(t_end, diffs[hi][0] + _TRANSITION_SPAN_PAD)
+
+    # A "span" longer than any plausible stinger means the whole window is
+    # high-motion (gameplay) — fall back to treating the peak as a hard cut.
+    if span_end - span_start > _TRANSITION_SPAN_MAX:
+        peak_ts = diffs[peak_idx][0]
+        return (peak_ts, peak_ts)
+
+    return (span_start, span_end)
 
 
 def detect_layout_segments(
@@ -7338,19 +7382,32 @@ def detect_layout_segments(
         curr_ts, curr_layout, curr_webcam_candidate = raw[i]
 
         if curr_layout != current_layout:
-            # Snap the boundary to the actual scene cut between the two
-            # samples (sampling is coarse, so the midpoint can be off by up
-            # to sample_interval/2 — rendering the wrong layout for a couple
-            # of seconds around each transition). Fall back to midpoint if
-            # no clear cut is found.
-            cut_ts = _find_scene_cut(video_path, prev_ts, curr_ts)
-            if cut_ts is not None:
-                boundary = cut_ts
-                print(f"  ✂️ Boundary snapped to scene cut at {cut_ts:.2f}s "
+            # Snap the boundary to the actual scene transition between the
+            # two samples (sampling is coarse, so the midpoint can be off by
+            # up to sample_interval/2). For stinger animations the transition
+            # is a span, not an instant: place the boundary so the animation
+            # frames land in a statically-rendered segment (SPLIT/NO_WEBCAM)
+            # rather than a face-tracked FULL_CAM segment, where the tracker
+            # would hunt across splash-covered frames and visibly pan around.
+            span = _find_scene_transition(video_path, prev_ts, curr_ts)
+            if span is not None:
+                span_start, span_end = span
+                # NO_WEBCAM counts as face-tracked too: false NO_WEBCAM
+                # segments get anchored to FULL_CAM later in the pipeline.
+                tracked = ('FULL_CAM', 'NO_WEBCAM')
+                if current_layout in tracked:
+                    boundary = span_start  # animation goes to incoming segment
+                elif curr_layout in tracked:
+                    boundary = span_end    # animation stays in outgoing segment
+                else:
+                    boundary = (span_start + span_end) / 2.0
+                boundary = min(max(boundary, prev_ts), curr_ts)
+                print(f"  ✂️ Boundary snapped to scene transition "
+                      f"[{span_start:.2f}s – {span_end:.2f}s] → boundary {boundary:.2f}s "
                       f"({current_layout} → {curr_layout})")
             else:
                 boundary = (prev_ts + curr_ts) / 2.0
-                print(f"  ⚠️ No clear scene cut in [{prev_ts:.1f}s – {curr_ts:.1f}s], "
+                print(f"  ⚠️ No clear scene transition in [{prev_ts:.1f}s – {curr_ts:.1f}s], "
                       f"using midpoint {boundary:.2f}s")
             segments_raw.append(LayoutSegment(
                 start_time=current_start,
