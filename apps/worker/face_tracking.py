@@ -35,7 +35,15 @@ from dataclasses import dataclass
 # GLOBAL CACHED DNN NET (singleton pattern for performance)
 # =============================================================================
 _DNN_NET = None
-_DNN_NET_LOADED = False  # Track if we've attempted loading
+_DNN_LOAD_ATTEMPTS = 0
+_DNN_MAX_LOAD_ATTEMPTS = 3  # Retry (with re-download) instead of caching first failure forever
+_DNN_FAILURE_LOGGED = False  # Avoid spamming "net is None" for every sampled frame
+
+# Model sources + integrity thresholds (real sizes: prototxt ~28KB, caffemodel ~10.6MB)
+DNN_PROTOTXT_URL = "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/dnn/face_detector/deploy.prototxt"
+DNN_CAFFEMODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
+MIN_PROTOTXT_BYTES = 10_000
+MIN_CAFFEMODEL_BYTES = 5_000_000
 
 DEBUG_FACE_TRACKING = os.environ.get("DEBUG_FACE_TRACKING", "1") == "1"
 
@@ -65,47 +73,100 @@ FAR_JUMP_MIN_SCORE = 0.80       # Minimum score for far jumps
 FAR_JUMP_MIN_CONF = 0.85        # Minimum confidence for far jumps
 
 
+def _file_ok(path: Path, min_bytes: int) -> bool:
+    """Check a model file exists and isn't truncated/corrupt (e.g. an HTML error page)."""
+    try:
+        return path.exists() and path.stat().st_size >= min_bytes
+    except OSError:
+        return False
+
+
+def _download_file(url: str, dest: Path, min_bytes: int) -> bool:
+    """Download url to dest atomically. Returns True on success."""
+    import urllib.request
+    import ssl
+    try:
+        import certifi
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ssl_ctx = ssl.create_default_context()
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    try:
+        print(f"   ⬇️ Downloading DNN model: {url}")
+        with urllib.request.urlopen(url, timeout=60, context=ssl_ctx) as resp, open(tmp, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+        if tmp.stat().st_size < min_bytes:
+            print(f"   ❌ Downloaded file too small ({tmp.stat().st_size} bytes, expected >= {min_bytes})")
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(dest)
+        print(f"   ✅ Downloaded {dest.name} ({dest.stat().st_size} bytes)")
+        return True
+    except Exception as e:
+        print(f"   ❌ Download failed for {url}: {type(e).__name__}: {e}")
+        tmp.unlink(missing_ok=True)
+        return False
+
+
+def _ensure_dnn_model_files(prototxt: Path, caffemodel: Path) -> bool:
+    """Make sure both DNN model files exist and look valid, downloading if needed."""
+    prototxt.parent.mkdir(parents=True, exist_ok=True)
+    ok = True
+    if not _file_ok(prototxt, MIN_PROTOTXT_BYTES):
+        print(f"   ⚠️ {prototxt} missing or corrupt (exists={prototxt.exists()}, "
+              f"size={prototxt.stat().st_size if prototxt.exists() else 0})")
+        ok = _download_file(DNN_PROTOTXT_URL, prototxt, MIN_PROTOTXT_BYTES) and ok
+    if not _file_ok(caffemodel, MIN_CAFFEMODEL_BYTES):
+        print(f"   ⚠️ {caffemodel} missing or corrupt (exists={caffemodel.exists()}, "
+              f"size={caffemodel.stat().st_size if caffemodel.exists() else 0})")
+        ok = _download_file(DNN_CAFFEMODEL_URL, caffemodel, MIN_CAFFEMODEL_BYTES) and ok
+    return ok
+
+
 def _get_dnn_net():
     """
     Load DNN face detection model once and cache it.
-    
+
+    Self-healing: validates model files (re-downloading if missing/corrupt) and
+    retries loading up to _DNN_MAX_LOAD_ATTEMPTS times instead of permanently
+    caching the first failure.
+
     Returns:
-        cv2.dnn.Net or None if models are missing
+        cv2.dnn.Net or None if the model cannot be loaded
     """
-    global _DNN_NET, _DNN_NET_LOADED
-    
-    if _DNN_NET_LOADED:
-        if _DNN_NET is not None:
-            print(f"   🔄 DNN net already loaded (cached)")
+    global _DNN_NET, _DNN_LOAD_ATTEMPTS
+
+    if _DNN_NET is not None:
         return _DNN_NET
-    
-    _DNN_NET_LOADED = True
-    
-    # HARD DIAGNOSTIC: Log exact paths being checked
+
+    if _DNN_LOAD_ATTEMPTS >= _DNN_MAX_LOAD_ATTEMPTS:
+        return None  # Gave up after repeated failures (reasons already logged)
+
+    _DNN_LOAD_ATTEMPTS += 1
+
     model_base = Path(__file__).parent / "models"
     prototxt = model_base / "deploy.prototxt"
     caffemodel = model_base / "res10_300x300_ssd_iter_140000.caffemodel"
-    
-    print(f"   🔍 DNN MODEL PATHS:")
-    print(f"      __file__: {__file__}")
-    print(f"      model_base: {model_base}")
-    print(f"      model_base.resolve(): {model_base.resolve()}")
-    print(f"      prototxt: {prototxt}")
-    print(f"      prototxt.exists(): {prototxt.exists()}")
-    print(f"      caffemodel: {caffemodel}")
-    print(f"      caffemodel.exists(): {caffemodel.exists()}")
-    
-    if not prototxt.exists() or not caffemodel.exists():
-        print(f"   ❌ DNN MODELS NOT FOUND!")
-        # Try to list what IS in the models directory
+
+    print(f"   🔍 DNN load attempt {_DNN_LOAD_ATTEMPTS}/{_DNN_MAX_LOAD_ATTEMPTS}")
+    print(f"      model_base: {model_base.resolve()}")
+    print(f"      prototxt exists={prototxt.exists()} "
+          f"size={prototxt.stat().st_size if prototxt.exists() else 0}")
+    print(f"      caffemodel exists={caffemodel.exists()} "
+          f"size={caffemodel.stat().st_size if caffemodel.exists() else 0}")
+
+    if not _ensure_dnn_model_files(prototxt, caffemodel):
+        print(f"   ❌ DNN model files unavailable (will retry on next call)")
         if model_base.exists():
             print(f"      Contents of {model_base}:")
             for f in model_base.iterdir():
-                print(f"         - {f.name}")
-        else:
-            print(f"      Directory {model_base} does NOT exist!")
+                print(f"         - {f.name} ({f.stat().st_size} bytes)")
         return None
-    
+
     try:
         print(f"   🚀 Loading DNN model with cv2.dnn.readNetFromCaffe...")
         net = cv2.dnn.readNetFromCaffe(str(prototxt), str(caffemodel))
@@ -117,10 +178,18 @@ def _get_dnn_net():
         return _DNN_NET
     except Exception as e:
         import traceback
-        print(f"   ❌ EXCEPTION loading DNN model:")
+        print(f"   ❌ EXCEPTION loading DNN model (cv2={cv2.__version__}):")
         print(f"      Exception type: {type(e).__name__}")
         print(f"      Exception message: {e}")
         print(f"      Traceback: {traceback.format_exc()}")
+        # Files may be corrupt in a way size checks can't catch — delete so the
+        # next attempt re-downloads fresh copies.
+        try:
+            prototxt.unlink(missing_ok=True)
+            caffemodel.unlink(missing_ok=True)
+            print(f"      🧹 Deleted model files; next attempt will re-download")
+        except OSError:
+            pass
         return None
 
 
@@ -348,14 +417,15 @@ def detect_face_dnn(
     Returns:
         Tuple of (x, y, width, height, confidence) or None
     """
-    print(f"   🔍 detect_face_dnn() ENTER - conf_thresh={confidence_threshold}, prev_center={prev_center}")
-    
+    global _DNN_FAILURE_LOGGED
+
     net = _get_dnn_net()
     if net is None:
-        print(f"   ❌ detect_face_dnn(): DNN net is None, cannot proceed")
+        if not _DNN_FAILURE_LOGGED:
+            print(f"   ❌ detect_face_dnn(): DNN net unavailable, skipping DNN detection "
+                  f"(suppressing further messages)")
+            _DNN_FAILURE_LOGGED = True
         return None
-    
-    print(f"   ✅ detect_face_dnn(): DNN net loaded, running detection...")
     
     h, w = frame_bgr.shape[:2]
     frame_area = w * h

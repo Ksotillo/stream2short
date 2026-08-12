@@ -27,13 +27,16 @@ RUN mkdir -p /usr/share/fonts/truetype/montserrat \
     && fc-cache -f -v
 
 # Download OpenCV DNN face detection models (ResNet SSD - much better than Haar)
-# These are required for reliable face tracking in FULL_CAM mode
+# These are required for reliable face tracking in FULL_CAM mode.
+# Size checks make the build fail loudly if the download is truncated/corrupt.
 RUN mkdir -p /app/models \
-    && wget -q "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt" \
+    && wget -q "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/dnn/face_detector/deploy.prototxt" \
          -O /app/models/deploy.prototxt \
     && wget -q "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel" \
          -O /app/models/res10_300x300_ssd_iter_140000.caffemodel \
-    && echo "✅ DNN face detection models downloaded"
+    && test "$(stat -c%s /app/models/deploy.prototxt)" -ge 10000 \
+    && test "$(stat -c%s /app/models/res10_300x300_ssd_iter_140000.caffemodel)" -ge 5000000 \
+    && echo "✅ DNN face detection models downloaded and verified"
 
 # Set working directory
 WORKDIR /app
