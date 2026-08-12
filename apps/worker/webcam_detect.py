@@ -6987,7 +6987,7 @@ _CACHE_FILENAME = "layout_detection_cache.json"
 
 # Cache version - increment when detection algorithm changes significantly
 # This ensures old cached bboxes are invalidated when logic changes
-_CACHE_VERSION = 22  # v22: Stinger-aware boundaries (animation span kept out of face-tracked segments)
+_CACHE_VERSION = 23  # v23: Robust span detection (percentile baseline, wider window) + Gemini reacquire gate
 
 
 def _get_cache_path(temp_dir: str) -> str:
@@ -7159,7 +7159,7 @@ def _merge_short_segments(segments: List[LayoutSegment], min_duration: float) ->
 # low-motion head/tail frames of stinger animations (paint splashes, wipes).
 _TRANSITION_SPAN_PAD = 0.15
 # Max plausible stinger animation length; spans longer than this are noise.
-_TRANSITION_SPAN_MAX = 2.0
+_TRANSITION_SPAN_MAX = 2.5
 
 
 def _find_scene_transition(
@@ -7204,7 +7204,10 @@ def _find_scene_transition(
     values = [d for _, d in diffs]
     peak_idx = int(np.argmax(values))
     peak_val = values[peak_idx]
-    baseline = float(np.median(values))
+    # Baseline = 25th percentile, NOT median: a long stinger animation can
+    # fill half the window with high diffs, which inflates the median enough
+    # to hide the spike entirely (transition then goes undetected).
+    baseline = float(np.percentile(values, 25))
 
     # Require a clear spike: strong absolute change AND well above baseline motion
     if not (peak_val >= 15.0 and peak_val >= max(3.0 * baseline, baseline + 10.0)):
@@ -7389,7 +7392,12 @@ def detect_layout_segments(
             # frames land in a statically-rendered segment (SPLIT/NO_WEBCAM)
             # rather than a face-tracked FULL_CAM segment, where the tracker
             # would hunt across splash-covered frames and visibly pan around.
-            span = _find_scene_transition(video_path, prev_ts, curr_ts)
+            # Extend the search window one sample interval back: mid-animation
+            # frames can still classify as the OLD layout (e.g. YOLO said
+            # FULL_CAM at 7.0s while a 6.0-8.0s transition was playing), so
+            # the animation may start well before the last same-layout sample.
+            win_start = max(current_start, prev_ts - sample_interval)
+            span = _find_scene_transition(video_path, win_start, curr_ts)
             if span is not None:
                 span_start, span_end = span
                 # NO_WEBCAM counts as face-tracked too: false NO_WEBCAM
@@ -7401,7 +7409,7 @@ def detect_layout_segments(
                     boundary = span_end    # animation stays in outgoing segment
                 else:
                     boundary = (span_start + span_end) / 2.0
-                boundary = min(max(boundary, prev_ts), curr_ts)
+                boundary = min(max(boundary, win_start), curr_ts)
                 print(f"  ✂️ Boundary snapped to scene transition "
                       f"[{span_start:.2f}s – {span_end:.2f}s] → boundary {boundary:.2f}s "
                       f"({current_layout} → {curr_layout})")

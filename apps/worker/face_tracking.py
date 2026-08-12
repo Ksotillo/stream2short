@@ -1077,7 +1077,12 @@ def track_faces(
                         gcy = gy + gh // 2
                         gemini_score = _score_face_for_fullcam(gx, gy, gw, gh, width, height)
                         
-                        if gemini_score >= REACQUIRE_MIN_SCORE or gconf >= 0.85:
+                        # Gemini confidence alone is NOT enough: during scene
+                        # transitions Gemini confidently finds the tiny corner
+                        # webcam of the incoming scene (fullcam score ~0.2),
+                        # yanking the crop across the frame. Require the same
+                        # fullcam score gate as DNN re-acquires.
+                        if gemini_score >= REACQUIRE_MIN_SCORE:
                             print(f"   ✅ LOST MODE: re-acquired via GEMINI at center=({gcx},{gcy}) score={gemini_score:.2f} conf={gconf:.2f}")
                             detection_accepted = True
                             lost_count = 0
