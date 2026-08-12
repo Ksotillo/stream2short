@@ -34,7 +34,12 @@ pydantic>=2.5.0
 yt-dlp>=2025.1.0
 
 # Face/webcam detection (contrib version includes trackers: CSRT, KCF, MOSSE)
-opencv-contrib-python-headless>=4.9.0
+# IMPORTANT: pin to 4.x — OpenCV 5 removed cv2.dnn.readNetFromCaffe and the
+# bundled Haar cascade files, which breaks face detection entirely.
+# opencv-python is pinned too because ultralytics depends on it (unpinned);
+# without the pin, pip installs opencv-python 5.x which overwrites cv2.
+opencv-contrib-python-headless>=4.9.0,<5.0.0
+opencv-python>=4.9.0,<5.0.0
 numpy>=1.26.0
 
 # YOLOv8 webcam detector (webcam_locator package — fine-tuned on Twitch clips)
